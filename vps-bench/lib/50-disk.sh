@@ -7,6 +7,7 @@
 # shellcheck shell=bash
 
 BH_SEQW=""; BH_SEQR=""; BH_4KW=""; BH_4KR=""
+BH_4K_IOPS_W=""; BH_4K_IOPS_R=""   # dd-derived baseline IOPS (fio stays premium)
 BH_DISK_MODE=""; BH_FIO_RIOPS=""; BH_FIO_WIOPS=""
 
 bh_dd_supports() { # $1=flags — probe with a 1 MB write
@@ -80,6 +81,8 @@ bench_disk() {
     seq4k=$((seq4k * 4))
   done
   BH_4KW="$(awk -v n="$seq4k" -v ms="$ms" 'BEGIN{ if (ms>=50) printf "%.1f", n*4096/(ms/1000)/1048576; else print 0 }')"
+  # baseline 4K write IOPS = ops / seconds (ops = final 4K block count)
+  BH_4K_IOPS_W="$(awk -v n="$seq4k" -v ms="$ms" 'BEGIN{ if (ms>=50) printf "%.1f", n/(ms/1000); else print "" }')"
 
   t0=$(now_ms)
   # shellcheck disable=SC2086
@@ -87,6 +90,8 @@ bench_disk() {
   t1=$(now_ms)
   ms=$((t1 - t0))
   BH_4KR="$(awk -v n="$seq4k" -v ms="$ms" 'BEGIN{ if (ms>=50) printf "%.1f", n*4096/(ms/1000)/1048576; else print 0 }')"
+  # baseline 4K read IOPS over the same payload
+  BH_4K_IOPS_R="$(awk -v n="$seq4k" -v ms="$ms" 'BEGIN{ if (ms>=50) printf "%.1f", n/(ms/1000); else print "" }')"
 
   rm -f "$file" 2>/dev/null
 

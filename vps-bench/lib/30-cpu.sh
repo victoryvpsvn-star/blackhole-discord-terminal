@@ -7,6 +7,9 @@
 # shellcheck shell=bash
 
 BH_SHA1C=""; BH_SHANC=""; BH_OPENSSL_K=""
+# multi-core scaling efficiency: BH_SHANC / (BH_SHA1C * BH_PAR_JOBS) * 100,
+# ~100% means near-linear scaling ("" when inputs are 0/empty)
+BH_CPU_EFFICIENCY=""
 BH_LAST_N=0; BH_LAST_MS=0
 
 # dd_time_ms n_mb [jobs] — runs n MB of dd|sha256sum (jobs parallel copies).
@@ -52,6 +55,11 @@ bench_cpu() {
   done
   BH_SHANC="$(awk -v n="$BH_LAST_N" -v j="$j" -v ms="$ms" 'BEGIN{ if (ms>=50) printf "%.1f", n*j*1048576/(ms/1000)/1048576; else print 0 }')"
 
+  # scaling efficiency: ~100% = linear speedup across BH_PAR_JOBS threads
+  BH_CPU_EFFICIENCY="$(awk -v s1="$BH_SHA1C" -v sn="$BH_SHANC" -v j="$j" 'BEGIN{
+    if (s1+0 > 0 && sn+0 > 0 && j+0 > 0) printf "%.1f", sn / (s1 * j) * 100
+  }' 2>/dev/null)"
+
   # optional cross-check via openssl (info only, format varies by version)
   if command_exists openssl; then
     BH_OPENSSL_K="$(openssl speed -seconds 2 -evp sha256 2>/dev/null | awk 'tolower($1) ~ /sha/ && $2 ~ /k$/ {gsub(/k$/,"",$2); print $2; exit}')"
@@ -59,4 +67,8 @@ bench_cpu() {
       BH_OPENSSL_K="$(openssl speed -seconds 2 -evp sha256 2>/dev/null | awk 'tolower($0) ~ /sha/ && NF>1 {v=$NF; gsub(/k$/,"",v); if (v ~ /^[0-9.]+$/) {print v; exit}}')"
     fi
   fi
+  # never emit garbage: keep only values matching ^[0-9.]+$
+  case "$BH_OPENSSL_K" in
+    ''|.*|*[!0-9.]*) BH_OPENSSL_K="" ;;
+  esac
 }

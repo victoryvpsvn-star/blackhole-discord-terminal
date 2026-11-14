@@ -6,6 +6,8 @@
 # shellcheck shell=bash
 
 BH_MEM_GBS=""; BH_MEM_METHOD=""
+# context notes for the report layer (filled in by bench_mem)
+BH_MEM_THP_NOTE=""; BH_MEM_SWAP_NOTE=""
 
 BH_MEMBENCH_C='
 #include <stdio.h>
@@ -53,6 +55,15 @@ bench_mem() {
     mb="$(awk_min2 "$mb" "$(awk -v a="$BH_MEM_AVAIL_MB" 'BEGIN{printf "%d", a/4}')")"
   fi
   [ "$mb" -lt 16 ] 2>/dev/null && mb=16
+
+  # context notes for the report layer (informational only)
+  [ -n "$BH_THP" ] && BH_MEM_THP_NOTE="thp=$BH_THP"
+  [ -n "$BH_SWAP_DETAIL" ] && BH_MEM_SWAP_NOTE="$BH_SWAP_DETAIL"
+
+  # informational: cgroup RAM limit is smaller than the bench buffer request
+  if [ "${BH_MEM_LIMIT_MB:-0}" -gt 0 ] 2>/dev/null && [ "$BH_MEM_LIMIT_MB" -lt "$mb" ] 2>/dev/null; then
+    log "container RAM limit ${BH_MEM_LIMIT_MB} MB — bench buffer already clamped"
+  fi
 
   local ccbin=""
   command_exists cc    && ccbin=cc

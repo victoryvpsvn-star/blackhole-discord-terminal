@@ -7,12 +7,16 @@ usage() {
   cat <<USAGE
 $BH_TOOL v$BH_VERSION — VPS virtualization detector + hardware benchmark + SSH/security audit
 Detects KVM / QEMU / Docker / Podman / Kubernetes / LXC / OpenVZ / Xen / Hyper-V /
-VMware / VirtualBox / bhyve / WSL / bare metal, benchmarks the REAL (cgroup-limited)
-configuration — CPU, memory, disk, network speed (down/up, ICMP latency + jitter) —
-and audits the local SSH & security posture (password vs key auth, root login,
-authorized_keys, failed logins, firewall, fail2ban, UID-0 accounts, listening ports).
-Everything prints right here in the terminal; JSON/Markdown files and a Discord
-webhook are optional extras.
+VMware / VirtualBox / bhyve / WSL / bare metal, fingerprints the cloud provider
+(AWS Nitro/Xen, Azure, GCE, OCI, Alibaba, DigitalOcean, Hetzner, Linode, Scaleway),
+benchmarks the REAL (cgroup-limited) configuration — CPU (with steal / noisy-neighbor
+detection), memory, disk (NVMe/SSD/HDD class + 4k IOPS), network speed over hardened
+endpoints (down/up, ICMP latency + jitter) — and audits the local SSH & security
+posture (password vs key auth, root login, authorized_keys, failed logins, firewall,
+fail2ban jail state, UID-0 accounts, listening ports) plus a system hardening scan
+(SELinux/AppArmor, pending updates, exposed services, miner scan, docker.sock,
+sysctls). Everything prints right here in the terminal; JSON/Markdown files and a
+Discord webhook are optional extras.
 
 Usage: blackhole-vps-bench [MODE] [OPTIONS]
 

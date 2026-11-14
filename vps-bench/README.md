@@ -2,11 +2,13 @@
 
 Tool kiểm tra VPS của bạn thực chất đang chạy trên gì — KVM, QEMU, Docker, Podman, Kubernetes, LXC/LXD, OpenVZ, Xen, Hyper-V, VMware, VirtualBox, bhyve, WSL hay máy chủ dedicated — rồi benchmark đúng **cấu hình thực** (đọc cgroup limit chứ không báo nhầm RAM/CPU của host), **audit SSH & bảo mật ngay trên máy** (password hay key auth, root login, firewall, fail2ban, brute-force log...), đo **tốc độ mạng down/up + latency/jitter**. Thuần bash, một file duy nhất, chạy được cả trong container Alpine, có GitHub Actions selftest, và **kết quả in thẳng ra terminal** — Discord chỉ là tuỳ chọn.
 
-- Phiên bản: **v2.0.0**
+- Phiên bản: **v3.0.0**
 - Repo: `victoryvpsvn-star/blackhole-discord-terminal`
 - Yêu cầu: Linux + bash, `curl` (bắt buộc cho phần network), còn lại mọi thứ đều tự động hóa qua `dd`/`sha256sum`/`openssl`/`fio`/`ss` nếu có. Không cần root (có root thì audit sâu hơn).
 
 > **Có gì mới ở v2?** Mode `sec` audit SSH/bảo mật độc lập · badge màu [OK]/[WARN]/[BAD] ngay terminal · ICMP latency + jitter · deep-scan (DNS, TCP congestion control, entropy, TUN/FUSE/PPP, load, tiến trình, timezone) · JSON/Markdown có thêm `security` + `net_env` · container job trong CI bị giới hạn cứng 2 CPU / 2 GB để chứng minh bench tự scale theo quota.
+>
+> **Có gì mới ở v3?** Fingerprint cloud đầy đủ: **AWS Nitro vs Xen, Azure (asset-tag chuẩn), GCE, OCI, Alibaba, Tencent, DigitalOcean, Hetzner, Linode, Scaleway, OpenStack** (DMI + metadata IMDSv2) · chassis_type (VM vs máy vật lý) · phân biệt **WSL1/WSL2** + phát hiện chroot + Virtuozzo 7 (`envID`) · **CPU steal %** (báo động hàng xóm ồn ào) · multi-thread efficiency % · **4K IOPS** tự tính + phân loại ổ **NVMe/SSD/HDD** + scheduler · tier label cho mọi metric (entry-NVMe, gigabit-class…) · grade **S→F** cho BH-SCORE · **sửa bug endpoint** (Cloudflare chặn >50 MB, cachefly thành stub → best-of-N: Cloudflare 50 MB + OVH + Hetzner + Thinkbroadband, chọn số nhanh nhất) · audit SSH sâu hơn: **PermitEmptyPasswords, LoginGraceTime, X11Forwarding, KbdInteractive, AllowUsers, file permission của authorized_keys (StrictModes), fail2ban có ĐANG CHẠY + sshd jail, sshguard, crowdsec, sshd version, sshd process/listening** · module hardening mới: **SELinux/AppArmor, pending updates, port nguy hiểm expose (redis/mysql/mongo/memcached…), scan cryptominer, docker.sock, sysctl (kptr/dmesg/BPF/yama), /tmp noexec, cron/timers**.
 
 ---
 
@@ -89,12 +91,14 @@ Mọi kết luận đều kèm **Evidence**: các dòng bằng chứng in ngay d
 | LXC / LXD | cgroup tham chiếu `lxc`; `/proc/1/environ` có `container=lxc` |
 | systemd-nspawn | `/run/systemd/container`; cgroup `machine.slice` |
 | OpenVZ / Virtuozzo | `/proc/vz` tồn tại không có `/proc/bc`; `/proc/user_beancounters`; cgroup `vzcid`/`/vz/` |
-| WSL | `/proc/version` nhắc Microsoft |
+| WSL | `/proc/version` nhắc Microsoft; **v3 phân biệt WSL1/WSL2** qua `microsoft-standard` trong kernel version |
+| Chroot | `/` khác inode với `/proc/1/root/.` (chỉ kết luận khi không có signal nào khác) |
 | KVM / QEMU | DMI vendor `QEMU` / product "Virtual Machine"; `systemd-detect-virt --vm` = `kvm`; clocksource `kvm-clock` |
-| AWS EC2 (Nitro/KVM), GCE, DigitalOcean, Alibaba, Tencent, OpenStack | map từ DMI vendor/product tương ứng |
+| AWS EC2 (Nitro/KVM), GCE, DigitalOcean, Alibaba, Tencent, OpenStack | map từ DMI vendor/product; **v3 tách AWS Xen-gen (product `HVM domU`) vs Nitro, và instance `.metal` → bare metal** |
+| **v3**: Oracle Cloud (OCI), Hetzner, Linode, Scaleway | OCI qua chassis asset-tag `OracleCloud.com`; Hetzner/Linode/Scaleway qua DMI vendor/bios + metadata probe |
 | Xen PV | `/sys/hypervisor/type` = `xen`; nếu có `control_d` thì là dom0 |
 | Xen HVM | DMI vendor `Xen` hoặc product "HVM domU" |
-| Hyper-V | DMI vendor "Microsoft Corporation" |
+| Hyper-V | DMI vendor "Microsoft Corporation" + product "Virtual Machine"; **chỉ dán nhãn Azure khi chassis asset-tag khớp `7783-7084-…-77`** — Hyper-V on-prem không bị gọi nhầm Azure nữa (v3 fix) |
 | VMware ESXi | DMI vendor `VMware*` |
 | VirtualBox | DMI vendor "innotek GmbH" |
 | bhyve | DMI vendor "FreeBSD bhyve" |
@@ -134,10 +138,15 @@ Các check thực hiện:
 - **PubkeyAuthentication** — tắt sẽ bị cảnh báo.
 - **PermitRootLogin** — `yes` là `[BAD]`; `prohibit-password` (mặc định) kèm gợi ý.
 - **SSH port(s)** + `MaxAuthTries` (hỗ trợ multi-Port).
+- **(v3) PermitEmptyPasswords** — `yes` là `[BAD]` · **LoginGraceTime** > 120s → `[WARN]` · **X11Forwarding** bật → `[WARN]` · **KbdInteractiveAuthentication** + password auth cùng bật → `[WARN]` · **AllowUsers/AllowGroups** → ghi nhận whitelist.
+- **(v3) sshd runtime**: binary probe `/usr/sbin/sshd` → version qua `ssh -V`, process đang chạy hay không (`pgrep`), đang listen trên port nào (`ss -tlnp`).
+- **(v3) File permission**: `authorized_keys`/`~/.ssh`/home dir ghi quyền group/world-writable → `[WARN]` (sshd `StrictModes` sẽ TỪ CHỐI key nếu home ghi được bởi group/others).
 - **authorized_keys**: đếm key của `root` + mọi `/home/*`, phân loại `ed25519`/`RSA`/`ECDSA`, và dùng `ssh-keygen -lf` (nếu có) để bắt key yếu < 2048 bit.
 - **Failed SSH logins**: đếm qua `journalctl` (24h gần nhất) hoặc `/var/log/auth.log`; ≥ 50 lần/24h → cảnh báo đang bị brute-force.
 - **Firewall**: ufw active / nftables / iptables rules / firewalld; không thấy gì → `[WARN]`.
-- **fail2ban**, **sudo NOPASSWD**, **tài khoản UID-0** (ngoài root là `[BAD]`), **mật khẩu trống** trong `/etc/shadow` (cần root), **ASLR**, **auto security updates** (unattended-upgrades / dnf-automatic), **listening TCP ports**.
+- **fail2ban** — v3 kiểm tra cả trạng thái **ĐANG CHẠY** (`systemctl is-active` / `pgrep fail2ban-server`) + sshd jail qua `fail2ban-client status sshd`; cài mà không chạy → `[WARN]`. Nhận diện thêm **sshguard** và **crowdsec**.
+- **(v3) Hardening scan** (module mới `85-hardening.sh`): **SELinux/AppArmor** · **pending package updates** (apt/dnf/yum/apk/pacman, >50 gói → `[WARN]`) · **port nguy hiểm bind wildcard** — redis/mongo/memcached/telnet expose là `[BAD]`, mysql/postgres/rdp/vnc/ftp/smb là `[WARN]` · **scan cryptominer** (`xmrig`, `kdevtmpfsi`, `kinsing`, `stratum+tcp`…) · **docker.sock** world-accessible là `[BAD]` (tương đương root) · **sysctl kernel**: `kptr_restrict`, `dmesg_restrict`, `unprivileged_bpf_disabled`, `yama ptrace_scope` · **/tmp** có `noexec,nosuid` không · đếm **cron + systemd timers**.
+- **sudo NOPASSWD**, **tài khoản UID-0** (ngoài root là `[BAD]`), **mật khẩu trống** trong `/etc/shadow` (cần root), **ASLR**, **auto security updates** (unattended-upgrades / dnf-automatic), **listening TCP ports**.
 - Kết: **Posture** `GOOD` / `FAIR` / `WEAK` kèm đếm pass/warn/bad.
 
 Chạy riêng nhanh:
@@ -160,12 +169,16 @@ blackhole-vps-bench sec --json sec.json
 | CPU cross-check | `openssl speed -seconds 2 -evp sha256` (k/s, chỉ để đối chiếu) |
 | Memory | vòng lặp memcpy-style viết bằng C, biên dịch lúc chạy (cc/gcc/clang), lấy best của 3 passes, GB/s |
 | Memory fallback | không có compiler thì dùng proxy `dd` — kết quả luôn ghi kèm `[method]` để bạn biết số nào thật |
-| Disk seq/4K | `dd` ghi rồi đọc: seq block 1M, 4K block 4k; ghi có fsync; có `fio` thì thêm 4K random IOPS (randrw 8s, direct, bỏ qua khi `--fast`) |
-| Network | download từ `speed.cloudflare.com/__down` (100 MB, fast: 25 MB; fallback cachefly), upload POST lên `speed.cloudflare.com/__up` (25 MB, fast: 10 MB), latency = TCP connect time |
+| Disk seq/4K | `dd` ghi rồi đọc: seq block 1M, 4K block 4k; ghi có fsync; có `fio` thì thêm 4K random IOPS (randrw 8s, direct, bỏ qua khi `--fast`). **v3: tự tính 4K IOPS baseline từ dd + nhận diện ổ NVMe/SSD/HDD + I/O scheduler** |
+| Network | **v3 (fix bug)**: Cloudflare chặn payload > 50 MB (HTTP 403) và cachefly đã thành stub 25 byte → tool dùng **best-of-N endpoint đã verify**: Cloudflare 50 MB → OVH → Thinkbroadband (fast: CF 10 MB → OVH), thử endpoint kế khi transfer kết thúc < 2s hoặc fail, **lấy số lớn nhất**; in rõ endpoint thắng + bảng attempts. Upload POST lên `speed.cloudflare.com/__up` (25 MB, fast: 10 MB), latency = TCP connect time |
 | ICMP latency + jitter (v2) | `ping -c 4` tới 1.1.1.1 (fallback 8.8.8.8): avg + mdev (jitter). Container không có CAP_NET_RAW thì tự bỏ qua, giữ số TCP connect |
 | Địa lý | IPv4/IPv6 qua ipify; geo/ISP/ASN qua ip-api.com |
 
 Deep-scan (v2, in trong section `[2] SYSTEM / REAL CONFIG`): TCP congestion control đang dùng + các thuật toán available (thấy `bbr` là VPS tốt cho proxy/VPN), entropy pool, DNS resolvers, TUN/TAP + FUSE + PPP (đủ để chạy VPN hay không), load average, số tiến trình, timezone.
+
+Deep-scan v3: **CPU steal %** — lấy mẫu `/proc/stat` 2 lần (0.7s): steal > 5% in kèm `noisy neighbor!` (VPS oversell là đây) · CPU freq hiện tại · cpuset cores count · **THP + hugepages** · **swap** total/free · MTU · multi-thread efficiency (`multi ÷ (single × jobs) × 100` — ~100% là scale tuyến tính).
+
+Mọi metric benchmark đều có **tier label** ngay dòng số liệu: CPU (`standard`/`high-perf`/`server-grade`…), RAM (GB/s), disk (`HDD-class`/`SATA-SSD-class`/`entry-NVMe`/`premium-NVMe`), IOPS (`cloud-standard`/`fast-SSD`/`NVMe-class`), net (`slow`/`standard`/`fast`/`gigabit-class`/`10G-class`) — đọc một phát biết ngay VPS mình nằm đẳng cấp nào.
 
 Vì sao số có thể khác các tool/label khác:
 
@@ -191,6 +204,8 @@ Vì sao số có thể khác các tool/label khác:
 | Net up | `upload (Mbps) / 20` |
 
 Ví dụ đọc điểm: 1 core đạt ~500 MB/s sha256 → 500/5 = 100 điểm; RAM 12.5 GB/s → 100 điểm; net 2000 Mbps down → 100 điểm. Một thành phần thiếu dữ liệu (ví dụ `--no-net`) tính 0, không bù điểm.
+
+**v3 thêm grade letter** theo tỷ lệ điểm/tối đa: `S ≥ 630` · `A ≥ 525` · `B ≥ 420` · `C ≥ 315` · `D ≥ 210` · `F` dưới — in ngay cạnh TOTAL và trong JSON (`score.grade`).
 
 ---
 
@@ -264,11 +279,11 @@ Chỉ chạy tay qua `workflow_dispatch` với 2 input: `fast` (mặc định b�
 
 ## 10. Output JSON
 
-`--json report.json` sinh một object với các nhóm key chính (v2 thêm `net_env` và `security`):
+`--json report.json` sinh một object với các nhóm key chính (v2 thêm `net_env` và `security`; **v3 thêm**: `virtualization.chassis_type/chassis_class/wsl_gen/is_chroot/aws_gen/cloud_method`, `system.steal_pct`, `cpu.freq_mhz/efficiency_pct`, `memory.swap`, `limits.cpuset_cores`, disk `class/scheduler/rotational/iops_4k_*`, network `endpoint/attempts`, security `sshd_version/sshd_running/permit_empty_passwords/login_grace_time/x11_forwarding/allow_users/auth_key_perm_issues/mac/updates/risky_ports/miners/docker_sock/sysctl/tmp_opts/sshguard/crowdsec`, `score.grade`):
 
 ```json
 {
-  "tool": "blackhole-vps-bench", "version": "2.0.0", "mode": "all",
+  "tool": "blackhole-vps-bench", "version": "3.0.0", "mode": "all",
   "virtualization": { "kind": "container", "type": "docker", "product": "Docker",
                       "host_type": "kvm", "host_product": "KVM/QEMU",
                       "cloud": "", "evidence": ["..."] },
@@ -320,7 +335,7 @@ Các hạng mục chưa đo được (ví dụ chạy `detect`/`info`, hoặc `f
 
 ## English quick reference
 
-`blackhole-vps-bench` is a single-file pure-bash Linux tool that (1) detects the virtualization environment — KVM/QEMU, Docker, Podman, Kubernetes, LXC/LXD, systemd-nspawn, OpenVZ/Virtuozzo, Xen PV/HVM, Hyper-V, VMware, VirtualBox, bhyve, WSL, or bare metal — printing verifiable evidence lines for every verdict; (2) benchmarks the real cgroup-limited configuration: CPU sha256 throughput (single and effective-core parallel), memory bandwidth (compiled C memcpy loop with a labeled dd fallback), disk sequential and 4K dd throughput with automatic O_DIRECT detection plus optional fio random IOPS, and network download/upload via Cloudflare speed endpoints with TCP connect latency plus ICMP latency/jitter when ping is permitted; (3) audits the local SSH & security posture (password vs pubkey auth, root login, authorized_keys inventory with weak-key detection, failed login counts, firewall, fail2ban, UID-0 accounts, empty passwords, sudo NOPASSWD, ASLR, auto updates, listening ports) summarized as GOOD/FAIR/WEAK — local machine only, no remote scanning; and (4) reports everything to the terminal with colored OK/WARN/BAD badges, plus optional JSON, Markdown, and Discord webhook outputs. Each of 7 score components (cpu1c = sha1c/5, cpumc = shanc/20, mem = GBps*8, dseq = seqw/10, d4k = (4kw+4kr)/4, ndown = down/20, nup = up/20) is capped at 100 for a BH-SCORE of at most 700.
+`blackhole-vps-bench` is a single-file pure-bash Linux tool that (1) detects the virtualization environment — KVM/QEMU, Docker, Podman, Kubernetes, LXC/LXD, systemd-nspawn, OpenVZ/Virtuozzo 7, Xen PV/HVM, Hyper-V, VMware, VirtualBox, Parallels, bhyve, WSL1/WSL2, chroot, or bare metal — plus cloud fingerprinting (AWS Nitro vs Xen, Azure via chassis asset tag, GCE, Oracle Cloud, Alibaba, Tencent, DigitalOcean, Hetzner, Linode, Scaleway, OpenStack) with verifiable evidence lines for every verdict; (2) benchmarks the real cgroup-limited configuration: CPU sha256 throughput (single and effective-core parallel, with multi-thread efficiency %), memory bandwidth (compiled C memcpy loop with a labeled dd fallback), disk sequential and 4K dd throughput with derived 4K IOPS, NVMe/SSD/HDD classification and scheduler detection, automatic O_DIRECT probing plus optional fio random IOPS, and network download via verified best-of-N endpoints (Cloudflare 50 MB, OVH, Thinkbroadband) with upload via Cloudflare, TCP connect latency plus ICMP latency/jitter when ping is permitted; (3) audits the local SSH & security posture (password vs pubkey auth, root login, PermitEmptyPasswords, LoginGraceTime, X11, AllowUsers, authorized_keys inventory with weak-key and permission checks, sshd runtime/version, fail2ban jail state, sshguard, crowdsec, failed login counts, firewall, SELinux/AppArmor, pending updates, exposed services, cryptominer scan, docker.sock, kernel sysctls, UID-0 accounts, empty passwords, sudo NOPASSWD, ASLR, auto updates) summarized as GOOD/FAIR/WEAK — local machine only, no remote scanning; and (4) reports everything to the terminal with colored OK/WARN/BAD badges and per-metric tier labels, plus optional JSON, Markdown, and Discord webhook outputs. Each of 7 score components (cpu1c = sha1c/5, cpumc = shanc/20, mem = GBps*8, dseq = seqw/10, d4k = (4kw+4kr)/4, ndown = down/20, nup = up/20) is capped at 100 for a BH-SCORE of at most 700 with a letter grade S/A/B/C/D/F.
 
 | Flag | Effect |
 |---|---|
