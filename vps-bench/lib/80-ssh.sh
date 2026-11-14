@@ -769,7 +769,7 @@ bhv5c10_eff_decl() {
              x11forwarding kbdinteractiveauthentication maxauthtries; do
     d="$(bhv5c10_norm "$(bhv5c10_decl "$key")")"
     e="$(bhv5c10_norm "$(sec_sshd_opt "$key" "")")"
-    [ -n "$d" ] && [ -n "$e" ] || continue
+    if [ -z "$d" ] || [ -z "$e" ]; then continue; fi
     if [ "$d" != "$e" ]; then
       n=$((n + 1))
       sec_line warn "declared '$key $d' overridden to '$e' (Match/drop-in)"
@@ -853,7 +853,7 @@ bhv5c10_ak_deep() {
       case ",$seen," in *",${path},"*) continue ;; esac
       seen="$seen,$path"
       kf="$path"
-      [ -f "$kf" ] && [ -r "$kf" ] || continue
+      if [ ! -f "$kf" ] || [ ! -r "$kf" ]; then continue; fi
       f_dsa=0
       # one awk pass per file: key type + comment CLASS per key line
       # (IFS=" " — with IFS= unset-field-splitting would put the whole line in $kt)
@@ -930,7 +930,7 @@ bhv5c10_hostkey_audit() {
   BH_HOSTKEY_AUDIT=""
   local f n=0 dsa=0 small=0 mid=0 first_mt="" same=1 out bits tp fp fps mt
   for f in /etc/ssh/ssh_host_*_key.pub; do
-    [ -f "$f" ] && [ -r "$f" ] || continue
+    if [ ! -f "$f" ] || [ ! -r "$f" ]; then continue; fi
     n=$((n + 1))
     if command_exists ssh-keygen; then
       out="$(sec_to 2 ssh-keygen -lf "$f" | head -n 1)"

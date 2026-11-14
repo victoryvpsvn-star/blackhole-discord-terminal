@@ -727,6 +727,7 @@ bhv5c3_tell_add() {
 # (e1000/rtl8139/pcnet32) are a weaker "emu-nic" tell. Inside a container
 # the netns devices are host-side, so the emu-nic tell gains a (host-view)
 # suffix per spec.
+  # shellcheck disable=SC2120  # optional fixture-path arg ($1) for offline unit tests
 bhv5c3_tell_nic() {
   local base="${1:-/sys/class/net}"   # arg 1: base dir (test fixture override)
   [ -d "$base" ] || return 0
@@ -792,6 +793,7 @@ bhv5c3_tell_nic() {
 # 0x5853 Xen. An absent/empty PCI bus on x86 (where every real board
 # enumerates PCI) hints at a microvm (pci=off) layout — but inside a
 # container the empty bus is a namespace artifact, so no tell there.
+  # shellcheck disable=SC2120  # optional fixture-path arg ($1) for offline unit tests
 bhv5c3_tell_pci() {
   local dir="${1:-/sys/bus/pci/devices}"   # arg 1: devices dir (test fixture override)
   local d v any=0
@@ -838,6 +840,7 @@ bhv5c3_tell_pci() {
 # ---- tell: VMM kernel modules (/sys/module) ----
 # vmw_*/hv_*/xen_*/virtio_*/ptp_kvm module dirs leak the host VMM layer;
 # kvm_amd|kvm_intel WITHOUT a hypervisor flag means this box RUNS VMs (host).
+  # shellcheck disable=SC2120  # optional fixture-path arg ($1) for offline unit tests
 bhv5c3_tell_modules() {
   local base="${1:-/sys/module}"   # arg 1: module dir (test fixture override)
   local d name hits="" kvmmod=""
@@ -896,6 +899,7 @@ bhv5c3_tell_dmesg() {
 # ---- tell: kernel cmdline fingerprints ----
 # firecracker-style: reboot=k + pci=off + 8250* (>= 3 tokens) => microvm;
 # VM-style: root=/dev/vd?|xvd? + console=ttyS0.
+  # shellcheck disable=SC2120  # optional fixture-path arg ($1) for offline unit tests
 bhv5c3_tell_cmdline() {
   local cf="${1:-/proc/cmdline}"   # arg 1: cmdline file (test fixture override)
   [ -r "$cf" ] || return 0
@@ -929,6 +933,7 @@ bhv5c3_tell_cmdline() {
 # ---- tell: device-tree hypervisor (aarch64/arm only) ----
 # /proc/device-tree/hypervisor/compatible carries "linux,kvm" or "xen";
 # the file is NUL-padded property data, so strip NUL bytes first.
+  # shellcheck disable=SC2120  # optional fixture-path arg ($1) for offline unit tests
 bhv5c3_tell_dt() {
   local cf="${1:-/proc/device-tree/hypervisor/compatible}"   # arg 1: compatible file (test fixture override)
   case "${BHV5C3_ARCH:-}" in
@@ -952,6 +957,7 @@ bhv5c3_tell_dt() {
 }
 
 # ---- tell + global: Xen version (/sys/hypervisor) ----
+  # shellcheck disable=SC2120  # optional fixture-path arg ($1) for offline unit tests
 bhv5c3_tell_xenver() {
   local base="${1:-/sys/hypervisor}"   # arg 1: /sys/hypervisor dir (test fixture override)
   [ "$(cat "$base/type" 2>/dev/null)" = "xen" ] || return 0
@@ -1001,6 +1007,7 @@ bhv5c3_qemu_accel() {
 # keep 1-byte alignment even for space/NUL bytes), takes OEM ID bytes 10-15,
 # sanitizes to [A-Z0-9 ] and maps known VMM OEMs. Missing/unreadable (root-only
 # 0400 is tolerated) => "". Unknown OEM => "" (raw ID not reported).
+  # shellcheck disable=SC2120  # optional fixture-path arg ($1) for offline unit tests
 bhv5c3_acpi_oem() {
   BH_ACPI_OEM=""
   local f="${1:-/sys/firmware/acpi/tables/DSDT}"   # arg 1: table file (test fixture override)
@@ -1085,6 +1092,8 @@ bhv5c3_deep_tells() {
   if grep -qE 'kvmclock|kvm_steal_time|kvm_asyncpf' /proc/cpuinfo 2>/dev/null; then BHV5C3_PV=1; fi
   BHV5C3_CS="$(cat /sys/devices/system/clocksource/clocksource0/current_clocksource 2>/dev/null)"
   # evidence tells (never touch verdicts)
+  # shellcheck disable=SC2119  # deliberate no-arg calls in production path
+  # shellcheck disable=SC2119  # deliberate no-arg calls in production path
   bhv5c3_tell_nic
   bhv5c3_tell_pci
   bhv5c3_tell_modules

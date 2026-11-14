@@ -168,13 +168,13 @@ bhv5c15_progress() {
 # (lib file not merged yet) never breaks main. Timing names:
 # region spec hw container mounts [health].
 bhv5c15_v5_gathers() {
-  bh_mod_enabled region    && declare -F gather_region      >/dev/null 2>&1 && bh_timed region    gather_region      || true
-  bh_mod_enabled spec      && declare -F gather_speccheck   >/dev/null 2>&1 && bh_timed spec      gather_speccheck   || true
-  bh_mod_enabled hw        && declare -F gather_hwdeep      >/dev/null 2>&1 && bh_timed hw        gather_hwdeep      || true
-  bh_mod_enabled container && declare -F gather_container   >/dev/null 2>&1 && bh_timed container gather_container   || true
-  bh_mod_enabled mounts    && declare -F gather_mount_audit >/dev/null 2>&1 && bh_timed mounts    gather_mount_audit || true
+  if bh_mod_enabled region && declare -F gather_region >/dev/null 2>&1; then bh_timed region gather_region; fi
+  if bh_mod_enabled spec && declare -F gather_speccheck >/dev/null 2>&1; then bh_timed spec gather_speccheck; fi
+  if bh_mod_enabled hw && declare -F gather_hwdeep >/dev/null 2>&1; then bh_timed hw gather_hwdeep; fi
+  if bh_mod_enabled container && declare -F gather_container >/dev/null 2>&1; then bh_timed container gather_container; fi
+  if bh_mod_enabled mounts && declare -F gather_mount_audit >/dev/null 2>&1; then bh_timed mounts gather_mount_audit; fi
   if [ "${1:-}" = "--health" ]; then
-    bh_mod_enabled health && declare -F gather_storage_health >/dev/null 2>&1 && bh_timed health gather_storage_health || true
+    if bh_mod_enabled health && declare -F gather_storage_health >/dev/null 2>&1; then bh_timed health gather_storage_health; fi
   fi
   return 0
 }
@@ -536,13 +536,13 @@ main() {
       bh_mod_enabled mem     && bh_timed mem bench_mem
       bhv5c15_progress "disk bench..."
       bh_mod_enabled disk    && bh_timed disk bench_disk
-      bh_mod_enabled diskdur && declare -F bench_disk_dur >/dev/null 2>&1 && bh_timed diskdur bench_disk_dur || true
+      if bh_mod_enabled diskdur && declare -F bench_disk_dur >/dev/null 2>&1; then bh_timed diskdur bench_disk_dur; fi
       bh_mod_enabled storage && bh_timed storage gather_storage_map
       bhv5c15_progress "extras bench..."
       bh_mod_enabled extra   && bh_timed extra bench_extra
       bhv5c15_progress "network bench..."
       bh_mod_enabled net     && bh_timed net bench_net
-      bh_mod_enabled netextra && declare -F bench_net_extra >/dev/null 2>&1 && bh_timed netextra bench_net_extra || true
+      if bh_mod_enabled netextra && declare -F bench_net_extra >/dev/null 2>&1; then bh_timed netextra bench_net_extra; fi
       compute_scores
       declare -F bh_history_append >/dev/null 2>&1 && bh_history_append
       declare -F bh_history_render >/dev/null 2>&1 && bh_history_render
@@ -553,13 +553,13 @@ main() {
       bh_mod_enabled mem     && bh_timed mem bench_mem
       bhv5c15_progress "disk bench..."
       bh_mod_enabled disk    && bh_timed disk bench_disk
-      bh_mod_enabled diskdur && declare -F bench_disk_dur >/dev/null 2>&1 && bh_timed diskdur bench_disk_dur || true
+      if bh_mod_enabled diskdur && declare -F bench_disk_dur >/dev/null 2>&1; then bh_timed diskdur bench_disk_dur; fi
       bh_mod_enabled storage && bh_timed storage gather_storage_map
       bhv5c15_progress "extras bench..."
       bh_mod_enabled extra   && bh_timed extra bench_extra
       bhv5c15_progress "network bench..."
       bh_mod_enabled net     && bh_timed net bench_net
-      bh_mod_enabled netextra && declare -F bench_net_extra >/dev/null 2>&1 && bh_timed netextra bench_net_extra || true
+      if bh_mod_enabled netextra && declare -F bench_net_extra >/dev/null 2>&1; then bh_timed netextra bench_net_extra; fi
       compute_scores
       declare -F bh_history_append >/dev/null 2>&1 && bh_history_append
       declare -F bh_history_render >/dev/null 2>&1 && bh_history_render

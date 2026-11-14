@@ -142,7 +142,7 @@ bhv5c9_edr_census() {
   esac
   if [ "$audit_running" = "1" ]; then
     for f in /etc/audit/rules.d/*.rules /etc/audit/audit.rules; do
-      [ -f "$f" ] && [ -r "$f" ] || continue
+      if [ ! -f "$f" ] || [ ! -r "$f" ]; then continue; fi
       cnt="$(grep -cvE '^[[:space:]]*(#|$)' "$f" 2>/dev/null)"
       case "$cnt" in ''|*[!0-9]*) cnt=0 ;; esac
       n=$(( n + cnt ))
