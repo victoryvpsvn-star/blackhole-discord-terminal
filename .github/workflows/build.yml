@@ -1,0 +1,149 @@
+# ============================================================
+#  BLACKHOLE — MỘT workflow duy nhất build đủ 5 bản:
+#    Linux x64 (musl STATIC) | Linux x86 | Windows x64 | Windows x86
+#  Build xong TỰ ĐỘNG gửi file .zip về Discord qua webhook
+# ============================================================
+
+name: "BLACKHOLE • Build 5 bản + gửi Discord"
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # ⚠️ Webhook Discord. Nên bảo mật hơn: tạo repo secret DISCORD_WEBHOOK
+  # rồi thay dòng dưới bằng:  DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK }}
+  DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/1570794468356137060/NMGpqRun_Z13CiNZQTp6AlB59psNca9hnnJcfJ2rjU1jv7ftl2hvN8lAxKAUviV_6CgI"
+
+jobs:
+  build:
+    name: build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64-musl, target: x86_64-unknown-linux-musl, apt: "musl-tools",            ext: ""    }
+          - { name: linux-x64,      target: x86_64-unknown-linux-gnu, apt: "",                        ext: ""    }
+          - { name: linux-x86,      target: i686-unknown-linux-gnu,   apt: "gcc-multilib g++-multilib", ext: ""    }
+          - { name: windows-x64,    target: x86_64-pc-windows-gnu,    apt: "mingw-w64",                 ext: ".exe"}
+          - { name: windows-x86,    target: i686-pc-windows-gnu,      apt: "mingw-w64",                 ext: ".exe"}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cài thư viện hệ thống
+        run: |
+          sudo apt-get update -qq
+          if [ -n "${{ matrix.apt }}" ]; then sudo apt-get install -y -qq ${{ matrix.apt }}; fi
+
+      - name: Thêm target Rust
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release (tối ưu size cho máy yếu)
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          AR_x86_64_unknown_linux_musl: ar
+          CC_i686_unknown_linux_gnu: gcc
+          CFLAGS_i686_unknown_linux_gnu: -m32
+          CC_i686_pc_windows_gnu: i686-w64-mingw32-gcc
+          CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc
+          AR_i686_pc_windows_gnu: i686-w64-mingw32-ar
+          AR_x86_64_pc_windows_gnu: x86_64-w64-mingw32-ar
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Đóng gói
+        run: |
+          BIN="target/${{ matrix.target }}/release/blackhole${{ matrix.ext }}"
+          OUT="blackhole-${{ matrix.name }}${{ matrix.ext }}"
+          cp "$BIN" "$OUT"
+          strip "$OUT" 2>/dev/null || true
+          zip -9 "blackhole-${{ matrix.name }}.zip" "$OUT"
+          sha256sum "$OUT" > "blackhole-${{ matrix.name }}.sha256"
+          echo "=== $OUT ==="
+          ls -lh "$OUT" "blackhole-${{ matrix.name }}.zip"
+
+      - name: Lưu artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: blackhole-${{ matrix.name }}
+          path: |
+            blackhole-${{ matrix.name }}.zip
+            blackhole-${{ matrix.name }}.sha256
+          if-no-files-found: error
+
+  discord:
+    name: Gửi build qua Discord webhook
+    needs: build
+    if: ${{ always() }}          # build lỗi CŨNG báo về Discord
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tải artifact
+        uses: actions/download-artifact@v4
+        with:
+          pattern: blackhole-*
+          path: dist
+          merge-multiple: true
+
+      - name: Gửi file + thông báo lên Discord
+        env:
+          BUILD_OK: ${{ needs.build.result == 'success' }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          cd dist
+          DESC=""
+          for f in blackhole-*.zip; do
+            [ -e "$f" ] || continue
+            SZ=$(du -h "$f" | cut -f1)
+            DESC="${DESC}• ${f} (${SZ})"$'\n'
+          done
+          if [ "$BUILD_OK" = "true" ]; then
+            COLOR=3066993
+            TITLE="✅ Build BLACKHOLE v2.1 thành công — gửi đủ 5 bản"
+            BODY="Xong rồi! Linux x64 musl STATIC + Linux x86 + Windows x64/x86. Mới v2.1: TRÌNH DUYỆT ẨN tự bắt captcha (trang xác minh phong cách Discord, bạn tự bấm, không dán tay) + /voice mượn browser vào voice. Giao diện discordo-style + xem ảnh + đăng nhập email giữ nguyên."
+          else
+            COLOR=15158332
+            TITLE="❌ Build BLACKHOLE có lỗi"
+            BODY="Một hoặc nhiều target build lỗi — vào tab Actions của repo xem log."
+          fi
+          PAYLOAD=$(jq -n \
+            --arg title "$TITLE" --arg body "$BODY" --arg desc "$DESC" \
+            --arg repo "$REPO" --arg sha "${SHA:0:7}" --arg branch "$BRANCH" \
+            --argjson color "$COLOR" \
+            '{username:"BLACKHOLE Builder",
+              content:$body,
+              embeds:[{
+                title:$title,
+                description:$desc,
+                color:$color,
+                fields:[
+                  {name:"Repo",   value:$repo},
+                  {name:"Branch", value:$branch},
+                  {name:"Commit", value:$sha}
+                ],
+                footer:{text:"BLACKHOLE v2.1 • Rust terminal • trình duyệt ẩn tự bắt captcha • /voice • email login"}
+              }]}')
+          ARGS=(-sS -o resp.json -w "%{http_code}" "${DISCORD_WEBHOOK_URL}?wait=true"
+                -F "payload_json=${PAYLOAD}")
+          i=0
+          for f in blackhole-*.zip; do
+            [ -e "$f" ] || continue
+            ARGS+=(-F "files[$i]=@$f")
+            i=$((i+1))
+          done
+          CODE=$(curl "${ARGS[@]}")
+          echo "Webhook HTTP: $CODE"
+          [ -f resp.json ] && cat resp.json || true
+          if [ "$CODE" != "200" ] && [ "$CODE" != "204" ]; then
+            echo "::warning::Webhook trả về $CODE — kiểm tra lại URL/token webhook (401/404 = webhook sai hoặc đã bị xóa)"
+          fi
