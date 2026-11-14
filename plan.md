@@ -387,3 +387,37 @@ cấm gọi mọi API/browser (đã chặn ở từng lệnh).
 ---
 
 *— Hết plan. Toàn bộ code v2.1 bám 100% spec này, không tự ý thêm deps ngoài danh sách mục 6.*
+
+---
+
+## 12. PIVOT v3.0 — BLACKHOLE BROWSER (yêu cầu chủ dự án 14/11/2026)
+
+> "ko làm discord on terminal nữa — làm browser gaming + core browser tối ưu cực mượt
+> cho game thủ, đấu với browser gaming thế hệ 5, mượt hơn Opera và dùng ít RAM.
+> Dùng workflow để bench lẫn xây browser, tự gửi file + điểm số lên webhook."
+
+### 12.1 NGUYÊN TẮC THIẾT KẾ (squad C9/C10 chuyển sang browser)
+
+| Hạng mục | Quyết định | Lý do |
+|---|---|---|
+| Engine | **KHÔNG bundle** — dùng webview hệ thống (WebView2 / WebKitGTK) | Opera GX nhúng Chromium: cài 300-500MB, RAM ~500MB+. Webview hệ thống = 0 MB cài thêm, RAM thấp hơn hẳn |
+| UI | 2 webview con (thanh tab + nội dung) + IPC JSON | nhẹ, không framework, không electron |
+| Tabs | tối đa 24, switch = dựng lại webview nội dung | v1.0 giữ binary nhỏ; v1.1 roadmap multi-webview giữ state |
+| Binary | opt-level=z + lto + strip | mục tiêu < 10MB |
+| Bảo mật | IPC chỉ đẩy JSON vào inbox; không lock qua webview call | chống deadlock COM |
+
+### 12.2 SPEC BENCH (browser/bench/)
+
+- `gen-pages.ps1`: 5 trang nửa nặng (DOM 1500 dòng + heap ~30MB + SVG + rAF anim) — cùng bộ cho mọi browser, công bằng tuyệt đối.
+- `bench.ps1`: cold start (spawn → CDP ready), RAM 5 tabs (tổng WS/Private cây process), Speedometer 3 qua CDP WebSocket.
+- Đối thủ: Microsoft Edge, Google Chrome, Opera GX (choco). Bỏ qua đối thủ nào không cài được — không bịa số.
+
+### 12.3 KPI NGHIỆM THU v3.0
+
+| Mục | Tiêu chí |
+|---|---|
+| Build | Windows x64 + Linux x64 xanh trên Actions |
+| Webhook | zip build + bảng điểm số vào Discord (HTTP 200 trong log) |
+| Bench | chạy THẬT, có số thật cho ≥ 2 browser (BLACKHOLE + Edge); ghi chú công bằng về nhân Chromium |
+| Compile | `cargo check --target x86_64-pc-windows-msvc` pass trước khi push |
+

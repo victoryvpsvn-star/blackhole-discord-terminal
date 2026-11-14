@@ -1,3 +1,34 @@
+# BLACKHOLE — Gaming Browser siêu nhẹ (mới) + Discord Terminal v2.1 (100% Rust)
+
+> **PIVOT v3.0 — BLACKHOLE BROWSER**: chủ dự án chuyển sang **gaming browser** đấu với
+> Opera GX (browser gaming "thế hệ 5"). Toàn bộ source nằm ở `browser/`, CI ở
+> `.github/workflows/browser.yml`: build Windows x64 + Linux x64 rồi **BENCH THẬT trên
+> GitHub Actions runner** — đo Cold start, RAM 5 tabs, Speedometer 3 đối đầu
+> **Microsoft Edge / Google Chrome / Opera GX**, tự gửi file + bảng điểm về Discord webhook.
+>
+> Vì sao BLACKHOLE Browser nhẹ hơn: **KHÔNG bundle engine**. Opera GX cài 300-500MB, bật
+> lên chiếm ~500MB+ RAM vì nó NHÚNG cả Chromium. BLACKHOLE dùng **webview hệ thống** máy
+> bạn đã có sẵn (Windows = WebView2, Linux = WebKitGTK) — binary chỉ vài MB, không service
+> nền, không telemetry, mọi MB RAM dành cho trang web đang mở.
+
+### BLACKHOLE Browser — tính năng v1.0
+
+- Tab nhiều lớp (thanh tab riêng, tối đa 24 tab) + Speed Dial phong cách gaming
+- Phím tắt gaming: `Ctrl+T` tab mới · `Ctrl+W` đóng · `Ctrl+Tab` chuyển · `Ctrl+1..8` nhảy tab · `Ctrl+L` focus URL · `Ctrl+R/F5` reload · `Ctrl+H` speed dial · `F11` fullscreen
+- Tìm kiếm nhanh bằng DuckDuckGo, auto-gắn `https://` khi gõ domain
+- Binary tối ưu `opt-level=z` + LTO + strip; UI thuần HTML/CSS/JS nhẹ nhàng
+
+### BENCH (chạy tự động, không bịa số)
+
+| Chỉ số | Cách đo |
+|---|---|
+| **Cold start** | từ spawn process → CDP ready (ms) |
+| **RAM 5 tabs** | tổng Working Set/Private của toàn cây process khi mở 5 trang bench nửa nặng |
+| **Speedometer 3** | điểm chuẩn JS/render của browserbench.org, chạy qua CDP |
+
+Kết quả mới nhất: xem artifact `browser-bench-result` trong tab Actions, hoặc bảng điểm
+được gửi tự động về Discord webhook sau mỗi lần push `browser/**`.
+
 # BLACKHOLE v2.1 — Discord Terminal siêu nhẹ (100% Rust)
 
 Giao diện full-screen kiểu **discordo** · **xem ảnh ngay trong terminal** · **đăng nhập email + password** · **TRÌNH DUYỆT ẨN tự bắt captcha** (trang xác minh phong cách Discord, bạn chỉ tự bấm — không dán tay) · **/voice mượn browser vào voice** · realtime gateway · reply / edit / delete.
