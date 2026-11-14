@@ -22,13 +22,23 @@ $cs = Get-CimInstance Win32_ComputerSystem
 $os = Get-CimInstance Win32_OperatingSystem
 Write-Host ("CPU cores: {0} | RAM: {1:N1} GB | OS: {2}" -f $env:NUMBER_OF_PROCESSORS, ($cs.TotalPhysicalMemory / 1GB), $os.Caption)
 
-# ---------- FIX: FORCE repair WebView2 Runtime (bootstrapper idempotent) ----------
-Write-Host "Đang đảm bảo WebView2 Runtime đăng ký đúng (repair silent — 30-60s)..."
+# ---------- FIX: cài STANDALONE WebView2 Runtime (offline, chắc chắn đăng ký) ----------
+$pvKey = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+$pv = (Get-ItemProperty $pvKey -ErrorAction SilentlyContinue).pv
+Write-Host ("WebView2 registry pv (trước): {0}" -f ($pv ?? 'KHÔNG CÓ'))
 try {
-  Invoke-WebRequest 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile "$env:TEMP\wv2setup.exe" -UseBasicParsing -TimeoutSec 180
-  $proc = Start-Process "$env:TEMP\wv2setup.exe" -ArgumentList '/silent','/install' -Wait -PassThru
-  Write-Host ("WebView2 bootstrapper exit code: {0}" -f $proc.ExitCode)
-} catch { Write-Host "!! cài/repair WebView2 lỗi: $_" }
+  Write-Host "Tải STANDALONE WebView2 Runtime x64 từ edgeupdates API..."
+  $api = Invoke-RestMethod 'https://edgeupdates.microsoft.com/api/products' -TimeoutSec 60
+  $prod = $api | Where-Object { $_.Product -eq 'WebView2' } | Select-Object -First 1
+  $rel = $prod.Releases | Where-Object { $_.Platform -eq 'Windows' -and $_.Arch -eq 'x64' } | Select-Object -First 1
+  $url = $rel.Artifacts[0].Location
+  Write-Host "Standalone installer: $url"
+  Invoke-WebRequest $url -OutFile "$env:TEMP\wv2standalone.exe" -UseBasicParsing -TimeoutSec 600
+  $p2 = Start-Process "$env:TEMP\wv2standalone.exe" -ArgumentList '/silent','/install' -Wait -PassThru
+  Write-Host ("Standalone installer exit: {0}" -f $p2.ExitCode)
+} catch { Write-Host "!! standalone install lỗi: $_" }
+$pv = (Get-ItemProperty $pvKey -ErrorAction SilentlyContinue).pv
+Write-Host ("WebView2 registry pv (sau): {0}" -f ($pv ?? 'KHÔNG CÓ — sẽ FAIL tiếp'))
 $wv2 = @('C:\Program Files (x86)\Microsoft\EdgeWebView\Application',
          'C:\Program Files\Microsoft\EdgeWebView\Application') |
         Where-Object { Test-Path $_ } | Select-Object -First 1
