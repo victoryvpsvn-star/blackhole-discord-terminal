@@ -243,5 +243,16 @@ Xem `plan.md` — kế hoạch dự án cấp công ty: đội hình 300 agent (
 - Dán chuỗi nhiều dòng vào ô nhập: chỉ lấy ký tự (bỏ xuống dòng).
 - Nếu gateway rớt, tin nhắn trong lúc rớt sẽ thiếu → `/history` để nạp lại.
 
+## BLACKHOLE VPS BENCH — tool kiểm tra VPS (KVM/Docker/OpenVZ/...) + benchmark đúng cấu hình
+
+Tool bash thuần trong [`vps-bench/`](vps-bench/): nhận diện môi trường VPS (KVM, QEMU, Docker, Podman, Kubernetes, LXC/LXD, OpenVZ, Xen, Hyper-V, VMware, VirtualBox, bhyve, WSL, bare metal) kèm **bằng chứng nhận diện**, rồi benchmark **đúng cấu hình thực** (đọc cgroup quota/limit — không báo nhầm RAM/CPU của host khi chạy trong container): CPU sha256 1 core + multi, bandwidth RAM, disk seq/4K (tự dò direct I/O), mạng down/up qua Cloudflare, IP/ASN. Xuất terminal/JSON/Markdown và **tự gửi báo cáo về Discord webhook**.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/victoryvpsvn-star/blackhole-discord-terminal/main/vps-bench/install.sh | sh
+blackhole-vps-bench detect    # KVM hay Docker? — 1 giây, có bằng chứng
+```
+
+CI tự test tool trên GitHub Actions (ubuntu host + container Alpine/Debian/Rocky/Fedora, shellcheck, hàng tuần theo cron) và có workflow riêng để **bench VPS thật qua SSH** — chi tiết xem [`vps-bench/README.md`](vps-bench/README.md).
+
 ## License
 MIT — dùng thoải mái. Đừng quên: user token = rủi ro ToS, tự chịu trách nhiệm nhé.

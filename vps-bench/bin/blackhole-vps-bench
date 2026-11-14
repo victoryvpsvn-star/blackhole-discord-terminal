@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# blackhole-vps-bench entry point.
+# Runs from a repo checkout (sources lib/*.sh) or as a bundled single file
+# produced by build.sh (BH_EMBEDDED=1 prepended, libs inlined, main called at end).
+set -u
+
+BH_SELF="${BASH_SOURCE[0]}"
+BH_SELF_DIR="$(cd -- "$(dirname -- "$BH_SELF")" && pwd)" || exit 2
+
+if [ "${BH_EMBEDDED:-0}" != "1" ]; then
+  BH_LIB_DIR="$(cd -- "$BH_SELF_DIR/../lib" 2>/dev/null && pwd)" || BH_LIB_DIR=""
+  if [ -z "$BH_LIB_DIR" ] || [ ! -d "$BH_LIB_DIR" ]; then
+    printf 'blackhole-vps-bench: cannot locate lib/ next to %s\n' "$BH_SELF" >&2
+    printf 'hint: run from the repo, or use the bundled single-file build (vps-bench/dist/)\n' >&2
+    exit 2
+  fi
+  # shellcheck disable=SC1090
+  for _bh_lib in "$BH_LIB_DIR"/*.sh; do
+    . "$_bh_lib"
+  done
+  main "$@"
+fi

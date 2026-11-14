@@ -1,0 +1,141 @@
+name: vps-bench selftest
+
+# BLACKHOLE fleet: the tool tests itself across VMs and containers,
+# weekly on schedule and on every change to vps-bench/**.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'vps-bench/**'
+      - '.github/workflows/vps-bench-selftest.yml'
+  pull_request:
+    paths:
+      - 'vps-bench/**'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * 1' # every Monday 03:00 UTC
+
+concurrency:
+  group: vps-bench-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+      - name: Build bundle
+        run: vps-bench/build.sh
+      - name: shellcheck
+        run: >
+          shellcheck -x -e SC2034,SC2016,SC2317
+          vps-bench/dist/blackhole-vps-bench
+          vps-bench/install.sh
+          vps-bench/tests/run-tests.sh
+      - name: Bundle freshness check
+        run: |
+          git diff --exit-code -- vps-bench/dist \
+            || { echo "::error::dist bundle is stale — run vps-bench/build.sh and commit the result"; exit 1; }
+
+  smoke:
+    name: ${{ matrix.os }} (host)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-22.04]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Smoke tests
+        run: vps-bench/tests/run-tests.sh
+      - name: Full bench (fast profile, with network)
+        run: |
+          vps-bench/bin/blackhole-vps-bench all --fast \
+            --json /tmp/report.json --markdown /tmp/report.md --output /tmp/report.txt
+      - name: Show verdict
+        run: grep -A6 "VIRTUALIZATION VERDICT" /tmp/report.txt || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: report-${{ matrix.os }}
+          path: |
+            /tmp/report.json
+            /tmp/report.md
+            /tmp/report.txt
+          if-no-files-found: error
+
+  containers:
+    name: container ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: alpine:3.20,   full: true  }
+          - { image: debian:12,     full: true  }
+          - { image: rockylinux:9,  full: false }
+          - { image: fedora:41,     full: false }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build bundle
+        run: vps-bench/build.sh
+      - name: Run inside ${{ matrix.image }}
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work "${{ matrix.image }}" bash -c '
+            set -e
+            if grep -qi alpine /etc/os-release; then
+              apk add --no-cache bash curl coreutils openssl >/dev/null
+            elif grep -qi debian /etc/os-release; then
+              apt-get update -qq && apt-get install -y -qq bash curl openssl >/dev/null
+            else
+              (dnf -y install bash curl openssl coreutils || yum -y install bash curl openssl coreutils) >/dev/null
+            fi
+            bash vps-bench/bin/blackhole-vps-bench detect
+            if [ "${{ matrix.full }}" = "true" ]; then
+              bash vps-bench/bin/blackhole-vps-bench all --fast --no-net --output /tmp/report.txt
+              grep -q "Kind    :" /tmp/report.txt
+              echo "--- verdict ---"
+              grep "Verdict :" /tmp/report.txt
+            fi
+          '
+
+  notify:
+    name: discord notify
+    needs: [lint, smoke, containers]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Send CI result to Discord
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          LINT: ${{ needs.lint.result }}
+          SMOKE: ${{ needs.smoke.result }}
+          CONT: ${{ needs.containers.result }}
+        run: |
+          if [ -z "$WEBHOOK" ]; then
+            echo "DISCORD_WEBHOOK not configured — skipping notify"
+            exit 0
+          fi
+          ok=true
+          for r in "$LINT" "$SMOKE" "$CONT"; do
+            [ "$r" = "success" ] || [ "$r" = "skipped" ] || ok=false
+          done
+          if $ok; then color=3066993; title="vps-bench selftest: PASS"; else color=15158332; title="vps-bench selftest: FAIL"; fi
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          desc=$(printf 'lint: %s\nsmoke: %s\ncontainers: %s\n\n[open run](%s)' "$LINT" "$SMOKE" "$CONT" "$run_url")
+          jq -n --arg t "$title" --arg d "$desc" --argjson c "$color" --arg u "$run_url" \
+            '{username:"Blackhole VPS Bench", embeds:[{title:$t, url:$u, description:$d, color:$c, timestamp:(now|todateiso8601)}]}' \
+            > /tmp/notify.json
+          curl -sS -o /dev/null -w 'discord http %{http_code}\n' --max-time 20 \
+            -H 'Content-Type: application/json' -X POST --data-binary @/tmp/notify.json "$WEBHOOK"

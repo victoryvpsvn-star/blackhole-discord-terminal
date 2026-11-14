@@ -1,0 +1,1300 @@
+#!/usr/bin/env bash
+BH_EMBEDDED=1
+# bundled build — regenerate with build.sh
+# blackhole-vps-bench entry point.
+# Runs from a repo checkout (sources lib/*.sh) or as a bundled single file
+# produced by build.sh (BH_EMBEDDED=1 prepended, libs inlined, main called at end).
+set -u
+
+BH_SELF="${BASH_SOURCE[0]}"
+BH_SELF_DIR="$(cd -- "$(dirname -- "$BH_SELF")" && pwd)" || exit 2
+
+if [ "${BH_EMBEDDED:-0}" != "1" ]; then
+  BH_LIB_DIR="$(cd -- "$BH_SELF_DIR/../lib" 2>/dev/null && pwd)" || BH_LIB_DIR=""
+  if [ -z "$BH_LIB_DIR" ] || [ ! -d "$BH_LIB_DIR" ]; then
+    printf 'blackhole-vps-bench: cannot locate lib/ next to %s\n' "$BH_SELF" >&2
+    printf 'hint: run from the repo, or use the bundled single-file build (vps-bench/dist/)\n' >&2
+    exit 2
+  fi
+  # shellcheck disable=SC1090
+  for _bh_lib in "$BH_LIB_DIR"/*.sh; do
+    . "$_bh_lib"
+  done
+  main "$@"
+fi
+
+# ============ lib/00-core.sh ============
+# =====================================================================
+# blackhole-vps-bench · 00-core.sh — constants, env, helpers
+# =====================================================================
+# shellcheck shell=bash
+
+BH_VERSION="1.0.0"
+BH_TOOL="blackhole-vps-bench"
+BH_REPO="victoryvpsvn-star/blackhole-discord-terminal"
+
+export LC_ALL=C
+umask 077
+
+# ------- configuration (env overridable, CLI wins later) -------
+BH_FAST="${BH_FAST:-0}"
+BH_NO_NET="${BH_NO_NET:-0}"
+BH_WEBHOOK="${BH_WEBHOOK:-}"
+BH_JSON_OUT="${BH_JSON_OUT:-}"
+BH_MD_OUT="${BH_MD_OUT:-}"
+BH_TXT_OUT="${BH_TXT_OUT:-}"
+BH_DISK_DIR="${BH_DISK_DIR:-/tmp}"
+BH_NO_COLOR="${BH_NO_COLOR:-0}"
+
+# ------- colors (report bodies stay ANSI-free; only the banner gets color on a TTY) -------
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "$BH_NO_COLOR" != "1" ]; then
+  C_RST=$'\033[0m'; C_B=$'\033[1m'; C_DIM=$'\033[2m'
+  C_CYN=$'\033[36m'; C_GRN=$'\033[32m'; C_YLW=$'\033[33m'; C_RED=$'\033[31m'; C_MAG=$'\033[35m'
+else
+  C_RST=''; C_B=''; C_DIM=''; C_CYN=''; C_GRN=''; C_YLW=''; C_RED=''; C_MAG=''
+fi
+
+# ------- logging -------
+log()  { printf '[%s] %s\n' "$BH_TOOL" "$*" >&2; }
+warn() { printf '[%s] WARN: %s\n' "$BH_TOOL" "$*" >&2; }
+die()  { printf '[%s] ERROR: %s\n' "$BH_TOOL" "$*" >&2; exit "${2:-2}"; }
+
+# ------- temp workspace -------
+BH_RUNDIR="$(mktemp -d "${TMPDIR:-/tmp}/bhvps.XXXXXX")" || die "cannot create temp dir"
+bh_cleanup() { rm -rf "$BH_RUNDIR"; }
+trap bh_cleanup EXIT
+
+# ------- time helpers -------
+now_ms() {
+  if [ -n "${EPOCHREALTIME:-}" ]; then
+    awk -v t="$EPOCHREALTIME" 'BEGIN{n=split(t,a,"."); printf "%d", a[1]*1000 + int(substr((a[2] "000"),1,3))}'
+  elif [ -r /proc/uptime ]; then
+    awk '{printf "%d", $1*1000}' /proc/uptime
+  else
+    date +%s000
+  fi
+}
+
+# ------- formatting -------
+fmt_mb()    { awk -v v="$1" 'BEGIN{ if (v=="" || v+0<=0) print "n/a"; else if (v>=1000) printf "%.2f GB/s", v/1024; else printf "%.1f MB/s", v }'; }
+fmt_gbs()   { awk -v v="$1" 'BEGIN{ if (v=="" || v+0<=0) print "n/a"; else printf "%.2f GB/s", v }'; }
+fmt_mbps()  { awk -v v="$1" 'BEGIN{ if (v=="" || v+0<=0) print "n/a"; else if (v>=1000) printf "%.2f Gbps", v/1000; else printf "%.1f Mbps", v }'; }
+fmt_ms()    { awk -v v="$1" 'BEGIN{ if (v=="" || v+0<=0) print "n/a"; else printf "%.1f ms", v }'; }
+fmt_mbint() { awk -v v="$1" 'BEGIN{ if (v=="" || v+0<=0) print "n/a"; else printf "%d MB", v }'; }
+
+# ------- cgroup environment -------
+bh_cg_version() {
+  if [ -f /sys/fs/cgroup/cgroup.controllers ]; then echo 2
+  elif [ -d /sys/fs/cgroup/cpu ]; then echo 1
+  else echo 0
+  fi
+}
+CG_VER="$(bh_cg_version)"
+
+bh_cpu_quota_cores() {
+  case "$CG_VER" in
+    2)
+      if [ -r /sys/fs/cgroup/cpu.max ]; then
+        local q p
+        read -r q p < /sys/fs/cgroup/cpu.max 2>/dev/null || { echo 0; return; }
+        [ "${q:-max}" = "max" ] && { echo 0; return; }
+        awk -v q="$q" -v p="$p" 'BEGIN{ if (p+0>0) printf "%.2f", q/p; else print 0 }'
+      else echo 0; fi
+      ;;
+    1)
+      local q p
+      q="$(head -n 1 /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null || echo -1)"
+      p="$(head -n 1 /sys/fs/cgroup/cpu/cpu.cfs_period_us 2>/dev/null || echo 100000)"
+      [ -z "$q" ] && q=-1
+      awk -v q="$q" -v p="$p" 'BEGIN{ if (q+0>0 && p+0>0) printf "%.2f", q/p; else print 0 }'
+      ;;
+    *) echo 0 ;;
+  esac
+}
+QUOTA_CORES="$(bh_cpu_quota_cores)"
+
+bh_mem_limit_kb() {
+  case "$CG_VER" in
+    2)
+      local v
+      v="$(head -n 1 /sys/fs/cgroup/memory.max 2>/dev/null || echo max)"
+      if [ -z "$v" ] || [ "$v" = "max" ]; then echo 0
+      else awk -v b="$v" 'BEGIN{printf "%d", b/1024}'; fi
+      ;;
+    1)
+      local v
+      v="$(head -n 1 /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo 0)"
+      awk -v b="$v" 'BEGIN{ if (b+0>=9000000000000000 || b+0<=0) print 0; else printf "%d", b/1024 }'
+      ;;
+    *) echo 0 ;;
+  esac
+}
+MEM_LIMIT_KB="$(bh_mem_limit_kb)"
+
+bh_cpuset() {
+  case "$CG_VER" in
+    2) head -n 1 /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null ;;
+    1) head -n 1 /sys/fs/cgroup/cpuset/cpuset.cpus 2>/dev/null ;;
+    *) : ;;
+  esac | tr -d '\n'
+}
+CPUSET="$(bh_cpuset)"
+
+NCPU="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+if [ -z "$NCPU" ] || [ "$NCPU" -lt 1 ] 2>/dev/null; then NCPU=1; fi
+
+# parallel jobs: respect cgroup CPU quota when present, cap at 64
+if awk -v q="$QUOTA_CORES" 'BEGIN{exit !(q+0>0)}'; then
+  BH_PAR_JOBS=$(awk -v q="$QUOTA_CORES" 'BEGIN{ j=int(q); if (j<1) j=1; print j }')
+  BH_EFF_CORES="$BH_PAR_JOBS"
+  if [ "$BH_PAR_JOBS" -gt "$NCPU" ]; then BH_PAR_JOBS=$NCPU; BH_EFF_CORES=$NCPU; fi
+else
+  BH_PAR_JOBS=$NCPU
+  BH_EFF_CORES=$NCPU
+fi
+if [ "$BH_PAR_JOBS" -gt 64 ]; then BH_PAR_JOBS=64; fi
+
+# ------- JSON helpers -------
+json_esc() {
+  local s=$1
+  s=${s//[[:cntrl:]]/}   # raw control bytes (e.g. from DMI strings) would break JSON
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/}
+  s=${s//$'\t'/ }
+  printf '%s' "$s"
+}
+json_val() { # quote unless it matches a strict JSON number: ^-?[0-9]+(\.[0-9]+)?$
+  if [[ ${1:-} =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+    printf '%s' "$1"
+  else
+    printf '"%s"' "$(json_esc "${1:-}")"
+  fi
+}
+
+# ------- misc -------
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+awk_min2() { awk -v a="$1" -v b="$2" 'BEGIN{ if (b+0<a+0) print b; else print a }'; }
+
+# ============ lib/10-detect.sh ============
+# =====================================================================
+# blackhole-vps-bench · 10-detect.sh — virtualization / environment detection
+# Answers: KVM? Docker? OpenVZ? LXC? Xen? Hyper-V? VMware? bare metal?
+# Every verdict carries evidence lines so the user can verify the reasoning.
+# =====================================================================
+# shellcheck shell=bash
+
+BH_KIND="unknown"      # bare-metal | vm | container
+BH_TYPE="unknown"      # kvm, docker, openvz, lxc, xen-hvm, ...
+BH_PRODUCT="Unknown"
+BH_HOST_TYPE=""        # host VM type when running inside a container
+BH_HOST_PRODUCT=""
+BH_CLOUD=""
+BH_CLOUD_DETAIL=""
+BH_EVIDENCE=""
+BH_DMI_VENDOR=""; BH_DMI_PRODUCT=""; BH_DMI_FAMILY=""; BH_DMI_BOARD=""; BH_DMI_BIOS=""
+
+dmi_read() {
+  local f="/sys/class/dmi/id/$1" v=""
+  if [ -r "$f" ]; then v="$(tr -d '\n' < "$f" 2>/dev/null)"; fi
+  printf '%s' "$v"
+}
+
+read_all_dmi() {
+  BH_DMI_VENDOR="$(dmi_read sys_vendor)"
+  BH_DMI_PRODUCT="$(dmi_read product_name)"
+  BH_DMI_FAMILY="$(dmi_read product_family)"
+  BH_DMI_BOARD="$(dmi_read board_vendor)"
+  BH_DMI_BIOS="$(dmi_read bios_vendor)"
+}
+
+append_ev() { BH_EVIDENCE="${BH_EVIDENCE:+$BH_EVIDENCE
+}• $1"; }
+
+has_hv_flag() { grep -qw hypervisor /proc/cpuinfo 2>/dev/null; }
+
+cpu_brand() { awk -F': ' '/model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null; }
+
+sdv_vmm() {
+  if command_exists systemd-detect-virt; then
+    systemd-detect-virt --vm 2>/dev/null || true
+  fi
+}
+sdv_any() {
+  if command_exists systemd-detect-virt; then
+    systemd-detect-virt 2>/dev/null || true
+  fi
+}
+
+# Map DMI vendor/product to a friendly VM product name. Prints "" when unknown.
+map_vm_product() {
+  local vendor="$1" product="$2"
+  case "$vendor" in
+    QEMU)                    printf 'KVM/QEMU' ;;
+    "Amazon EC2")            printf 'AWS EC2 (Nitro/KVM)' ;;
+    "Microsoft Corporation") printf 'Hyper-V' ;;
+    VMware*)                 printf 'VMware ESXi' ;;
+    "innotek GmbH")          printf 'VirtualBox' ;;
+    Xen)                     printf 'Xen HVM' ;;
+    Bochs)                   printf 'Bochs' ;;
+    "Parallels Software International Inc.") printf 'Parallels' ;;
+    Google)                  printf 'Google Compute Engine (KVM)' ;;
+    DigitalOcean)            printf 'DigitalOcean (KVM)' ;;
+    "Oracle Corporation")    printf 'Oracle VM' ;;
+    Alibaba*)                printf 'Alibaba Cloud (KVM)' ;;
+    Tencent*)                printf 'Tencent Cloud (KVM)' ;;
+    OpenStack*|Mirantis*)    printf 'OpenStack (KVM)' ;;
+    "FreeBSD bhyve"|bhyve)   printf 'bhyve' ;;
+    *)
+      case "$product" in
+        *"Virtual Machine"*)      printf 'KVM/QEMU' ;;
+        *VMware*)                 printf 'VMware' ;;
+        *VirtualBox*)             printf 'VirtualBox' ;;
+        *"HVM domU"*)             printf 'Xen HVM' ;;
+        *BHYVE*|*bhyve*)          printf 'bhyve' ;;
+        *"Standard PC"*|*"QEMU"*) printf 'KVM/QEMU' ;;
+        *) printf '' ;;
+      esac
+      ;;
+  esac
+}
+
+map_vm_cloud() {
+  local vendor="$1"
+  case "$vendor" in
+    "Amazon EC2")            printf 'AWS EC2' ;;
+    "Microsoft Corporation") printf 'Microsoft Azure' ;;
+    Google)                  printf 'Google Cloud' ;;
+    DigitalOcean)            printf 'DigitalOcean' ;;
+    Alibaba*)                printf 'Alibaba Cloud' ;;
+    Tencent*)                printf 'Tencent Cloud' ;;
+    OpenStack*)              printf 'OpenStack cloud' ;;
+    *) printf '' ;;
+  esac
+}
+
+map_container_product() {
+  case "$1" in
+    docker)         printf 'Docker' ;;
+    podman)         printf 'Podman' ;;
+    kubernetes)     printf 'Kubernetes (CRI)' ;;
+    lxc)            printf 'LXC / LXD' ;;
+    systemd-nspawn) printf 'systemd-nspawn' ;;
+    openvz)         printf 'OpenVZ / Virtuozzo' ;;
+    containerd)     printf 'containerd' ;;
+    *)              printf 'Container (%s)' "$1" ;;
+  esac
+}
+
+map_sdv_product() {
+  case "$1" in
+    kvm)       printf 'KVM' ;;
+    qemu)      printf 'QEMU' ;;
+    vmware)    printf 'VMware' ;;
+    microsoft) printf 'Hyper-V' ;;
+    oracle)    printf 'VirtualBox' ;;
+    xen)       printf 'Xen' ;;
+    bochs)     printf 'Bochs' ;;
+    parallels) printf 'Parallels' ;;
+    bhyve)     printf 'bhyve' ;;
+    "")       printf '' ;;
+    *)         printf 'hypervisor (%s)' "$1" ;;
+  esac
+}
+
+# Detect the hypervisor hosting the container we run in (best effort).
+detect_host_virt() {
+  local t p
+  t="$(sdv_vmm)"
+  p="$(map_vm_product "$BH_DMI_VENDOR" "$BH_DMI_PRODUCT")"
+  if [ -n "$p" ]; then
+    BH_HOST_TYPE="${t:-$BH_HOST_TYPE}"
+    BH_HOST_PRODUCT="$p"
+    append_ev "host DMI: vendor='$BH_DMI_VENDOR' product='$BH_DMI_PRODUCT'"
+  elif [ -n "$t" ]; then
+    BH_HOST_TYPE="$t"
+    p="$(map_sdv_product "$t")"
+    BH_HOST_PRODUCT="${p:-$t}"
+    append_ev "systemd-detect-virt --vm = $t"
+  fi
+}
+
+detect_virt() {
+  read_all_dmi
+  local ctype=""
+
+  # ---- WSL ----
+  if grep -qi microsoft /proc/version 2>/dev/null; then
+    BH_KIND="vm"; BH_TYPE="wsl"; BH_PRODUCT="WSL (Windows Subsystem for Linux)"
+    append_ev "/proc/version mentions Microsoft"
+    detect_host_virt
+    return
+  fi
+
+  # ---- container signals ----
+  if [ -e /.dockerenv ]; then
+    ctype="docker"
+    append_ev "/.dockerenv present"
+  fi
+  if [ -e /run/.containerenv ]; then
+    ctype="${ctype:-podman}"
+    append_ev "/run/.containerenv present (Podman)"
+  fi
+  if [ -r /run/systemd/container ]; then
+    local sc
+    sc="$(tr -d '\n' < /run/systemd/container 2>/dev/null)"
+    if [ -n "$sc" ]; then
+      ctype="${ctype:-$sc}"
+      append_ev "/run/systemd/container = $sc"
+    fi
+  fi
+  local cg
+  for cg in /proc/1/cgroup /proc/self/cgroup /proc/self/mountinfo; do
+    [ -r "$cg" ] || continue
+    if grep -aq kubepods "$cg" 2>/dev/null; then
+      ctype="kubernetes"; append_ev "$cg mentions kubepods"
+    fi
+    if grep -aqE '/docker[/-]|docker\.slice' "$cg" 2>/dev/null; then
+      ctype="${ctype:-docker}"; append_ev "$cg references docker"
+    fi
+    if grep -aqE 'libpod|podman' "$cg" 2>/dev/null; then
+      ctype="${ctype:-podman}"; append_ev "$cg references podman/libpod"
+    fi
+    if grep -aqE '(^|[:/])lxc' "$cg" 2>/dev/null; then
+      ctype="${ctype:-lxc}"; append_ev "$cg references lxc"
+    fi
+    if grep -aqE 'machine.slice|systemd-nspawn' "$cg" 2>/dev/null; then
+      ctype="${ctype:-systemd-nspawn}"; append_ev "$cg references systemd-nspawn/machine.slice"
+    fi
+    if grep -aq 'vzcid\|/vz/' "$cg" 2>/dev/null; then
+      ctype="openvz"; append_ev "$cg references openvz"
+    fi
+  done
+  if [ -e /var/run/secrets/kubernetes.io/serviceaccount ] || [ -e /run/secrets/kubernetes.io/serviceaccount ]; then
+    ctype="kubernetes"
+    append_ev "Kubernetes serviceaccount present"
+  fi
+  if [ -r /proc/1/environ ] && tr '\0' '\n' < /proc/1/environ 2>/dev/null | grep -q '^container=lxc'; then
+    ctype="lxc"; append_ev "/proc/1/environ container=lxc"
+  fi
+
+  # ---- OpenVZ / Virtuozzo (container tech, may sit above other signals) ----
+  if [ -e /proc/vz ] && [ ! -e /proc/bc ]; then
+    ctype="openvz"
+    append_ev "/proc/vz present without /proc/bc"
+  elif [ -e /proc/user_beancounters ]; then
+    ctype="openvz"
+    append_ev "/proc/user_beancounters present"
+  fi
+
+  if [ -n "$ctype" ]; then
+    BH_KIND="container"
+    BH_TYPE="$ctype"
+    BH_PRODUCT="$(map_container_product "$ctype")"
+    detect_host_virt
+    return
+  fi
+
+  # ---- Xen paravirtualized (no DMI in PV guests) ----
+  if [ -r /sys/hypervisor/type ] && [ "$(tr -d '\n' < /sys/hypervisor/type 2>/dev/null)" = "xen" ]; then
+    BH_KIND="vm"; BH_TYPE="xen-pv"; BH_PRODUCT="Xen PV"
+    append_ev "/sys/hypervisor/type = xen"
+    if [ -r /proc/xen/capabilities ] && grep -q control_d /proc/xen/capabilities 2>/dev/null; then
+      BH_PRODUCT="Xen dom0 (host)"
+      append_ev "/proc/xen/capabilities has control_d (dom0)"
+    fi
+    return
+  fi
+
+  # ---- full VMs ----
+  local t p
+  t="$(sdv_vmm)"
+  p="$(map_vm_product "$BH_DMI_VENDOR" "$BH_DMI_PRODUCT")"
+  if [ -n "$p" ]; then
+    BH_KIND="vm"
+    BH_TYPE="${t:-unknown}"
+    BH_PRODUCT="$p"
+    append_ev "DMI: vendor='$BH_DMI_VENDOR' product='$BH_DMI_PRODUCT' board='$BH_DMI_BOARD'"
+    [ -n "$t" ] && append_ev "systemd-detect-virt --vm = $t"
+  elif [ -n "$t" ]; then
+    BH_KIND="vm"
+    BH_TYPE="$t"
+    BH_PRODUCT="Virtual machine ($t)"
+    append_ev "systemd-detect-virt --vm = $t"
+  elif has_hv_flag; then
+    BH_KIND="vm"
+    BH_TYPE="unknown"
+    BH_PRODUCT="Virtual machine (hypervisor bit set, vendor unknown)"
+    append_ev "/proc/cpuinfo has 'hypervisor' flag"
+  else
+    BH_KIND="bare-metal"
+    BH_TYPE="none"
+    BH_PRODUCT="Bare metal (dedicated server)"
+    append_ev "no hypervisor flag, no container markers, no VM DMI signature"
+    [ -n "$BH_DMI_VENDOR" ] && append_ev "DMI: vendor='$BH_DMI_VENDOR' product='$BH_DMI_PRODUCT'"
+  fi
+
+  # nested virtualization note
+  if [ "$BH_KIND" = "vm" ] && grep -qwE '(vmx|svm)' /proc/cpuinfo 2>/dev/null; then
+    append_ev "nested virtualization exposed (vmx/svm in CPU flags)"
+  fi
+
+  # clocksource corroboration
+  local cs
+  cs="$(cat /sys/devices/system/clocksource/clocksource0/current_clocksource 2>/dev/null)"
+  case "$cs" in
+    kvm-clock) append_ev "clocksource = kvm-clock (KVM signature)" ;;
+    tsc)       : ;;
+    xen)       append_ev "clocksource = xen" ;;
+    *)         : ;;
+  esac
+
+  # cloud vendor from DMI
+  BH_CLOUD="$(map_vm_cloud "$BH_DMI_VENDOR")"
+}
+
+# ============ lib/20-info.sh ============
+# =====================================================================
+# blackhole-vps-bench · 20-info.sh — system info + cgroup limits + IP/cloud
+# =====================================================================
+# shellcheck shell=bash
+
+BH_HOSTNAME=""; BH_OS=""; BH_KERNEL=""; BH_ARCH=""; BH_UPTIME=""
+BH_CPU_MODEL=""; BH_CPU_LOGICAL=""; BH_CPU_PHYS=""; BH_CPU_FLAGS_HI=""
+BH_MEM_TOTAL_MB=""; BH_MEM_AVAIL_MB=""; BH_MEM_SWAP_MB=""
+BH_MEM_LIMIT_MB="0"; BH_MEM_EFF_MB=""; BH_CPU_QUOTA_TXT=""
+BH_DISK_DEV=""; BH_DISK_FS=""; BH_DISK_TOTAL_MB=""; BH_DISK_AVAIL_MB=""
+BH_IPV4=""; BH_IPV6=""; BH_IP_GEO=""; BH_IP_ASN=""
+
+gather_info() {
+  BH_HOSTNAME="$(hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
+  BH_OS="$( ( . /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-}") || true )"
+  [ -n "$BH_OS" ] || BH_OS="$(uname -s 2>/dev/null || echo unknown)"
+  BH_KERNEL="$(uname -r 2>/dev/null || echo unknown)"
+  BH_ARCH="$(uname -m 2>/dev/null || echo unknown)"
+  BH_UPTIME="$(awk '{u=int($1); d=int(u/86400); h=int(u%86400/3600); m=int(u%3600/60); if(d>0) printf "%dd %dh %dm", d, h, m; else printf "%dh %dm", h, m}' /proc/uptime 2>/dev/null)"
+
+  # ---- CPU ----
+  BH_CPU_MODEL="$(cpu_brand)"
+  BH_CPU_LOGICAL="$(awk '/^processor/{n++} END{ if (n>0) print n; else print 0 }' /proc/cpuinfo 2>/dev/null)"
+  [ -z "$BH_CPU_LOGICAL" ] || [ "$BH_CPU_LOGICAL" = "0" ] && BH_CPU_LOGICAL="$NCPU"
+  # physical cores: unique (socket, core) pairs via lscpu, else logical count
+  BH_CPU_PHYS=""
+  if command_exists lscpu; then
+    BH_CPU_PHYS="$(lscpu -p=CPU,CORE,SOCKET 2>/dev/null | grep -v '^#' | awk -F, '$2!="" && $2!="-" {print $2","$3}' | sort -u | wc -l | tr -d ' ')"
+  fi
+  [ -n "$BH_CPU_PHYS" ] && [ "$BH_CPU_PHYS" -ge 1 ] 2>/dev/null || BH_CPU_PHYS="$BH_CPU_LOGICAL"
+  local fl
+  fl="$(awk '/^flags/{for(i=2;i<=NF;i++){f[$i]=1}} END{print (f["avx512f"]?"avx512 ":"") (f["avx2"]?"avx2 ":"") (f["aes"]?"aes ":"") (f["vmx"]?"vmx ":"") (f["svm"]?"svm ":"")}' /proc/cpuinfo 2>/dev/null)"
+  BH_CPU_FLAGS_HI="${fl% }"
+
+  # ---- cgroup limits (report the REAL config, not the host's) ----
+  BH_MEM_LIMIT_MB="$MEM_LIMIT_KB"
+  if [ "${MEM_LIMIT_KB:-0}" -gt 0 ] 2>/dev/null; then
+    BH_MEM_LIMIT_MB=$(( MEM_LIMIT_KB / 1024 ))
+  else
+    BH_MEM_LIMIT_MB=0
+  fi
+  if [ "${QUOTA_CORES:-0}" != "0" ] 2>/dev/null; then
+    BH_CPU_QUOTA_TXT=$(awk -v q="$QUOTA_CORES" 'BEGIN{printf "%.2f", q}')
+  else
+    BH_CPU_QUOTA_TXT=""
+  fi
+
+  # ---- memory ----
+  local mt ma sw
+  mt="$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null)"
+  ma="$(awk '/^MemAvailable:/{print $2; found=1} END{ if (!found) print "" }' /proc/meminfo 2>/dev/null)"
+  [ -z "$ma" ] && ma="$(awk '/^MemFree:/{print $2}' /proc/meminfo 2>/dev/null)"
+  sw="$(awk '/^SwapTotal:/{print $2}' /proc/meminfo 2>/dev/null)"
+  BH_MEM_TOTAL_MB=$(( ${mt:-0} / 1024 ))
+  BH_MEM_AVAIL_MB=$(( ${ma:-0} / 1024 ))
+  BH_MEM_SWAP_MB=$(( ${sw:-0} / 1024 ))
+  if [ "$BH_MEM_LIMIT_MB" -gt 0 ] 2>/dev/null; then
+    BH_MEM_EFF_MB="$BH_MEM_LIMIT_MB"
+    [ "$BH_MEM_TOTAL_MB" -gt 0 ] && [ "$BH_MEM_TOTAL_MB" -lt "$BH_MEM_EFF_MB" ] && BH_MEM_EFF_MB="$BH_MEM_TOTAL_MB"
+  else
+    BH_MEM_EFF_MB="$BH_MEM_TOTAL_MB"
+  fi
+
+  # ---- disk (target dir) ----
+  mkdir -p "$BH_DISK_DIR" 2>/dev/null || true
+  local dfl
+  dfl="$(df -P "$BH_DISK_DIR" 2>/dev/null | awk 'NR==2{print $1, $2, $4}')"
+  BH_DISK_DEV="$(printf '%s' "$dfl" | awk '{print $1}')"
+  BH_DISK_TOTAL_MB=$(awk -v k="$(printf '%s' "$dfl" | awk '{print $2}')" 'BEGIN{printf "%d", k/1024}')
+  BH_DISK_AVAIL_MB=$(awk -v k="$(printf '%s' "$dfl" | awk '{print $3}')" 'BEGIN{printf "%d", k/1024}')
+  if command_exists df && df -T "$BH_DISK_DIR" >/dev/null 2>&1; then
+    BH_DISK_FS="$(df -PT "$BH_DISK_DIR" 2>/dev/null | awk 'NR==2{print $2}')"
+  else
+    BH_DISK_FS=""
+  fi
+  [ -n "$BH_DISK_FS" ] || BH_DISK_FS="unknown"
+
+  # ---- network identity (optional) ----
+  if [ "$BH_NO_NET" != "1" ] && command_exists curl; then
+    BH_IPV4="$(curl -4 -fsS --max-time 6 https://api.ipify.org 2>/dev/null | head -c 64)"
+    local geo
+    geo="$(curl -fsS --max-time 8 'http://ip-api.com/line/?fields=country,regionName,city,isp' 2>/dev/null | tr '\n' '|' )"
+    BH_IP_GEO="${geo%|}"
+    BH_IP_ASN="$(curl -fsS --max-time 8 'http://ip-api.com/line/?fields=as' 2>/dev/null | head -c 128)"
+    BH_IPV6="$(curl -6 -fsS --max-time 6 https://api64.ipify.org 2>/dev/null | head -c 64)"
+    probe_cloud_meta
+  fi
+}
+
+# Best-effort cloud metadata probes (only when network is allowed)
+probe_cloud_meta() {
+  case "$BH_DMI_VENDOR" in
+    "Microsoft Corporation")
+      local az
+      az="$(curl -fsS --max-time 3 -H 'Metadata:true' 'http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01' 2>/dev/null | sed -n 's/.*"vmSize"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+      if [ -n "$az" ]; then
+        BH_CLOUD="Microsoft Azure"
+        BH_CLOUD_DETAIL="$az"
+      fi
+      ;;
+    Google)
+      local gcp
+      gcp="$(curl -fsS --max-time 3 -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/machine-type' 2>/dev/null | awk -F/ '{print $NF}')"
+      if [ -n "$gcp" ]; then
+        BH_CLOUD="Google Cloud"
+        BH_CLOUD_DETAIL="$gcp"
+      fi
+      ;;
+    "Amazon EC2")
+      BH_CLOUD="AWS EC2"
+      ;;
+    *)
+      :
+      ;;
+  esac
+}
+
+# ============ lib/30-cpu.sh ============
+# =====================================================================
+# blackhole-vps-bench · 30-cpu.sh — CPU benchmark (sha256 throughput)
+# Primary metric: MB/s of sha256 over memory streams — 1 core and N cores.
+# Predictable across distros (pure dd/sha256sum), works on busybox too.
+# =====================================================================
+# shellcheck shell=bash
+
+BH_SHA1C=""; BH_SHANC=""; BH_OPENSSL_K=""
+
+bench_cpu() {
+  local n=256
+  [ "$BH_FAST" = "1" ] && n=96
+  local t0 t1
+
+  log "CPU bench: sha256 single-core (${n} MB)..."
+  # warmup (small, unmeasured)
+  dd if=/dev/zero bs=1M count=8 2>/dev/null | sha256sum >/dev/null 2>&1
+
+  t0=$(now_ms)
+  dd if=/dev/zero bs=1M count="$n" 2>/dev/null | sha256sum >/dev/null 2>&1
+  t1=$(now_ms)
+  BH_SHA1C="$(awk -v n="$n" -v ms=$((t1 - t0)) 'BEGIN{ if (ms>50) printf "%.1f", n*1048576/(ms/1000)/1048576; else print 0 }')"
+  [ "${BH_SHA1C:-0}" = "0" ] && warn "single-core CPU timing too short to be reliable"
+
+  log "CPU bench: sha256 multi-core (${BH_PAR_JOBS} jobs x ${n} MB)..."
+  t0=$(now_ms)
+  local i=0
+  while [ "$i" -lt "$BH_PAR_JOBS" ]; do
+    ( dd if=/dev/zero bs=1M count="$n" 2>/dev/null | sha256sum >/dev/null 2>&1 ) &
+    i=$((i + 1))
+  done
+  wait
+  t1=$(now_ms)
+  BH_SHANC="$(awk -v n="$n" -v j="$BH_PAR_JOBS" -v ms=$((t1 - t0)) 'BEGIN{ if (ms>50) printf "%.1f", n*j*1048576/(ms/1000)/1048576; else print 0 }')"
+
+  # optional cross-check via openssl (info only, format varies by version)
+  if command_exists openssl; then
+    BH_OPENSSL_K="$(openssl speed -seconds 2 -evp sha256 2>/dev/null | awk 'tolower($1) ~ /sha/ && $2 ~ /k$/ {gsub(/k$/,"",$2); print $2; exit}')"
+    if [ -z "$BH_OPENSSL_K" ]; then
+      BH_OPENSSL_K="$(openssl speed -seconds 2 -evp sha256 2>/dev/null | awk 'tolower($0) ~ /sha/ && NF>1 {v=$NF; gsub(/k$/,"",v); if (v ~ /^[0-9.]+$/) {print v; exit}}')"
+    fi
+  fi
+}
+
+# ============ lib/40-mem.sh ============
+# =====================================================================
+# blackhole-vps-bench · 40-mem.sh — memory bandwidth benchmark
+# Preferred: tiny C memcpy-style loop compiled at runtime (cc/gcc/clang).
+# Fallback: dd write-to-null proxy (clearly labeled).
+# =====================================================================
+# shellcheck shell=bash
+
+BH_MEM_GBS=""; BH_MEM_METHOD=""
+
+BH_MEMBENCH_C='
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+static double now(void){
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+int main(int argc, char **argv){
+  size_t mb = argc > 1 ? (size_t)atoi(argv[1]) : 256;
+  int passes = argc > 2 ? atoi(argv[2]) : 3;
+  size_t sz = mb * 1024UL * 1024UL;
+  char *buf = malloc(sz);
+  double best = 0;
+  int p, i;
+  if (!buf) { perror("malloc"); return 1; }
+  memset(buf, 0xAB, sz);
+  for (p = 0; p < passes; p++) {
+    double t0 = now();
+    memset(buf, 0x5A + (unsigned char)p, sz);
+    volatile unsigned long acc = 0;
+    for (i = 0; i < (int)(sz / 4096); i++) acc += (unsigned long)buf[(size_t)i * 4096];
+    (void)acc;
+    double dt = now() - t0;
+    double gbps = ((double)sz * 2.0) / dt / 1e9;
+    if (gbps > best) best = gbps;
+  }
+  printf("%.2f\n", best);
+  free(buf);
+  return 0;
+}
+'
+
+bench_mem() {
+  local passes=3
+  [ "$BH_FAST" = "1" ] && passes=1
+
+  # pick a safe buffer size: fast=128 / normal=256, clamped to 25% of available RAM
+  local mb=256
+  [ "$BH_FAST" = "1" ] && mb=128
+  if [ "${BH_MEM_AVAIL_MB:-0}" -gt 8 ] 2>/dev/null; then
+    mb="$(awk_min2 "$mb" "$(awk -v a="$BH_MEM_AVAIL_MB" 'BEGIN{printf "%d", a/4}')")"
+  fi
+  [ "$mb" -lt 16 ] 2>/dev/null && mb=16
+
+  local ccbin=""
+  command_exists cc    && ccbin=cc
+  [ -z "$ccbin" ] && command_exists gcc   && ccbin=gcc
+  [ -z "$ccbin" ] && command_exists clang && ccbin=clang
+
+  if [ -n "$ccbin" ]; then
+    printf '%s\n' "$BH_MEMBENCH_C" > "$BH_RUNDIR/mem.c" 2>/dev/null
+    if "$ccbin" -O2 -o "$BH_RUNDIR/membench" "$BH_RUNDIR/mem.c" 2>/dev/null; then
+      log "MEM bench: memcpy-style C loop (${mb} MB x ${passes})..."
+      BH_MEM_GBS="$("$BH_RUNDIR/membench" "$mb" "$passes" 2>/dev/null | tr -d '\n')"
+      BH_MEM_METHOD="memcpy (C, write+read counted)"
+    fi
+  fi
+
+  if [ -z "$BH_MEM_GBS" ] || [ "$BH_MEM_GBS" = "0" ] || [ "$BH_MEM_GBS" = "0.00" ]; then
+    log "MEM bench: C compiler unavailable, falling back to dd proxy..."
+    local blocks=2048
+    [ "$BH_FAST" = "1" ] && blocks=1024
+    local t0 t1
+    t0=$(now_ms)
+    dd if=/dev/zero of=/dev/null bs=1M count="$blocks" 2>/dev/null
+    t1=$(now_ms)
+    BH_MEM_GBS="$(awk -v b="$blocks" -v ms=$((t1 - t0)) 'BEGIN{ if (ms>50) printf "%.2f", b/1048576/(ms/1000)*1024; else print 0 }')"
+    BH_MEM_METHOD="dd /dev/zero->null proxy"
+  fi
+}
+
+# ============ lib/50-disk.sh ============
+# =====================================================================
+# blackhole-vps-bench · 50-disk.sh — disk benchmark (dd with auto flag pick)
+# Tries direct I/O first for honest numbers; falls back cleanly on
+# filesystems that reject O_DIRECT (common inside containers/overlayfs).
+# Optional fio pass when available for true 4K random numbers.
+# =====================================================================
+# shellcheck shell=bash
+
+BH_SEQW=""; BH_SEQR=""; BH_4KW=""; BH_4KR=""
+BH_DISK_MODE=""; BH_FIO_RIOPS=""; BH_FIO_WIOPS=""
+
+bh_dd_supports() { # $1=flags — probe with a 1 MB write
+  local file="$1"; shift
+  dd if=/dev/zero of="$file" bs=1M count=1 "$@" 2>/dev/null
+}
+
+bench_disk() {
+  local dir="$BH_DISK_DIR"
+  mkdir -p "$dir" 2>/dev/null || dir=/tmp
+  if [ ! -w "$dir" ]; then dir=/tmp; mkdir -p "$dir" 2>/dev/null; fi
+  local file="$dir/.bhvps_disk_$$"
+
+  # keep payloads small on tiny disks: at most ~20% of available space
+  local seqmb=256 seq4k=8192
+  [ "$BH_FAST" = "1" ] && { seqmb=96; seq4k=4096; }
+  if [ "${BH_DISK_AVAIL_MB:-0}" -gt 64 ] 2>/dev/null; then
+    seqmb="$(awk_min2 "$seqmb" "$(awk -v a="$BH_DISK_AVAIL_MB" 'BEGIN{printf "%d", a/5}')")"
+    # keep the 4k payload (seq4k * 4096 bytes) inside the same ~20% budget
+    seq4k="$(awk_min2 "$seq4k" "$(awk -v a="$BH_DISK_AVAIL_MB" 'BEGIN{printf "%d", a*51.2}')")"
+  fi
+
+  # pick the strongest write mode this filesystem accepts
+  BH_DISK_MODE="plain"
+  if bh_dd_supports "$file" oflag=direct conv=fdatasync; then
+    BH_WFLAGS="oflag=direct conv=fdatasync"; BH_DISK_MODE="direct+fsync"
+  elif bh_dd_supports "$file" conv=fdatasync; then
+    BH_WFLAGS="conv=fdatasync"; BH_DISK_MODE="fsync (buffered)"
+  elif bh_dd_supports "$file" conv=fsync; then
+    BH_WFLAGS="conv=fsync"; BH_DISK_MODE="fsync (buffered)"
+  else
+    BH_WFLAGS=""; BH_DISK_MODE="plain (cache-inflated!)"
+  fi
+  BH_RFLAGS=""
+  if dd if="$file" of=/dev/null bs=1M count=1 iflag=direct 2>/dev/null; then
+    BH_RFLAGS="iflag=direct"; BH_DISK_MODE="${BH_DISK_MODE} +direct-read"
+  fi
+
+  local t0 t1
+  log "DISK bench on $dir (mode: $BH_DISK_MODE): seq write ${seqmb} MB..."
+
+  t0=$(now_ms)
+  # shellcheck disable=SC2086  # flags are intentionally word-split
+  dd if=/dev/zero of="$file" bs=1M count="$seqmb" $BH_WFLAGS 2>/dev/null
+  sync 2>/dev/null
+  t1=$(now_ms)
+  BH_SEQW="$(awk -v n="$seqmb" -v ms=$((t1 - t0)) 'BEGIN{ if (ms>50) printf "%.1f", n*1048576/(ms/1000)/1048576; else print 0 }')"
+
+  t0=$(now_ms)
+  dd if="$file" of=/dev/null bs=1M $BH_RFLAGS 2>/dev/null
+  t1=$(now_ms)
+  BH_SEQR="$(awk -v n="$seqmb" -v ms=$((t1 - t0)) 'BEGIN{ if (ms>50) printf "%.1f", n*1048576/(ms/1000)/1048576; else print 0 }')"
+
+  log "DISK bench: 4K blocks (${seq4k} x 4K)..."
+  t0=$(now_ms)
+  # shellcheck disable=SC2086
+  dd if=/dev/zero of="$file" bs=4k count="$seq4k" $BH_WFLAGS 2>/dev/null
+  sync 2>/dev/null
+  t1=$(now_ms)
+  BH_4KW="$(awk -v n="$seq4k" -v ms=$((t1 - t0)) 'BEGIN{ if (ms>50) printf "%.1f", n*4096/(ms/1000)/1048576; else print 0 }')"
+
+  t0=$(now_ms)
+  dd if="$file" of=/dev/null bs=4k $BH_RFLAGS 2>/dev/null
+  t1=$(now_ms)
+  BH_4KR="$(awk -v n="$seq4k" -v ms=$((t1 - t0)) 'BEGIN{ if (ms>50) printf "%.1f", n*4096/(ms/1000)/1048576; else print 0 }')"
+
+  rm -f "$file" 2>/dev/null
+
+  # optional: fio for true 4K random IOPS
+  if command_exists fio && [ "$BH_FAST" != "1" ]; then
+    log "DISK bench: fio 4k randrw (8s, direct)..."
+    local fj="$BH_RUNDIR/fio.json"
+    if fio --name=bh --filename="$dir/.bhvps_fio_$$" --size=32M --bs=4k --rw=randrw \
+        --rwmixread=50 --ioengine=sync --direct=1 --numjobs=1 --runtime=8 \
+        --time_based --group_reporting --output-format=json \
+        --output="$fj" >/dev/null 2>&1 && [ -s "$fj" ]; then
+      local r w
+      r="$(grep -oE '"iops"[[:space:]]*:[[:space:]]*[0-9.]+' "$fj" | head -n 1 | grep -oE '[0-9.]+$')"
+      w="$(grep -oE '"iops"[[:space:]]*:[[:space:]]*[0-9.]+' "$fj" | tail -n 1 | grep -oE '[0-9.]+$')"
+      [ -n "$r" ] && BH_FIO_RIOPS="$(awk -v r="$r" 'BEGIN{printf "%.0f", r}')"
+      [ -n "$w" ] && BH_FIO_WIOPS="$(awk -v w="$w" 'BEGIN{printf "%.0f", w}')"
+    fi
+    rm -f "$dir/.bhvps_fio_$$" 2>/dev/null
+  fi
+}
+
+# ============ lib/60-net.sh ============
+# =====================================================================
+# blackhole-vps-bench · 60-net.sh — network benchmark (Cloudflare speed)
+# Download + upload + TCP connect latency. Skippable with --no-net.
+# =====================================================================
+# shellcheck shell=bash
+
+BH_DOWN_MBPS=""; BH_UP_MBPS=""; BH_LAT_MS=""; BH_NET_METHOD=""
+
+bench_net() {
+  if [ "$BH_NO_NET" = "1" ]; then
+    log "NET bench skipped (--no-net)"
+    return 0
+  fi
+  if ! command_exists curl; then
+    warn "curl not found — network bench skipped"
+    return 0
+  fi
+
+  # TCP connect latency (TTFB fallback)
+  local lat
+  lat="$(curl -s -o /dev/null --max-time 8 -w '%{time_connect}' 'https://speed.cloudflare.com/__down?bytes=0' 2>/dev/null)"
+  if [ -z "$lat" ] || [ "$lat" = "0.000000" ]; then
+    lat="$(curl -s -o /dev/null --max-time 8 -w '%{time_starttransfer}' 'https://speed.cloudflare.com/__down?bytes=1' 2>/dev/null)"
+  fi
+  [ -n "$lat" ] && BH_LAT_MS="$(awk -v t="$lat" 'BEGIN{ if (t+0>0) printf "%.1f", t*1000; else print 0 }')"
+
+  # download
+  local dbytes=104857600 dmethod="cloudflare"
+  [ "$BH_FAST" = "1" ] && dbytes=26214400
+  log "NET bench: download ($((dbytes / 1048576)) MB from ${dmethod})..."
+  local d
+  d="$(curl -s -o /dev/null --max-time 60 -w '%{speed_download}' "https://speed.cloudflare.com/__down?bytes=$dbytes" 2>/dev/null)"
+  if [ -z "$d" ] || [ "$d" = "0" ] || [ "$d" = "0.000" ]; then
+    dmethod="cachefly"
+    d="$(curl -s -o /dev/null --max-time 60 -w '%{speed_download}' 'http://cachefly.cachefly.net/100mb.test' 2>/dev/null)"
+  fi
+  [ -n "$d" ] && [ "$d" != "0" ] && BH_DOWN_MBPS="$(awk -v s="$d" 'BEGIN{printf "%.1f", s*8/1000000}')"
+  BH_NET_METHOD="$dmethod"
+
+  # upload
+  local ubytes=26214400
+  [ "$BH_FAST" = "1" ] && ubytes=10485760
+  log "NET bench: upload ($((ubytes / 1048576)) MB to cloudflare)..."
+  local u
+  u="$(head -c "$ubytes" /dev/zero | curl -s -o /dev/null --max-time 60 -w '%{speed_upload}' -X POST --data-binary @- 'https://speed.cloudflare.com/__up' 2>/dev/null)"
+  [ -n "$u" ] && [ "$u" != "0" ] && BH_UP_MBPS="$(awk -v s="$u" 'BEGIN{printf "%.1f", s*8/1000000}')"
+
+  return 0
+}
+
+# ============ lib/70-report.sh ============
+# =====================================================================
+# blackhole-vps-bench · 70-report.sh — scoring + human/JSON/Markdown/Discord output
+# =====================================================================
+# shellcheck shell=bash
+
+BH_SCORE_CPU1C=0; BH_SCORE_CPUMC=0; BH_SCORE_MEM=0; BH_SCORE_DSEQ=0
+BH_SCORE_D4K=0; BH_SCORE_NDOWN=0; BH_SCORE_NUP=0; BH_SCORE_TOTAL=0
+BH_SCORE_MAX=700
+
+num_or_0() { if [ -n "${1:-}" ]; then printf '%s' "$1"; else printf '0'; fi; }
+
+cap100() { awk -v v="$1" 'BEGIN{ if (v+0<=0) print 0; else if (v>100) print 100; else printf "%.0f", v }'; }
+
+compute_scores() {
+  BH_SCORE_CPU1C="$(cap100 "$(awk -v v="$(num_or_0 "$BH_SHA1C")" 'BEGIN{print v/5}')")"
+  BH_SCORE_CPUMC="$(cap100 "$(awk -v v="$(num_or_0 "$BH_SHANC")" 'BEGIN{print v/20}')")"
+  BH_SCORE_MEM="$(cap100 "$(awk -v v="$(num_or_0 "$BH_MEM_GBS")" 'BEGIN{print v*8}')")"
+  BH_SCORE_DSEQ="$(cap100 "$(awk -v v="$(num_or_0 "$BH_SEQW")" 'BEGIN{print v/10}')")"
+  BH_SCORE_D4K="$(cap100 "$(awk -v w="$(num_or_0 "$BH_4KW")" -v r="$(num_or_0 "$BH_4KR")" 'BEGIN{print (w+r)/4}')")"
+  BH_SCORE_NDOWN="$(cap100 "$(awk -v v="$(num_or_0 "$BH_DOWN_MBPS")" 'BEGIN{print v/20}')")"
+  BH_SCORE_NUP="$(cap100 "$(awk -v v="$(num_or_0 "$BH_UP_MBPS")" 'BEGIN{print v/20}')")"
+  BH_SCORE_TOTAL="$(( BH_SCORE_CPU1C + BH_SCORE_CPUMC + BH_SCORE_MEM + BH_SCORE_DSEQ + BH_SCORE_D4K + BH_SCORE_NDOWN + BH_SCORE_NUP ))"
+}
+
+verdict_text() {
+  case "$BH_KIND" in
+    container)
+      local v="Container ($BH_PRODUCT)"
+      [ -n "$BH_HOST_PRODUCT" ] && v="$v on host: $BH_HOST_PRODUCT"
+      printf '%s' "$v"
+      ;;
+    vm)        printf 'Virtual machine — %s' "$BH_PRODUCT" ;;
+    bare-metal) printf 'Dedicated / bare metal server' ;;
+    *)         printf 'Unknown environment' ;;
+  esac
+}
+
+# ---------------------------------------------------------------- human report
+bh_lines=()
+rpt() { bh_lines+=("$1"); }
+
+print_evidence() {
+  if [ -n "$BH_EVIDENCE" ]; then
+    while IFS= read -r ev; do
+      rpt "  $ev"
+    done <<< "$BH_EVIDENCE"
+  else
+    rpt "  (no evidence collected)"
+  fi
+}
+
+build_report() {
+  bh_lines=()
+  rpt "+----------------------------------------------------------------+"
+  rpt "$(printf '| %-62s |' "BLACKHOLE VPS BENCH v$BH_VERSION")"
+  rpt "$(printf '| %-62s |' "github.com/$BH_REPO")"
+  rpt "+----------------------------------------------------------------+"
+
+  rpt ""
+  rpt "[1] VIRTUALIZATION VERDICT"
+  rpt "  Kind    : $BH_KIND"
+  rpt "  Type    : $BH_TYPE"
+  rpt "  Product : $BH_PRODUCT"
+  if [ "$BH_KIND" = "container" ] && [ -n "$BH_HOST_PRODUCT" ]; then
+    rpt "  Host VM : $BH_HOST_PRODUCT"
+  fi
+  if [ -n "$BH_CLOUD" ]; then
+    rpt "  Cloud   : $BH_CLOUD${BH_CLOUD_DETAIL:+ ($BH_CLOUD_DETAIL)}"
+  fi
+  rpt "  Verdict : $(verdict_text)"
+  rpt "  Evidence:"
+  print_evidence
+
+  rpt ""
+  rpt "[2] SYSTEM / REAL CONFIG"
+  rpt "  Hostname: $BH_HOSTNAME"
+  rpt "  OS      : $BH_OS"
+  rpt "  Kernel  : $BH_KERNEL ($BH_ARCH), uptime $BH_UPTIME"
+  rpt "  CPU     : ${BH_CPU_MODEL:-n/a}"
+  rpt "            ${BH_CPU_LOGICAL:-?} logical / ${BH_CPU_PHYS:-?} physical cores"
+  local effline="            effective: ${BH_EFF_CORES:-?} core(s)"
+  if [ -n "$BH_CPU_QUOTA_TXT" ]; then effline="$effline, cgroup quota $BH_CPU_QUOTA_TXT cores"; fi
+  if [ -n "$CPUSET" ]; then effline="$effline, cpuset [$CPUSET]"; fi
+  rpt "$effline"
+  [ -n "$BH_CPU_FLAGS_HI" ] && rpt "            features: $BH_CPU_FLAGS_HI"
+  local memline
+  memline="  RAM     : total $(fmt_mbint "$BH_MEM_TOTAL_MB"), avail $(fmt_mbint "$BH_MEM_AVAIL_MB"), swap $(fmt_mbint "$BH_MEM_SWAP_MB")"
+  if [ "${BH_MEM_LIMIT_MB:-0}" -gt 0 ] 2>/dev/null; then
+    memline="$memline | container limit $(fmt_mbint "$BH_MEM_LIMIT_MB")"
+  fi
+  rpt "$memline"
+  rpt "  Disk    : $BH_DISK_DEV ($BH_DISK_FS) on $BH_DISK_DIR — total $(fmt_mbint "$BH_DISK_TOTAL_MB"), avail $(fmt_mbint "$BH_DISK_AVAIL_MB")"
+
+  rpt ""
+  if [ "${BH_BENCH_SKIPPED:-0}" = "1" ]; then
+    rpt "[3] BENCHMARK — skipped in $BH_MODE mode (run: all | bench)"
+  else
+    rpt "[3] BENCHMARK"
+    rpt "  CPU     : sha256 $(fmt_mb "$BH_SHA1C") (1 core) | $(fmt_mb "$BH_SHANC") (${BH_PAR_JOBS} threads)"
+    [ -n "$BH_OPENSSL_K" ] && rpt "            openssl sha256 cross-check: $BH_OPENSSL_K k/s"
+    rpt "  Memory  : $(fmt_gbs "$BH_MEM_GBS")  [$BH_MEM_METHOD]"
+    rpt "  Disk    : seq w $(fmt_mb "$BH_SEQW") | seq r $(fmt_mb "$BH_SEQR") | 4k w $(fmt_mb "$BH_4KW") | 4k r $(fmt_mb "$BH_4KR")  [$BH_DISK_DIR, mode: $BH_DISK_MODE]"
+    if [ -n "$BH_FIO_RIOPS" ] || [ -n "$BH_FIO_WIOPS" ]; then
+      rpt "            fio 4k randrw IOPS: r=${BH_FIO_RIOPS:-n/a} w=${BH_FIO_WIOPS:-n/a}"
+    fi
+    if [ "$BH_NO_NET" = "1" ]; then
+      rpt "  Network : skipped (--no-net)"
+    else
+      rpt "  Network : down $(fmt_mbps "$BH_DOWN_MBPS") | up $(fmt_mbps "$BH_UP_MBPS") | connect $(fmt_ms "$BH_LAT_MS")  [$BH_NET_METHOD]"
+    fi
+  fi
+
+  if [ -n "$BH_IPV4$BH_IPV6$BH_IP_GEO$BH_IP_ASN" ]; then
+    rpt ""
+    rpt "[4] LOCATION / NETWORK IDENTITY"
+    [ -n "$BH_IPV4" ]   && rpt "  IPv4    : $BH_IPV4"
+    [ -n "$BH_IPV6" ]   && rpt "  IPv6    : $BH_IPV6"
+    [ -n "$BH_IP_GEO" ] && rpt "  Geo/ISP : $BH_IP_GEO"
+    [ -n "$BH_IP_ASN" ] && rpt "  ASN     : $BH_IP_ASN"
+  fi
+
+  rpt ""
+  if [ "${BH_BENCH_SKIPPED:-0}" = "1" ]; then
+    rpt "[5] BH-SCORE — n/a (no benchmark in $BH_MODE mode)"
+  else
+    rpt "[5] BH-SCORE"
+    rpt "  CPU 1-core ${BH_SCORE_CPU1C}/100 | CPU multi ${BH_SCORE_CPUMC}/100 | Memory ${BH_SCORE_MEM}/100"
+    rpt "  Disk seq ${BH_SCORE_DSEQ}/100 | Disk 4k ${BH_SCORE_D4K}/100 | Net down ${BH_SCORE_NDOWN}/100 | Net up ${BH_SCORE_NUP}/100"
+    rpt "  TOTAL: $BH_SCORE_TOTAL / $BH_SCORE_MAX"
+  fi
+  rpt ""
+  rpt "generated $(date -u '+%Y-%m-%d %H:%M:%S UTC') by $BH_TOOL v$BH_VERSION"
+}
+
+print_report() {
+  if [ -n "$BH_TXT_OUT" ] && [ "$BH_TXT_OUT" != "-" ]; then
+    printf '%s\n' "${bh_lines[@]}" > "$BH_TXT_OUT"
+    log "text report written to $BH_TXT_OUT"
+  fi
+  # banner in color on TTY, then the plain body
+  if [ -n "$C_CYN" ]; then
+    printf '%s%s%s\n' "$C_B$C_CYN" "${bh_lines[0]}" "$C_RST"
+  else
+    printf '%s\n' "${bh_lines[0]}"
+  fi
+  printf '%s\n' "${bh_lines[@]:1}"
+}
+
+# ---------------------------------------------------------------- JSON
+build_json() {
+  local ev_json="" first=1 ev
+  while IFS= read -r ev; do
+    [ -z "$ev" ] && continue
+    if [ "$first" = "1" ]; then first=0; else ev_json="$ev_json,"; fi
+    ev_json="$ev_json\"$(json_esc "$ev")\""
+  done <<EOF2
+$BH_EVIDENCE
+EOF2
+
+  local skipped
+  if [ "${BH_BENCH_SKIPPED:-0}" = "1" ]; then skipped=true; else skipped=false; fi
+  local netskipped
+  if [ "$BH_NO_NET" = "1" ]; then netskipped=true; else netskipped=false; fi
+
+  printf '{'
+  printf '"tool":"%s","version":"%s","generated_at":"%s","mode":"%s",' \
+    "$(json_esc "$BH_TOOL")" "$(json_esc "$BH_VERSION")" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(json_esc "$BH_MODE")"
+  printf '"hostname":%s,' "$(json_val "$BH_HOSTNAME")"
+  printf '"virtualization":{"kind":%s,"type":%s,"product":%s,"host_type":%s,"host_product":%s,"cloud":%s,"cloud_detail":%s,"evidence":[%s]},' \
+    "$(json_val "$BH_KIND")" "$(json_val "$BH_TYPE")" "$(json_val "$BH_PRODUCT")" \
+    "$(json_val "$BH_HOST_TYPE")" "$(json_val "$BH_HOST_PRODUCT")" \
+    "$(json_val "$BH_CLOUD")" "$(json_val "$BH_CLOUD_DETAIL")" "$ev_json"
+  printf '"system":{"os":%s,"kernel":%s,"arch":%s,"uptime":%s,' \
+    "$(json_val "$BH_OS")" "$(json_val "$BH_KERNEL")" "$(json_val "$BH_ARCH")" "$(json_val "$BH_UPTIME")"
+  printf '"cpu":{"model":%s,"logical_cores":%s,"physical_cores":%s,"effective_cores":%s,"features":%s},' \
+    "$(json_val "$BH_CPU_MODEL")" "$(json_val "$BH_CPU_LOGICAL")" "$(json_val "$BH_CPU_PHYS")" "$(json_val "$BH_EFF_CORES")" "$(json_val "$BH_CPU_FLAGS_HI")"
+  printf '"memory":{"total_mb":%s,"available_mb":%s,"swap_mb":%s}},' \
+    "$(json_val "$BH_MEM_TOTAL_MB")" "$(json_val "$BH_MEM_AVAIL_MB")" "$(json_val "$BH_MEM_SWAP_MB")"
+  printf '"limits":{"cgroup_version":%s,"cpu_quota_cores":%s,"memory_limit_mb":%s,"cpuset":%s},' \
+    "$(json_val "$CG_VER")" "$(json_val "$BH_CPU_QUOTA_TXT")" "$(json_val "$BH_MEM_LIMIT_MB")" "$(json_val "$CPUSET")"
+  printf '"disk":{"dir":%s,"device":%s,"fs":%s,"total_mb":%s,"available_mb":%s},' \
+    "$(json_val "$BH_DISK_DIR")" "$(json_val "$BH_DISK_DEV")" "$(json_val "$BH_DISK_FS")" "$(json_val "$BH_DISK_TOTAL_MB")" "$(json_val "$BH_DISK_AVAIL_MB")"
+  printf '"bench":{"skipped":%s,' "$skipped"
+  printf '"cpu":{"sha256_1c_mbps":%s,"sha256_mc_mbps":%s,"threads":%s,"openssl_sha256_kbs":%s},' \
+    "$(json_val "$(num_or_0 "$BH_SHA1C")")" "$(json_val "$(num_or_0 "$BH_SHANC")")" "$(json_val "$BH_PAR_JOBS")" "$(json_val "$BH_OPENSSL_K")"
+  printf '"memory":{"gbps":%s,"method":%s},' "$(json_val "$(num_or_0 "$BH_MEM_GBS")")" "$(json_val "$BH_MEM_METHOD")"
+  printf '"disk":{"mode":%s,"seq_write_mbps":%s,"seq_read_mbps":%s,"k4_write_mbps":%s,"k4_read_mbps":%s,"fio_randread_iops":%s,"fio_randwrite_iops":%s},' \
+    "$(json_val "$BH_DISK_MODE")" "$(json_val "$(num_or_0 "$BH_SEQW")")" "$(json_val "$(num_or_0 "$BH_SEQR")")" \
+    "$(json_val "$(num_or_0 "$BH_4KW")")" "$(json_val "$(num_or_0 "$BH_4KR")")" \
+    "$(json_val "$(num_or_0 "$BH_FIO_RIOPS")")" "$(json_val "$(num_or_0 "$BH_FIO_WIOPS")")"
+  printf '"network":{"skipped":%s,"method":%s,"download_mbps":%s,"upload_mbps":%s,"connect_ms":%s,' \
+    "$netskipped" "$(json_val "$BH_NET_METHOD")" "$(json_val "$(num_or_0 "$BH_DOWN_MBPS")")" \
+    "$(json_val "$(num_or_0 "$BH_UP_MBPS")")" "$(json_val "$(num_or_0 "$BH_LAT_MS")")"
+  printf '"ipv4":%s,"ipv6":%s,"geo":%s,"asn":%s}},' \
+    "$(json_val "$BH_IPV4")" "$(json_val "$BH_IPV6")" "$(json_val "$BH_IP_GEO")" "$(json_val "$BH_IP_ASN")"
+  printf '"score":{"cpu_1c":%s,"cpu_multi":%s,"memory":%s,"disk_seq":%s,"disk_4k":%s,"net_down":%s,"net_up":%s,"total":%s,"max":%s}}' \
+    "$(json_val "$BH_SCORE_CPU1C")" "$(json_val "$BH_SCORE_CPUMC")" "$(json_val "$BH_SCORE_MEM")" \
+    "$(json_val "$BH_SCORE_DSEQ")" "$(json_val "$BH_SCORE_D4K")" "$(json_val "$BH_SCORE_NDOWN")" \
+    "$(json_val "$BH_SCORE_NUP")" "$(json_val "$BH_SCORE_TOTAL")" "$(json_val "$BH_SCORE_MAX")"
+}
+
+# ---------------------------------------------------------------- Markdown
+build_markdown() {
+  printf '# BLACKHOLE VPS BENCH v%s\n\n' "$BH_VERSION"
+  printf '> Generated: %s · mode: `%s` · repo: [%s](https://github.com/%s)\n\n' \
+    "$(date -u '+%Y-%m-%d %H:%M UTC')" "$BH_MODE" "$BH_REPO" "$BH_REPO"
+  printf '## Verdict\n\n| Field | Value |\n|---|---|\n'
+  printf '| Kind | **%s** |\n' "$BH_KIND"
+  printf '| Type | %s |\n' "$BH_TYPE"
+  printf '| Product | %s |\n' "$BH_PRODUCT"
+  [ -n "$BH_HOST_PRODUCT" ] && printf '| Host | %s |\n' "$BH_HOST_PRODUCT"
+  [ -n "$BH_CLOUD" ] && printf '| Cloud | %s %s |\n' "$BH_CLOUD" "$BH_CLOUD_DETAIL"
+  printf '\n## System\n\n| Field | Value |\n|---|---|\n'
+  printf '| OS | %s (%s) |\n' "$BH_OS" "$BH_KERNEL"
+  printf '| CPU | %s — %s logical / %s physical, effective %s |\n' "$BH_CPU_MODEL" "$BH_CPU_LOGICAL" "$BH_CPU_PHYS" "$BH_EFF_CORES"
+  [ -n "$BH_CPU_QUOTA_TXT" ] && printf '| CPU quota (cgroup) | %s cores |\n' "$BH_CPU_QUOTA_TXT"
+  [ -n "$CPUSET" ] && printf '| cpuset | `%s` |\n' "$CPUSET"
+  printf '| RAM | %s total / %s avail |\n' "$(fmt_mbint "$BH_MEM_TOTAL_MB")" "$(fmt_mbint "$BH_MEM_AVAIL_MB")"
+  [ "${BH_MEM_LIMIT_MB:-0}" -gt 0 ] 2>/dev/null && printf '| RAM limit (cgroup) | %s |\n' "$(fmt_mbint "$BH_MEM_LIMIT_MB")"
+  printf '| Disk | %s (%s) %s total |\n' "$BH_DISK_DEV" "$BH_DISK_FS" "$(fmt_mbint "$BH_DISK_TOTAL_MB")"
+  if [ "${BH_BENCH_SKIPPED:-0}" != "1" ]; then
+    printf '\n## Benchmark\n\n| Metric | Value |\n|---|---|\n'
+    printf '| CPU sha256 (1 core) | %s |\n' "$(fmt_mb "$BH_SHA1C")"
+    printf '| CPU sha256 (%s threads) | %s |\n' "$BH_PAR_JOBS" "$(fmt_mb "$BH_SHANC")"
+    printf '| Memory bandwidth | %s (%s) |\n' "$(fmt_gbs "$BH_MEM_GBS")" "$BH_MEM_METHOD"
+    printf '| Disk seq write | %s |\n' "$(fmt_mb "$BH_SEQW")"
+    printf '| Disk seq read | %s |\n' "$(fmt_mb "$BH_SEQR")"
+    printf '| Disk 4K write / read | %s / %s |\n' "$(fmt_mb "$BH_4KW")" "$(fmt_mb "$BH_4KR")"
+    [ -n "$BH_FIO_RIOPS" ] && printf '| fio 4k rand IOPS | r %s / w %s |\n' "$BH_FIO_RIOPS" "${BH_FIO_WIOPS:-n/a}"
+    if [ "$BH_NO_NET" != "1" ]; then
+      printf '| Network download | %s |\n' "$(fmt_mbps "$BH_DOWN_MBPS")"
+      printf '| Network upload | %s |\n' "$(fmt_mbps "$BH_UP_MBPS")"
+      printf '| TCP connect | %s |\n' "$(fmt_ms "$BH_LAT_MS")"
+    fi
+    printf '\n## BH-SCORE\n\n**%s / %s**\n\n' "$BH_SCORE_TOTAL" "$BH_SCORE_MAX"
+    printf 'cpu1c %s · cpumc %s · mem %s · disk-seq %s · disk-4k %s · net-down %s · net-up %s\n' \
+      "$BH_SCORE_CPU1C" "$BH_SCORE_CPUMC" "$BH_SCORE_MEM" "$BH_SCORE_DSEQ" "$BH_SCORE_D4K" "$BH_SCORE_NDOWN" "$BH_SCORE_NUP"
+  fi
+  if [ -n "$BH_IPV4$BH_IP_GEO$BH_IP_ASN" ]; then
+    printf '\n## Location\n\n| Field | Value |\n|---|---|\n'
+    [ -n "$BH_IPV4" ] && printf '| IPv4 | `%s` |\n' "$BH_IPV4"
+    [ -n "$BH_IPV6" ] && printf '| IPv6 | `%s` |\n' "$BH_IPV6"
+    [ -n "$BH_IP_GEO" ] && printf '| Geo/ISP | %s |\n' "$BH_IP_GEO"
+    [ -n "$BH_IP_ASN" ] && printf '| ASN | %s |\n' "$BH_IP_ASN"
+  fi
+  if [ -n "$BH_EVIDENCE" ]; then
+    printf '\n<details><summary>Detection evidence</summary>\n\n```\n%s\n```\n\n</details>\n' "$BH_EVIDENCE"
+  fi
+  printf '\n> Methodology: CPU = sha256 throughput (dd|sha256sum); Memory = C memcpy-style loop (or dd proxy); Disk = dd (direct I/O when supported); Network = Cloudflare speed endpoints. BH-SCORE caps each of the 7 components at 100 (max 700).\n'
+}
+
+# ---------------------------------------------------------------- Discord
+discord_send() {
+  [ -n "$BH_WEBHOOK" ] || return 0
+  log "sending report to Discord webhook..."
+
+  local desc
+  desc="$(printf '%s\n' "${bh_lines[@]}" | tail -c 1900)"
+  desc="${desc//$\\/\\\\}"; desc="${desc//\"/\\\"}"; desc="${desc//$'\n'/\\n}"; desc="${desc//$'\t'/ }"
+
+  # colors must be DECIMAL: hex literals (9B59B6) are invalid JSON numbers
+  local color=10181046 # 0x9B59B6 (purple)
+  case "$BH_KIND" in
+    container)  color=3447003 ;;  # 0x3498DB (blue)
+    vm)         color=15494310 ;; # 0x9B59B6
+    bare-metal) color=3066993 ;;  # green
+  esac
+
+  local fields="["
+  local sep=""
+  add_field() {
+    fields="$fields$sep{\"name\":\"$(json_esc "$1")\",\"value\":\"$(json_esc "$2")\",\"inline\":true}"
+    sep=","
+  }
+  add_field "Verdict" "$(verdict_text)"
+  if [ "${BH_BENCH_SKIPPED:-0}" != "1" ]; then
+    add_field "BH-SCORE" "$BH_SCORE_TOTAL / $BH_SCORE_MAX"
+    add_field "CPU sha256" "$(fmt_mb "$BH_SHA1C") (1c) / $(fmt_mb "$BH_SHANC") (${BH_PAR_JOBS}thr)"
+    add_field "Memory" "$(fmt_gbs "$BH_MEM_GBS")"
+    add_field "Disk" "seq $(fmt_mb "$BH_SEQW") | 4k $(fmt_mb "$BH_4KW")"
+    if [ "$BH_NO_NET" != "1" ]; then
+      add_field "Network" "down $(fmt_mbps "$BH_DOWN_MBPS") / up $(fmt_mbps "$BH_UP_MBPS")"
+    fi
+  fi
+  [ -n "$BH_IP_GEO" ] && add_field "Location" "$BH_IP_GEO"
+  fields="$fields]"
+
+  local payload="$BH_RUNDIR/dh_payload.json"
+  {
+    printf '{"username":"Blackhole VPS Bench",'
+    printf '"embeds":[{"title":"%s — %s",' "$(json_esc "$BH_TOOL")" "$(json_esc "$BH_HOSTNAME")"
+    printf '"description":"```\\n%s\\n```",' "$desc"
+    printf '"color":%s,' "$color"
+    printf '"fields":%s,' "$fields"
+    printf '"footer":{"text":"%s v%s · %s"},' "$(json_esc "$BH_TOOL")" "$(json_esc "$BH_VERSION")" "$(json_esc "$BH_REPO")"
+    printf '"timestamp":"%s"}]}' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  } > "$payload"
+
+  local code
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+    -H 'Content-Type: application/json' -X POST --data-binary @"$payload" "$BH_WEBHOOK" 2>/dev/null)"
+  if [ "$code" = "204" ] || [ "$code" = "200" ]; then
+    log "Discord webhook delivered (HTTP $code)"
+  else
+    warn "Discord webhook returned HTTP ${code:-none}"
+  fi
+}
+
+# ============ lib/99-main.sh ============
+# =====================================================================
+# blackhole-vps-bench · 99-main.sh — CLI parsing and run modes
+# =====================================================================
+# shellcheck shell=bash
+
+usage() {
+  cat <<USAGE
+$BH_TOOL v$BH_VERSION — VPS virtualization detector + hardware benchmark
+Detects KVM / QEMU / Docker / Podman / LXC / OpenVZ / Xen / Hyper-V / VMware /
+VirtualBox / bhyve / WSL / bare metal, then benchmarks the REAL (cgroup-limited)
+configuration: CPU, memory, disk, network. Reports to terminal, JSON, Markdown
+and optionally a Discord webhook.
+
+Usage: blackhole-vps-bench [MODE] [OPTIONS]
+
+Modes:
+  all        detect + info + full benchmark (default)
+  detect     virtualization detection only (fast, works offline)
+  info       system info only, no benchmark
+  bench      benchmark only (detection still shown for context)
+  help       show this help
+
+Options:
+  --fast           quick profile (smaller test payloads)
+  --no-net         skip network tests (no outbound traffic)
+  --webhook URL    send report to a Discord webhook (env: BH_WEBHOOK)
+  --json PATH      write JSON report to PATH ('-' = stdout)
+  --markdown PATH  write Markdown report to PATH ('-' = stdout)
+  --output PATH    write plain-text report to PATH
+  --disk-dir DIR   directory for disk tests (default: /tmp)
+  --no-color       disable ANSI colors
+  --version        print version
+  -h, help         show help
+
+Environment: BH_WEBHOOK, BH_FAST=1, BH_NO_NET=1, BH_DISK_DIR, BH_NO_COLOR=1
+
+Exit codes: 0 ok | 1 benchmark produced no data | 2 usage error
+
+Examples:
+  blackhole-vps-bench
+  blackhole-vps-bench detect
+  blackhole-vps-bench all --fast --webhook https://discord.com/api/webhooks/xxx/yyy
+  blackhole-vps-bench all --json report.json --markdown report.md
+USAGE
+}
+
+BH_MODE="all"
+
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      all|detect|info|bench) BH_MODE="$1" ;;
+      help|-h|--help)        BH_MODE="help" ;;
+      --version|-V)          BH_MODE="version" ;;
+      --fast)                BH_FAST=1 ;;
+      --no-net)              BH_NO_NET=1 ;;
+      --no-color)            BH_NO_COLOR=1; C_RST=''; C_B=''; C_DIM=''; C_CYN=''; C_GRN=''; C_YLW=''; C_RED=''; C_MAG='' ;;
+      --webhook)
+        [ -n "${2:-}" ] || die "--webhook requires a URL"
+        BH_WEBHOOK="$2"; shift ;;
+      --json)
+        [ -n "${2:-}" ] || die "--json requires a path"
+        BH_JSON_OUT="$2"; shift ;;
+      --markdown)
+        [ -n "${2:-}" ] || die "--markdown requires a path"
+        BH_MD_OUT="$2"; shift ;;
+      --output)
+        [ -n "${2:-}" ] || die "--output requires a path"
+        BH_TXT_OUT="$2"; shift ;;
+      --disk-dir)
+        [ -n "${2:-}" ] || die "--disk-dir requires a directory"
+        BH_DISK_DIR="$2"; shift ;;
+      *)
+        die "unknown argument: $1 (see: $BH_TOOL help)" ;;
+    esac
+    shift
+  done
+}
+
+write_outputs() {
+  if [ -n "$BH_JSON_OUT" ]; then
+    if [ "$BH_JSON_OUT" = "-" ]; then
+      build_json; printf '\n'
+    else
+      build_json > "$BH_JSON_OUT" && log "JSON report written to $BH_JSON_OUT"
+    fi
+  fi
+  if [ -n "$BH_MD_OUT" ]; then
+    if [ "$BH_MD_OUT" = "-" ]; then
+      build_markdown
+    else
+      build_markdown > "$BH_MD_OUT" && log "Markdown report written to $BH_MD_OUT"
+    fi
+  fi
+}
+
+main() {
+  parse_args "$@"
+
+  case "$BH_MODE" in
+    help)    usage; exit 0 ;;
+    version) printf '%s v%s\n' "$BH_TOOL" "$BH_VERSION"; exit 0 ;;
+  esac
+
+  log "mode=$BH_MODE fast=$BH_FAST no_net=$BH_NO_NET"
+  detect_virt
+
+  if [ "$BH_MODE" = "detect" ]; then
+    # detection must work fully offline
+    local saved_net="$BH_NO_NET"
+    BH_NO_NET=1
+    gather_info
+    BH_NO_NET="$saved_net"
+    BH_BENCH_SKIPPED=1
+  else
+    gather_info
+    if [ "$BH_MODE" = "info" ]; then
+      BH_BENCH_SKIPPED=1
+    else
+      bench_cpu
+      bench_mem
+      bench_disk
+      bench_net
+      compute_scores
+    fi
+  fi
+
+  build_report
+  print_report
+  write_outputs
+  discord_send
+
+  if [ "${BH_BENCH_SKIPPED:-0}" != "1" ] && [ "$BH_SCORE_TOTAL" -eq 0 ]; then
+    warn "benchmark produced no usable data"
+    exit 1
+  fi
+  exit 0
+}
+
+main "$@"

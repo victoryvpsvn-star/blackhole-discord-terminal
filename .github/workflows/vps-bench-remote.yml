@@ -1,0 +1,90 @@
+name: vps-bench remote
+
+# Bench a REAL VPS over SSH, on demand (Actions tab -> Run workflow).
+# Required repo secrets (Settings -> Secrets and variables -> Actions):
+#   VPS_HOST     — IP or hostname of the VPS
+#   VPS_USER     — SSH user (root is typical)
+#   VPS_SSH_KEY  — private SSH key allowed to log in
+#   VPS_PORT     — (optional, default 22)
+# Optional:
+#   DISCORD_WEBHOOK — when set, the tool posts the full report to Discord.
+
+on:
+  workflow_dispatch:
+    inputs:
+      fast:
+        description: 'Fast profile (smaller payloads)'
+        type: boolean
+        default: true
+      extra_args:
+        description: 'Extra blackhole-vps-bench arguments (e.g. --disk-dir /data)'
+        type: string
+        default: ''
+
+concurrency:
+  group: vps-bench-remote
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+      VPS_PORT: ${{ secrets.VPS_PORT }}
+      VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check remote configuration
+        id: cfg
+        run: |
+          if [ -n "$VPS_HOST" ] && [ -n "$VPS_USER" ] && [ -n "$VPS_SSH_KEY" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Remote bench disabled. Add repo secrets: VPS_HOST, VPS_USER, VPS_SSH_KEY (optional VPS_PORT)."
+          fi
+
+      - name: Set up SSH
+        if: steps.cfg.outputs.configured == 'true'
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/bh_key
+          chmod 600 ~/.ssh/bh_key
+          ssh-keyscan -p "${VPS_PORT:-22}" "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Run blackhole-vps-bench on the VPS
+        if: steps.cfg.outputs.configured == 'true'
+        run: |
+          set -e
+          PORT="${VPS_PORT:-22}"
+          FLAGS="--fast"
+          [ "${{ inputs.fast }}" != "true" ] && FLAGS=""
+          tar -C vps-bench -czf /tmp/bh.tgz bin lib
+          scp -q -i ~/.ssh/bh_key -P "$PORT" /tmp/bh.tgz "$VPS_USER@$VPS_HOST:/tmp/bh.tgz"
+          # shellcheck disable=SC2029
+          ssh -q -i ~/.ssh/bh_key -p "$PORT" "$VPS_USER@$VPS_HOST" \
+            "rm -rf /tmp/bhvps && mkdir -p /tmp/bhvps && tar -xzf /tmp/bh.tgz -C /tmp/bhvps && cd /tmp/bhvps && bash bin/blackhole-vps-bench all $FLAGS ${{ inputs.extra_args }} --webhook '$DISCORD_WEBHOOK' --json /tmp/bhvps/report.json --markdown /tmp/bhvps/report.md --output /tmp/bhvps/report.txt"
+          mkdir -p report
+          scp -q -i ~/.ssh/bh_key -P "$PORT" "$VPS_USER@$VPS_HOST:/tmp/bhvps/report.json" \
+            "$VPS_USER@$VPS_HOST:/tmp/bhvps/report.md" \
+            "$VPS_USER@$VPS_HOST:/tmp/bhvps/report.txt" report/
+
+      - name: Job summary
+        if: always() && steps.cfg.outputs.configured == 'true'
+        run: cat report/report.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Upload report
+        if: always() && steps.cfg.outputs.configured == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vps-report
+          path: report/
+          if-no-files-found: warn
