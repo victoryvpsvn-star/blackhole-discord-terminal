@@ -24,10 +24,17 @@ BH_IS_CHROOT=0         # 1 when / differs from /proc/1/root/. (chroot jail)
 
 # ---- R3-approved deep-scan verdicts (optional: ""/0 when undetermined) ----
 BH_VIRT_NESTED=""      # C4: exposed | masked | native | ""  (nested-virt tri-state)
-BH_CONF_COMPUTING=""   # C1: amd-sev|amd-sev-es|amd-sev-snp|intel-tdx|arm-cca|""
+BH_CONF_COMPUTING=""   # C1: amd-sev|amd-sev-es|amd-sev-snp|intel-tdx|intel-sgx|arm-cca|""
 BH_IRQ_VMM=""          # C7: comma list of VMM handler names from /proc/interrupts
 BH_VIRTIO_DEVS=""      # C8: comma list of virtio driver names (virtio_blk,virtio_net)
 BH_IRQ_VMM_RE='kvm[a-z-]*|xen[a-z-]*|hv_[a-z]+|vmbus|dragonball[.a-z0-9]*|virtio[0-9]*|vfio|firecracker|cloud-hypervisor'
+
+# ---- v5 deep tells (C03): evidence-only fingerprints + orthogonal verdicts ----
+BH_VMM_TELLS=""        # comma list of VMM evidence IDs: nicdrv,pcivendor,modules,dmesg,cmdline,dt,xenver,emu-nic,pci-off
+BH_QEMU_ACCEL=""       # kvm | tcg | "" — QEMU/Bochs DMI only; hardware accel vs emulated (benchmark caveat)
+BH_ACPI_OEM=""         # mapped ACPI DSDT OEM ID (QEMU | Xen | VBox | VMware) or "" when unknown/unreadable
+BH_DMI_SPOOF=0         # 1 = hypervisor evidence contradicts a physical-vendor/physical-chassis DMI
+BH_XEN_VER=""          # /sys/hypervisor/version when /sys/hypervisor/type = xen
 
 dmi_read() {
   local f="/sys/class/dmi/id/$1" v=""
@@ -142,7 +149,15 @@ detect_chroot() {
 map_vm_product() {
   local vendor="$1" product="${2:-}" bios="${3:-}" tag="${4:-}" p2=""
   case "$vendor" in
-    QEMU)                    printf 'KVM/QEMU' ;;
+    QEMU)
+      # v5: refine the stock signature with the QEMU machine type when the
+      # product string carries one (i440FX/Q35); fall back to the generic tag.
+      case "$product" in
+        *Q35*)    printf 'QEMU Q35' ;;
+        *i440FX*) printf 'QEMU i440fx' ;;
+        *)        printf 'KVM/QEMU' ;;
+      esac
+      ;;
     "Amazon EC2")            printf 'AWS EC2 (Nitro/KVM)' ;;
     "Microsoft Corporation") printf 'Hyper-V' ;;
     VMware*)                 printf 'VMware ESXi' ;;
@@ -167,6 +182,9 @@ map_vm_product() {
     Tencent*)                printf 'Tencent Cloud (KVM)' ;;
     OpenStack*|Mirantis*)    printf 'OpenStack (KVM)' ;;
     "FreeBSD bhyve"|bhyve)   printf 'bhyve' ;;
+    Nutanix*)                printf 'Nutanix AHV (KVM)' ;;
+    crosvm)                  printf 'crosvm (KVM)' ;;
+    "Cloud Hypervisor"|cloud-hypervisor|clh) printf 'Cloud Hypervisor' ;;
     *)
       case "$product" in
         *"Virtual Machine"*)      p2='KVM/QEMU' ;;
@@ -174,6 +192,22 @@ map_vm_product() {
         *VirtualBox*)             p2='VirtualBox' ;;
         *"HVM domU"*)             p2='Xen HVM' ;;
         *BHYVE*|*bhyve*)          p2='bhyve' ;;
+        # v5: QEMU machine types + newer KVM-family products. The machine-type
+        # strings only mean QEMU when the BIOS flavor is QEMU firmware
+        # (SeaBIOS / OVMF / EDK II) — otherwise keep the generic KVM/QEMU tag.
+        *"i440FX"*)
+          case "$bios" in
+            SeaBIOS|OVMF|*EDK*|*edk*|"") p2='QEMU i440fx' ;;
+            *)                           p2='KVM/QEMU' ;;
+          esac ;;
+        *"Q35"*)
+          case "$bios" in
+            SeaBIOS|OVMF|*EDK*|*edk*|"") p2='QEMU Q35' ;;
+            *)                           p2='KVM/QEMU' ;;
+          esac ;;
+        *Nutanix*)                p2='Nutanix AHV (KVM)' ;;
+        *crosvm*)                 p2='crosvm (KVM)' ;;
+        *"Cloud Hypervisor"*|*cloud-hypervisor*|*cloud_hypervisor*) p2='Cloud Hypervisor' ;;
         *"Standard PC"*|*"QEMU"*) p2='KVM/QEMU' ;;
         *"Alibaba Cloud ECS"*)    p2='Alibaba Cloud ECS (KVM)' ;;
         *OpenStack*)              p2='OpenStack (KVM)' ;;
@@ -562,12 +596,17 @@ detect_nested_virt() {
 }
 
 # ---- C1: confidential computing ----
-# BH_CONF_COMPUTING = amd-sev | amd-sev-es | amd-sev-snp | intel-tdx | arm-cca | ""
+# BH_CONF_COMPUTING = amd-sev | amd-sev-es | amd-sev-snp | intel-tdx |
+#                     intel-sgx | arm-cca | ""
 # Sources ONLY (no dmesg inference): (a) /proc/cpuinfo flags sev/sev_es/
-# sev_snp/tdx_guest, (b) existence of /dev/sev-guest, (c) directory
-# /sys/kernel/security/tdx_guest. Highest wins: snp > sev-es > sev; tdx
-# standalone. arm-cca is a reserved value — no (a)/(b)/(c) source exists for
-# it yet, so it stays unset until an approved marker is defined.
+# sev_snp/tdx_guest, (b) device nodes /dev/sev-guest or /dev/sev, (c)
+# directory /sys/kernel/security/tdx_guest, (d) /dev/sgx_enclave or /dev/sgx
+# (intel-sgx; NOTE: SGX is a host TEE capability visible on bare metal too,
+# so it is the lowest-precedence verdict). Highest wins: snp > sev-es > sev
+# > tdx > sgx. arm-cca is a reserved value — no (a)/(b)/(c)/(d) source
+# exists for it yet, so it stays unset until an approved marker is defined.
+# v5 (C03): extra device nodes were appended (not restructured); a co-resident
+# SGX node only adds corroboration evidence, it never overwrites the winner.
 detect_conf_computing() {
   BH_CONF_COMPUTING=""
   local src=""
@@ -583,13 +622,28 @@ detect_conf_computing() {
   if [ -z "$BH_CONF_COMPUTING" ] && [ -e /dev/sev-guest ]; then
     BH_CONF_COMPUTING="amd-sev"; src="/dev/sev-guest present"
   fi
+  # v5 (C03): legacy /dev/sev node (no -guest chardev)
+  if [ -z "$BH_CONF_COMPUTING" ] && [ -e /dev/sev ]; then
+    BH_CONF_COMPUTING="amd-sev"; src="/dev/sev present"
+  fi
   if [ -z "$BH_CONF_COMPUTING" ] && [ -d /sys/kernel/security/tdx_guest ]; then
     BH_CONF_COMPUTING="intel-tdx"; src="/sys/kernel/security/tdx_guest present"
+  fi
+  # v5 (C03): SGX device nodes (lowest precedence — host TEE capability)
+  if [ -z "$BH_CONF_COMPUTING" ] && { [ -e /dev/sgx_enclave ] || [ -e /dev/sgx ]; }; then
+    BH_CONF_COMPUTING="intel-sgx"; src="/dev/sgx_enclave|/dev/sgx present"
   fi
   if [ -n "$BH_CONF_COMPUTING" ]; then
     append_ev "confidential computing: $BH_CONF_COMPUTING ($src)"
   else
     append_ev "confidential computing: none detected"
+  fi
+  # v5 (C03): corroboration only — SGX alongside another verdict is extra
+  # evidence, never an overwrite of the SEV/TDX winner above.
+  if [ -n "$BH_CONF_COMPUTING" ] && [ "$BH_CONF_COMPUTING" != "intel-sgx" ]; then
+    if [ -e /dev/sgx_enclave ] || [ -e /dev/sgx ]; then
+      append_ev "SGX device node present (additional TEE capability, not the primary verdict)"
+    fi
   fi
 }
 
@@ -650,6 +704,402 @@ detect_virtio_devs() {
 }
 
 # =====================================================================
+# v5 deep tells (C03) — evidence-only VMM fingerprints.
+# DISCIPLINE: nothing here may override BH_KIND/BH_TYPE/BH_PRODUCT or any
+# verdict set above; every check only appends IDs to BH_VMM_TELLS and
+# evidence lines. BH_QEMU_ACCEL, BH_DMI_SPOOF, BH_ACPI_OEM and BH_XEN_VER
+# are new orthogonal globals. Budget: all reads are single 1-token
+# sysfs/proc files (or 16 bytes of the ACPI table), no awk, total < 0.5s.
+# =====================================================================
+
+# bhv5c3_tell_add ID — append a deduped evidence ID to BH_VMM_TELLS.
+bhv5c3_tell_add() {
+  [ -n "${1:-}" ] || return 0
+  case ",${BH_VMM_TELLS:-}," in
+    *",$1,"*) return 0 ;;
+  esac
+  BH_VMM_TELLS="${BH_VMM_TELLS:+${BH_VMM_TELLS},}$1"
+  return 0
+}
+
+# ---- tell: NIC driver fingerprint (/sys/class/net/*/device/driver) ----
+# Paravirtual NIC drivers identify the hosting VMM; fully emulated NICs
+# (e1000/rtl8139/pcnet32) are a weaker "emu-nic" tell. Inside a container
+# the netns devices are host-side, so the emu-nic tell gains a (host-view)
+# suffix per spec.
+bhv5c3_tell_nic() {
+  local base="${1:-/sys/class/net}"   # arg 1: base dir (test fixture override)
+  [ -d "$base" ] || return 0
+  local d drv hits=""
+  for d in "$base"/*; do
+    [ -e "$d/device/driver" ] || continue
+    drv="$(readlink "$d/device/driver" 2>/dev/null)"
+    drv="${drv##*/}"
+    case "$drv" in
+      virtio_net|hv_netvsc|vmxnet3|xen_netfront|ena|gve|e1000|e1000e|rtl8139|pcnet32)
+        case ",$hits," in
+          *",$drv,"*) : ;;
+          *) hits="${hits:+$hits,}$drv" ;;
+        esac
+        ;;
+    esac
+  done
+  [ -n "$hits" ] || return 0
+  local view="" mapped="" m
+  if [ "$BH_KIND" = "container" ]; then
+    view=" (container: host netns view)"
+  fi
+  for m in virtio_net hv_netvsc vmxnet3 xen_netfront ena gve; do
+    case ",$hits," in
+      *",$m,"*)
+        case "$m" in
+          virtio_net)   mapped="${mapped:+$mapped,}virtio_net=>KVM/QEMU" ;;
+          hv_netvsc)    mapped="${mapped:+$mapped,}hv_netvsc=>Hyper-V" ;;
+          vmxnet3)      mapped="${mapped:+$mapped,}vmxnet3=>VMware" ;;
+          xen_netfront) mapped="${mapped:+$mapped,}xen_netfront=>Xen" ;;
+          ena)          mapped="${mapped:+$mapped,}ena=>AWS-Nitro" ;;
+          gve)          mapped="${mapped:+$mapped,}gve=>Google-Cloud" ;;
+        esac
+        ;;
+    esac
+  done
+  for m in e1000 e1000e rtl8139 pcnet32; do
+    case ",$hits," in
+      *",$m,"*) mapped="${mapped:+$mapped,}$m=>emulated" ;;
+    esac
+  done
+  case "$hits" in
+    *virtio_net*|*hv_netvsc*|*vmxnet3*|*xen_netfront*|*ena*|*gve*)
+      bhv5c3_tell_add nicdrv
+      append_ev "NIC driver(s): $mapped$view"
+      ;;
+  esac
+  case "$hits" in
+    *e1000*|*rtl8139*|*pcnet32*)
+      if [ "$BH_KIND" = "container" ]; then
+        bhv5c3_tell_add "emu-nic(host-view)"
+      else
+        bhv5c3_tell_add "emu-nic"
+      fi
+      append_ev "emulated NIC driver(s): $mapped$view"
+      ;;
+  esac
+  return 0
+}
+
+# ---- tell: PCI vendor census (/sys/bus/pci/devices/*/vendor) ----
+# 0x1af4 virtio (Red Hat), 0x1b36 QEMU, 0x15ad VMware, 0x1414 vmbus,
+# 0x5853 Xen. An absent/empty PCI bus on x86 (where every real board
+# enumerates PCI) hints at a microvm (pci=off) layout — but inside a
+# container the empty bus is a namespace artifact, so no tell there.
+bhv5c3_tell_pci() {
+  local dir="${1:-/sys/bus/pci/devices}"   # arg 1: devices dir (test fixture override)
+  local d v any=0
+  local nv=0 nq=0 nvm=0 nms=0 nx=0 summ=""
+  if [ -d "$dir" ]; then
+    for d in "$dir"/*/vendor; do
+      [ -r "$d" ] || continue
+      any=1
+      v="$(cat "$d" 2>/dev/null)"
+      case "$v" in
+        0x1af4|0x1AF4) nv=$((nv + 1)) ;;
+        0x1b36|0x1B36) nq=$((nq + 1)) ;;
+        0x15ad|0x15AD) nvm=$((nvm + 1)) ;;
+        0x1414)        nms=$((nms + 1)) ;;
+        0x5853)        nx=$((nx + 1)) ;;
+      esac
+    done
+  fi
+  if [ "$any" = 1 ]; then
+    if [ "$nv" -gt 0 ];  then summ="${summ:+$summ,}virtio=$nv"; fi
+    if [ "$nq" -gt 0 ];  then summ="${summ:+$summ,}qemu=$nq"; fi
+    if [ "$nvm" -gt 0 ]; then summ="${summ:+$summ,}vmware=$nvm"; fi
+    if [ "$nms" -gt 0 ]; then summ="${summ:+$summ,}vmbus=$nms"; fi
+    if [ "$nx" -gt 0 ];  then summ="${summ:+$summ,}xen=$nx"; fi
+    if [ -n "$summ" ]; then
+      bhv5c3_tell_add pcivendor
+      local view=""
+      if [ "$BH_KIND" = "container" ]; then view=" (container: host view)"; fi
+      append_ev "PCI vendor census: $summ$view"
+    fi
+    return 0
+  fi
+  # absent or empty bus -> pci-off microvm hint (x86 only, never containers)
+  if [ "$BH_KIND" = "container" ]; then return 0; fi
+  case "${BHV5C3_ARCH:-}" in
+    x86_64|i386|i486|i586|i686|x86)
+      bhv5c3_tell_add pci-off
+      append_ev "PCI bus absent/empty on x86 => microvm-style pci=off layout"
+      ;;
+  esac
+  return 0
+}
+
+# ---- tell: VMM kernel modules (/sys/module) ----
+# vmw_*/hv_*/xen_*/virtio_*/ptp_kvm module dirs leak the host VMM layer;
+# kvm_amd|kvm_intel WITHOUT a hypervisor flag means this box RUNS VMs (host).
+bhv5c3_tell_modules() {
+  local base="${1:-/sys/module}"   # arg 1: module dir (test fixture override)
+  local d name hits="" kvmmod=""
+  for d in "$base"/vmw_* "$base"/hv_* "$base"/xen_* "$base"/virtio_*; do
+    [ -d "$d" ] || continue          # glob unmatched -> literal pattern
+    name="${d##*/}"
+    case ",$hits," in *",$name,"*) continue ;; esac
+    hits="${hits:+$hits,}$name"
+  done
+  if [ -d "$base/ptp_kvm" ]; then
+    case ",$hits," in *",ptp_kvm,"*) : ;; *) hits="${hits:+$hits,}ptp_kvm" ;; esac
+  fi
+  if [ -d "$base/kvm_amd" ] || [ -d "$base/kvm_intel" ]; then
+    if [ "${BHV5C3_HV:-0}" = "1" ]; then
+      kvmmod="kvm host module present (hypervisor flag set)"
+    else
+      kvmmod="kvm_amd/kvm_intel loaded WITHOUT hypervisor flag => this box runs VMs (host)"
+      bhv5c3_tell_add modules
+    fi
+  fi
+  if [ -n "$hits" ]; then
+    bhv5c3_tell_add modules
+    local view=""
+    if [ "$BH_KIND" = "container" ]; then view=" (container: host view)"; fi
+    append_ev "VMM modules in /sys/module: $hits$view"
+  fi
+  if [ -n "$kvmmod" ]; then
+    append_ev "$kvmmod"
+  fi
+  return 0
+}
+
+# ---- tell: dmesg 'Hypervisor detected' line ----
+# Skipped entirely when dmesg_restrict is on (output would be empty anyway);
+# capped at 2s via timeout when available. Empty result -> no tell.
+bhv5c3_tell_dmesg() {
+  command_exists dmesg || return 0
+  if [ "$(cat /proc/sys/kernel/dmesg_restrict 2>/dev/null)" = "1" ]; then
+    return 0
+  fi
+  local line
+  if command_exists timeout; then
+    line="$(timeout 2 dmesg 2>/dev/null | grep -m1 -E 'Hypervisor detected: (KVM|Microsoft Hyper-V|VMware|Xen|QEMU)')" || line=""
+  else
+    line="$(dmesg 2>/dev/null | grep -m1 -E 'Hypervisor detected: (KVM|Microsoft Hyper-V|VMware|Xen|QEMU)')" || line=""
+  fi
+  [ -n "$line" ] || return 0
+  line="${line:0:120}"
+  bhv5c3_tell_add dmesg
+  local view=""
+  if [ "$BH_KIND" = "container" ]; then view=" (container: host kernel ring)"; fi
+  append_ev "dmesg: \"$line\"$view"
+  return 0
+}
+
+# ---- tell: kernel cmdline fingerprints ----
+# firecracker-style: reboot=k + pci=off + 8250* (>= 3 tokens) => microvm;
+# VM-style: root=/dev/vd?|xvd? + console=ttyS0.
+bhv5c3_tell_cmdline() {
+  local cf="${1:-/proc/cmdline}"   # arg 1: cmdline file (test fixture override)
+  [ -r "$cf" ] || return 0
+  local cl tk fc=0 vm=0
+  cl="$(cat "$cf" 2>/dev/null)"
+  [ -n "$cl" ] || return 0
+  local toks=()
+  read -r -a toks <<<"$cl" || true
+  if [ "${#toks[@]}" -gt 0 ]; then
+    for tk in "${toks[@]}"; do
+      case "$tk" in
+        reboot=k|reboot=k,*) fc=$((fc + 1)) ;;
+        pci=off)             fc=$((fc + 1)) ;;
+        8250*)               fc=$((fc + 1)) ;;
+        root=/dev/vda|root=/dev/vda[0-9]*|root=/dev/xvda|root=/dev/xvda[0-9]*) vm=$((vm + 1)) ;;
+        console=ttyS0*)      vm=$((vm + 1)) ;;
+      esac
+    done
+  fi
+  if [ "$fc" -ge 3 ]; then
+    bhv5c3_tell_add cmdline
+    append_ev "kernel cmdline firecracker-style (reboot=k + pci=off + 8250*) => microvm"
+  fi
+  if [ "$vm" -ge 2 ]; then
+    bhv5c3_tell_add cmdline
+    append_ev "kernel cmdline VM-style (root=/dev/vd?|xvd? + console=ttyS0)"
+  fi
+  return 0
+}
+
+# ---- tell: device-tree hypervisor (aarch64/arm only) ----
+# /proc/device-tree/hypervisor/compatible carries "linux,kvm" or "xen";
+# the file is NUL-padded property data, so strip NUL bytes first.
+bhv5c3_tell_dt() {
+  local cf="${1:-/proc/device-tree/hypervisor/compatible}"   # arg 1: compatible file (test fixture override)
+  case "${BHV5C3_ARCH:-}" in
+    aarch64|arm|armv7*|armv8*) : ;;
+    *) return 0 ;;
+  esac
+  [ -r "$cf" ] || return 0
+  local v
+  v="$(tr -d '\0' < "$cf" 2>/dev/null)"
+  case "$v" in
+    *xen*)
+      bhv5c3_tell_add dt
+      append_ev "device-tree hypervisor compatible='$v' => Xen (ARM)"
+      ;;
+    *kvm*)
+      bhv5c3_tell_add dt
+      append_ev "device-tree hypervisor compatible='$v' => KVM (ARM)"
+      ;;
+  esac
+  return 0
+}
+
+# ---- tell + global: Xen version (/sys/hypervisor) ----
+bhv5c3_tell_xenver() {
+  local base="${1:-/sys/hypervisor}"   # arg 1: /sys/hypervisor dir (test fixture override)
+  [ "$(cat "$base/type" 2>/dev/null)" = "xen" ] || return 0
+  # cat (not redirection) so a missing version file is silenced, not a shell error
+  BH_XEN_VER="$(cat "$base/version" 2>/dev/null)"
+  BH_XEN_VER="${BH_XEN_VER//[[:cntrl:]]/}"
+  bhv5c3_tell_add xenver
+  if [ -n "$BH_XEN_VER" ]; then
+    append_ev "Xen hypervisor version: $BH_XEN_VER (/sys/hypervisor/version)"
+  else
+    append_ev "Xen detected; /sys/hypervisor/version unreadable"
+  fi
+  return 0
+}
+
+# ---- BH_QEMU_ACCEL: kvm | tcg | "" ----
+# Only when the DMI vendor/product suggests QEMU/Bochs: KVM PV-clock evidence
+# (kvm-clock or kvm PV cpu flags) with the hypervisor flag => "kvm"; the
+# hypervisor flag without any PV evidence => "tcg" (emulated — benchmark
+# caveat). No QEMU DMI or no hypervisor flag => "" (undetermined).
+bhv5c3_qemu_accel() {
+  BH_QEMU_ACCEL=""
+  local q=0
+  case "${BH_DMI_VENDOR:-}" in
+    QEMU|Bochs) q=1 ;;
+  esac
+  if [ "$q" = 0 ]; then
+    case "${BH_DMI_PRODUCT:-}" in
+      *QEMU*|*Bochs*|*"Standard PC"*) q=1 ;;
+    esac
+  fi
+  [ "$q" = 1 ] || return 0
+  if [ "${BHV5C3_HV:-0}" = "1" ]; then
+    if [ "${BHV5C3_CS:-}" = "kvm-clock" ] || [ "${BHV5C3_PV:-0}" = "1" ]; then
+      BH_QEMU_ACCEL="kvm"
+      append_ev "QEMU/Bochs DMI + KVM PV evidence (clocksource=${BHV5C3_CS:-none}, pv-flags=${BHV5C3_PV:-0}) => accel=kvm"
+    else
+      BH_QEMU_ACCEL="tcg"
+      append_ev "QEMU/Bochs DMI + hypervisor flag but no KVM PV evidence (clocksource=${BHV5C3_CS:-none}) => accel=tcg (emulated: benchmark caveat)"
+    fi
+  fi
+  return 0
+}
+
+# ---- BH_ACPI_OEM: mapped ACPI DSDT OEM ID ----
+# Reads the 16-byte ACPI table header (head -c 16 | od -An -tx1; hex tokens
+# keep 1-byte alignment even for space/NUL bytes), takes OEM ID bytes 10-15,
+# sanitizes to [A-Z0-9 ] and maps known VMM OEMs. Missing/unreadable (root-only
+# 0400 is tolerated) => "". Unknown OEM => "" (raw ID not reported).
+bhv5c3_acpi_oem() {
+  BH_ACPI_OEM=""
+  local f="${1:-/sys/firmware/acpi/tables/DSDT}"   # arg 1: table file (test fixture override)
+  [ -r "$f" ] || return 0
+  local odout
+  odout="$(head -c 16 "$f" 2>/dev/null | od -An -tx1)" || odout=""
+  [ -n "$odout" ] || return 0
+  local toks=() hexstr="" oem="" i h
+  read -r -a toks <<<"$odout" || true
+  if [ "${#toks[@]}" -lt 16 ]; then return 0; fi
+  for i in 10 11 12 13 14 15; do
+    h="${toks[i]:-}"
+    case "$h" in
+      [0-9a-fA-F][0-9a-fA-F]) hexstr="${hexstr}\\x$h" ;;
+    esac
+  done
+  [ -n "$hexstr" ] || return 0
+  oem="$(printf '%b' "$hexstr")"
+  oem="$(printf '%s' "$oem" | tr -cd 'A-Z0-9 ')"
+  [ -n "$oem" ] || return 0
+  local m=""
+  case "$oem" in
+    BOCHS*)  m="QEMU" ;;
+    XEN*)    m="Xen" ;;
+    VBOX*)   m="VBox" ;;
+    VMWARE*) m="VMware" ;;
+  esac
+  if [ -n "$m" ]; then
+    BH_ACPI_OEM="$m"
+    append_ev "ACPI DSDT OEM ID '$oem' => $m"
+  fi
+  return 0
+}
+
+# ---- BH_DMI_SPOOF: DMI/chassis contradiction detector ----
+# 1 only on strong contradictions (never from weak signals):
+#   a) hypervisor flag or KVM PV clocks + physical-vendor-like DMI vendor
+#      (map_vm_product found nothing) => VM behind custom/spoofed DMI;
+#   b) QEMU/Bochs DMI vendor + concrete physical chassis_type 3..23 =>
+#      spoofed chassis.
+bhv5c3_dmi_spoof() {
+  BH_DMI_SPOOF=0
+  local p
+  p="$(map_vm_product "${BH_DMI_VENDOR:-}" "${BH_DMI_PRODUCT:-}" "${BH_DMI_BIOS:-}" "${BH_DMI_ASSET_TAG:-}")"
+  if [ "${BHV5C3_HV:-0}" = "1" ] || [ "${BHV5C3_PV:-0}" = "1" ] || [ "${BHV5C3_CS:-}" = "kvm-clock" ]; then
+    if [ -z "$p" ]; then
+      case "${BH_DMI_VENDOR:-}" in
+        Supermicro*|ASUS*|Gigabyte*|ASRock*|Dell*|HP*|Hewlett-Packard*|Lenovo*|Intel*)
+          BH_DMI_SPOOF=1
+          append_ev "hypervisor/PV-clock evidence behind physical-vendor DMI '${BH_DMI_VENDOR:-}' => VM behind custom/spoofed DMI"
+          ;;
+      esac
+    fi
+  fi
+  case "${BH_DMI_VENDOR:-}" in
+    QEMU|Bochs)
+      case "${BH_CHASSIS_TYPE:-}" in
+        ''|*[!0-9]*) : ;;
+        *)
+          if [ "${BH_CHASSIS_TYPE:-0}" -ge 3 ] && [ "${BH_CHASSIS_TYPE:-0}" -le 23 ]; then
+            BH_DMI_SPOOF=1
+            append_ev "QEMU/Bochs DMI with physical chassis_type=${BH_CHASSIS_TYPE:-} => spoofed chassis"
+          fi
+          ;;
+      esac
+      ;;
+  esac
+  if [ "$BH_DMI_SPOOF" = "1" ] && [ "$BH_KIND" = "container" ]; then
+    append_ev "caveat: DMI/cpuinfo are host view (container)"
+  fi
+  return 0
+}
+
+# ---- orchestrator: run once at the end of detect_virt (BH_KIND already set) ----
+bhv5c3_deep_tells() {
+  BH_VMM_TELLS=""
+  # shared 1-token inputs, read once (cached for the sub-checks below)
+  BHV5C3_ARCH="$(uname -m 2>/dev/null)"
+  BHV5C3_HV=0
+  if has_hv_flag; then BHV5C3_HV=1; fi
+  BHV5C3_PV=0
+  if grep -qE 'kvmclock|kvm_steal_time|kvm_asyncpf' /proc/cpuinfo 2>/dev/null; then BHV5C3_PV=1; fi
+  BHV5C3_CS="$(cat /sys/devices/system/clocksource/clocksource0/current_clocksource 2>/dev/null)"
+  # evidence tells (never touch verdicts)
+  bhv5c3_tell_nic
+  bhv5c3_tell_pci
+  bhv5c3_tell_modules
+  bhv5c3_tell_dmesg
+  bhv5c3_tell_cmdline
+  bhv5c3_tell_dt
+  bhv5c3_tell_xenver
+  # orthogonal new globals
+  bhv5c3_qemu_accel
+  bhv5c3_acpi_oem
+  bhv5c3_dmi_spoof
+  return 0
+}
+
+# =====================================================================
 # Entry point — 99-main.sh calls detect_virt(). Classic verdict first,
 # then the cross-cutting deep-scan detectors (they need BH_KIND set for
 # the container guards, hence they run after the verdict is known).
@@ -660,4 +1110,5 @@ detect_virt() {
   detect_conf_computing   # C1
   detect_irq_vmm          # C7
   detect_virtio_devs      # C8
+  bhv5c3_deep_tells       # v5 C03: evidence-only VMM tells + accel/spoof/OEM globals
 }

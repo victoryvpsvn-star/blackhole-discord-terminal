@@ -32,11 +32,14 @@ Options:
   --no-sec         skip the SSH/security audit
   --no-port-probe  skip the outbound port viability checks (25/465/587/1194/51820)
   --redact         mask IPs, usernames and cloud instance ids in every output
-  --only LIST      run only these modules: cpu,mem,disk,extra,net,sec,env,gpu,storage,info
+  --only LIST      run only these modules: cpu,mem,disk,extra,net,sec,env,gpu,storage,info,region,spec,hw,container,mounts,health,diskdur,netextra
   --skip LIST      skip these modules (same names)
   --min-score N    exit 3 when the BH-SCORE total is below N (CI gate)
   --fail-on LEVEL  exit 4 when security posture has warn|bad findings (CI gate)
   --prom PATH      write a Prometheus textfile (.prom) report — atomic rename
+  --timing PATH    write a per-module wall-time table (TSV) to PATH — atomic rename
+  --badge PATH     write a shields.io endpoint badge JSON to PATH — atomic rename
+  --svg PATH       write a static SVG score-gauge chart to PATH — atomic rename
   --compare PATH   diff this run against a previous JSON report (trend arrows)
   --webhook URL    send report to a Discord webhook (env: BH_WEBHOOK)
   --json PATH      write JSON report to PATH ('-' = stdout)
@@ -48,7 +51,8 @@ Options:
   -h, help         show help
 
 Environment: BH_WEBHOOK, BH_FAST=1, BH_NO_NET=1, BH_NO_SEC=1, BH_REDACT=1,
-BH_PORT_PROBE=0, BH_GAUGE_ASCII=1, BH_DISK_DIR, BH_NO_COLOR=1
+BH_PORT_PROBE=0, BH_GAUGE_ASCII=1, BH_DISK_DIR, BH_NO_COLOR=1, BH_QUIET=1,
+BH_HISTORY=0 (disable run-history TSV append)
 
 Exit codes: 0 ok | 1 benchmark produced no data | 2 usage error
             3 score below --min-score | 4 security posture hit --fail-on
@@ -59,6 +63,7 @@ Examples:
   blackhole-vps-bench sec                        # only the SSH/security audit
   blackhole-vps-bench all --fast
   blackhole-vps-bench all --json r.json --prom metrics.prom
+  blackhole-vps-bench all --timing t.tsv --badge b.json --svg score.svg
   blackhole-vps-bench bench --compare last.json --min-score 400
 USAGE
 }
@@ -104,6 +109,15 @@ parse_args() {
       --prom)
         [ -n "${2:-}" ] || die "--prom requires a path"
         BH_PROM_OUT="$2"; shift ;;
+      --timing)
+        [ -n "${2:-}" ] || die "--timing requires a path"
+        BH_TIMING_OUT="$2"; shift ;;
+      --badge)
+        [ -n "${2:-}" ] || die "--badge requires a path"
+        BH_BADGE_OUT="$2"; shift ;;
+      --svg)
+        [ -n "${2:-}" ] || die "--svg requires a path"
+        BH_SVG_OUT="$2"; shift ;;
       --compare)
         [ -n "${2:-}" ] || die "--compare requires a previous JSON report path"
         BH_COMPARE_IN="$2"; shift ;;
@@ -130,6 +144,150 @@ parse_args() {
   done
 }
 
+# =====================================================================
+# v5 wiring helpers (C15) — private, bhv5c15_* prefixed
+# =====================================================================
+
+# bhv5c15_progress MSG — one in-place progress hint on stderr. TTY-only and
+# silenced by BH_QUIET=1; step counter auto-increments up to the per-mode
+# BHV5C15_TOTAL so the numbering follows each mode's actual sequence.
+bhv5c15_progress() {
+  [ -t 2 ] || return 0
+  [ "${BH_QUIET:-0}" != "1" ] || return 0
+  BHV5C15_STEP=$(( ${BHV5C15_STEP:-0} + 1 ))
+  if [ "${BHV5C15_TOTAL:-0}" -gt 0 ] 2>/dev/null; then
+    printf '\r\033[K[bh] [%d/%d] %s' "$BHV5C15_STEP" "$BHV5C15_TOTAL" "$*" >&2
+  else
+    printf '\r\033[K[bh] %s' "$*" >&2
+  fi
+  return 0
+}
+
+# bhv5c15_v5_gathers [--health] — v5 info-side modules. Every module is
+# double-guarded (bh_mod_enabled + declare -F) so a partial upgrade tree
+# (lib file not merged yet) never breaks main. Timing names:
+# region spec hw container mounts [health].
+bhv5c15_v5_gathers() {
+  bh_mod_enabled region    && declare -F gather_region      >/dev/null 2>&1 && bh_timed region    gather_region      || true
+  bh_mod_enabled spec      && declare -F gather_speccheck   >/dev/null 2>&1 && bh_timed spec      gather_speccheck   || true
+  bh_mod_enabled hw        && declare -F gather_hwdeep      >/dev/null 2>&1 && bh_timed hw        gather_hwdeep      || true
+  bh_mod_enabled container && declare -F gather_container   >/dev/null 2>&1 && bh_timed container gather_container   || true
+  bh_mod_enabled mounts    && declare -F gather_mount_audit >/dev/null 2>&1 && bh_timed mounts    gather_mount_audit || true
+  if [ "${1:-}" = "--health" ]; then
+    bh_mod_enabled health && declare -F gather_storage_health >/dev/null 2>&1 && bh_timed health gather_storage_health || true
+  fi
+  return 0
+}
+
+# bhv5c15_quiet_summary — BH_QUIET=1 one-glance CI summary on stdout. Uses
+# the same score/posture globals the 70-report sink renders. Sinks (files)
+# are unaffected.
+bhv5c15_quiet_summary() {
+  [ "${BH_QUIET:-0}" = "1" ] || return 0
+  local total max grade w b
+  total="${BH_SCORE_TOTAL:-0}"
+  max="${BH_SCORE_MAX:-700}"
+  grade="${BH_GRADE:-}"
+  if [ -z "$grade" ] && declare -F grade_letter >/dev/null 2>&1; then
+    grade="$(grade_letter "$total" "$max" 2>/dev/null)" || grade=""
+  fi
+  if [ -n "$grade" ]; then
+    printf 'BH-SCORE: %s/%s (%s)\n' "$total" "$max" "$grade"
+  else
+    printf 'BH-SCORE: %s/%s\n' "$total" "$max"
+  fi
+  case "${BH_SEC_WARN:-}" in ''|*[!0-9]*) w=0 ;; *) w="$BH_SEC_WARN" ;; esac
+  case "${BH_SEC_BAD:-}"  in ''|*[!0-9]*) b=0 ;; *) b="$BH_SEC_BAD" ;; esac
+  if [ "$w" -gt 0 ] || [ "$b" -gt 0 ]; then
+    printf 'posture: warn:%s bad:%s\n' "$w" "$b"
+  else
+    printf 'posture: good\n'
+  fi
+  local fp
+  fp="${BH_FINGERPRINT:-${BH_FP:-}}"
+  [ -n "$fp" ] && printf 'fingerprint: %s\n' "$fp"
+  return 0
+}
+
+# bhv5c15_timing_out — write the module wall-time table atomically
+# (tmp + mv); also echo one row per log line to stderr unless quiet.
+bhv5c15_timing_out() {
+  [ -n "${BH_TIMING_OUT:-}" ] || return 0
+  if bh_timing_table > "${BH_TIMING_OUT}.tmp" 2>/dev/null; then
+    if mv -f "${BH_TIMING_OUT}.tmp" "$BH_TIMING_OUT" 2>/dev/null; then
+      log "timing table written to $BH_TIMING_OUT"
+    else
+      rm -f "${BH_TIMING_OUT}.tmp" 2>/dev/null || true
+      log "timing table could not be moved to $BH_TIMING_OUT"
+    fi
+  else
+    rm -f "${BH_TIMING_OUT}.tmp" 2>/dev/null || true
+    log "timing table unavailable"
+  fi
+  if [ "${BH_QUIET:-0}" != "1" ]; then
+    local row
+    bh_timing_table 2>/dev/null | while IFS= read -r row; do
+      [ -n "$row" ] || continue
+      log "timing $row"
+    done
+  fi
+  return 0
+}
+
+# bhv5c15_atomic_out PATH BUILDER LABEL — guarded sink runner for badge/svg.
+# Tolerates BOTH builder contracts:
+#   a) builder prints artifact to stdout  -> committed here via tmp + mv;
+#   b) builder writes PATH itself (the 70-report sinks are self-atomic)
+#      -> accepted when PATH exists non-empty after the call.
+# Absent builder = logged skip (mid-merge safe); failures never abort main.
+bhv5c15_atomic_out() {
+  local path="$1" fn="$2" label="$3" tmp rc=0
+  [ -n "$path" ] || return 0
+  declare -F "$fn" >/dev/null 2>&1 || { log "$label skipped (builder $fn not present)"; return 0; }
+  tmp="${path}.tmp"
+  rm -f "$tmp" 2>/dev/null || true
+  "$fn" > "$tmp" 2>/dev/null || rc=$?
+  if [ "$rc" -eq 0 ] && [ -s "$tmp" ]; then
+    if mv -f "$tmp" "$path" 2>/dev/null; then
+      log "$label written to $path"
+      return 0
+    fi
+  elif [ "$rc" -eq 0 ] && [ -s "$path" ]; then
+    # self-atomic builder already committed the artifact during the call
+    log "$label present at $path"
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+  log "$label build failed"
+  return 0
+}
+
+# bhv5c15_sinks_out — badge + svg sinks (builders live in 70-report; guarded).
+bhv5c15_sinks_out() {
+  [ -n "${BH_BADGE_OUT:-}" ] && bhv5c15_atomic_out "$BH_BADGE_OUT" build_badge "badge"
+  [ -n "${BH_SVG_OUT:-}" ]   && bhv5c15_atomic_out "$BH_SVG_OUT"   build_svg   "svg gauge"
+  return 0
+}
+
+# bhv5c15_footer — wall time + rerun hint reconstructed from actual state.
+# --webhook is deliberately never echoed (may be a private URL).
+bhv5c15_footer() {
+  local wall=0 now flags=""
+  if [ -n "${BH_T_MAIN0:-}" ]; then
+    now="$(now_ms)"
+    case "$now" in ''|*[!0-9]*) now="" ;; esac
+    if [ -n "$now" ]; then
+      wall=$(( (now - BH_T_MAIN0 + 999) / 1000 ))
+      [ "$wall" -lt 0 ] 2>/dev/null && wall=0
+    fi
+  fi
+  [ "${BH_FAST:-0}" = "1" ]   && flags="$flags --fast"
+  [ "${BH_NO_NET:-0}" = "1" ] && flags="$flags --no-net"
+  [ -n "${BH_SKIP:-}" ]       && flags="$flags --skip ${BH_SKIP}"
+  log "wall ${wall}s · v${BH_VERSION} · rerun: ${BH_TOOL} all${flags}"
+  return 0
+}
+
 # run_selftest — v4 internal assertions. Pure helper math only: no network,
 # no disk stress, no forking storms. Exit 0 = all green, 1 = regressions.
 run_selftest() {
@@ -146,6 +304,12 @@ run_selftest() {
   _eq() { [ "$1" = "$2" ]; }
   _ge() { [ "$1" -ge "$2" ]; }
   _len() { [ "${#1}" -eq "$2" ]; }
+  # v5 assertion helpers (plain predicates — no eval, no early `return` inside
+  # the _t condition: a `return` executed by eval would unwind _t itself and
+  # silently skip the PASS/FAIL line + fail counter)
+  _num()   { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }        # non-empty digits only
+  _match() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }                 # substring
+  _slug()  { case "${1:-}" in ''|*[!a-z0-9_.-]*) return 1 ;; *) return 0 ;; esac; }  # fingerprint slug charset
 
   local a b
   a=$(now_ms)
@@ -181,6 +345,87 @@ run_selftest() {
   _t "cpuset count empty"          eval '[ "$(CPUSET= bh_cpuset_count)" = "0" ]'
   _t "par jobs sane"               eval '[ "$BH_PAR_JOBS" -ge 1 ] && [ "$BH_PAR_JOBS" -le "$NCPU" ]'
   _t "cpu quota parses"            eval 'case "$QUOTA_CORES" in *[!0-9.]*) return 1 ;; esac'
+
+  # ---- v5 selftests (guarded: an unmerged optional module prints SKIP) ----
+
+  # bh_median3 (05-noise) — median-of-N command runner
+  if declare -F bh_median3 >/dev/null 2>&1; then
+    _t "bh_median3 runs cmd"       _eq "$(bh_median3 sh -c 'echo hi' 2>/dev/null)" "hi"
+  else
+    printf 'SKIP: bh_median3 (feature not present)\n'
+  fi
+
+  # bh_noise_spread (05-noise) — spread% of a ~10ms micro-bench is a plain integer
+  if declare -F bh_noise_spread >/dev/null 2>&1; then
+    _t "bh_noise_spread numeric"   _num "$(bh_noise_spread "${SLEEP_CMD:-sleep}" 0.01 2>/dev/null)"
+  else
+    printf 'SKIP: bh_noise_spread (feature not present)\n'
+  fi
+
+  # bh_psi (00-core) — fixture-driven PSI parse
+  local psi_dir psi_out
+  psi_dir="$(mktemp -d "${TMPDIR:-/tmp}/bhvps_psi.XXXXXX" 2>/dev/null)" || psi_dir=""
+  if [ -n "$psi_dir" ]; then
+    printf 'some avg10=1.00 avg60=0.50 avg300=0.10\n' > "$psi_dir/cpu" 2>/dev/null || true
+    printf 'some avg10=0.00 avg60=0.00 avg300=0.00\nfull avg10=0.00 avg60=0.00 avg300=0.00\n' > "$psi_dir/memory" 2>/dev/null || true
+    printf 'some avg10=0.00 avg60=0.00 avg300=0.00\nfull avg10=0.00 avg60=0.00 avg300=0.00\n' > "$psi_dir/io" 2>/dev/null || true
+    psi_out="$(bh_psi "$psi_dir" 2>/dev/null)"
+    _t "bh_psi fixture cpu avg10"  _match "$psi_out" "cpu s=1.00"
+  else
+    printf 'SKIP: bh_psi fixture (mktemp unavailable)\n'
+  fi
+  [ -z "$psi_dir" ] || rm -rf "$psi_dir" 2>/dev/null || true
+
+  # bh_spec_verdict (55-storage-map) — claimed-vs-actual spec verdicts
+  if declare -F bh_spec_verdict >/dev/null 2>&1; then
+    _t "bh_spec_verdict cpu ok"    _eq "$(bh_spec_verdict 2 2 cpu 2>/dev/null)" "ok"
+    _t "bh_spec_verdict ram warn"  _eq "$(bh_spec_verdict 1024 700 ram 2>/dev/null)" "warn"
+  else
+    printf 'SKIP: bh_spec_verdict (feature not present)\n'
+  fi
+
+  # bh_sparkline (64-history) — min-max block ramp ▁▂▃▄▅▆▇█.
+  # NOTE on "length": LC_ALL=C (exported by 00-core) makes ${#s} count BYTES,
+  # and each block char is 3 UTF-8 bytes — so a 3-point ramp is 9 "chars".
+  # The exact-ramp assertions below are the locale-stable "length 3" check.
+  if declare -F bh_sparkline >/dev/null 2>&1; then
+    local sl slc
+    sl="$(bh_sparkline 1 2 3 2>/dev/null)"
+    slc="$(bh_sparkline 4 4 4 2>/dev/null)"
+    _t "bh_sparkline 3 blocks"     _eq "$sl" "▁▅█"
+    _t "bh_sparkline 3 bytes x3"   _len "$sl" 9
+    _t "bh_sparkline const ramp"   _eq "$slc" "▅▅▅"
+    _t "bh_sparkline single empty" _eq "$(bh_sparkline 42 2>/dev/null)" ""
+    _t "bh_sparkline noargs empty" _eq "$(bh_sparkline 2>/dev/null)" ""
+  else
+    printf 'SKIP: bh_sparkline (feature not present)\n'
+  fi
+
+  # bh_fp_sanitize (70-report) — machine fingerprint slug
+  if declare -F bh_fp_sanitize >/dev/null 2>&1; then
+    _t "bh_fp_sanitize slug chars" _slug "$(bh_fp_sanitize 'KVM/AWS t3.medium' 2>/dev/null)"
+  else
+    printf 'SKIP: bh_fp_sanitize (feature not present)\n'
+  fi
+
+  # bh_history_render (64-history) — fixture TSV in a throwaway XDG_CACHE_HOME
+  local hdir old_xdg sl3 tr3
+  hdir="$(mktemp -d "${TMPDIR:-/tmp}/bhvps_hist.XXXXXX" 2>/dev/null)" || hdir=""
+  if [ -n "$hdir" ] && declare -F bh_history_render >/dev/null 2>&1 && declare -F bh_sparkline >/dev/null 2>&1; then
+    old_xdg="${XDG_CACHE_HOME:-}"
+    XDG_CACHE_HOME="$hdir"
+    mkdir -p "$hdir/blackhole-vps-bench" 2>/dev/null || true
+    printf '1700000000\t500\tA\t50\t50\t50\t50\t50\t100\t100\n1700000010\t537\tA\t50\t50\t60\t50\t50\t120\t107\n1700000020\t563\tA\t50\t50\t70\t50\t50\t140\t103\n' \
+      > "$hdir/blackhole-vps-bench/history.tsv" 2>/dev/null || true
+    bh_history_render
+    sl3="${BH_SPARKLINE:-}"; tr3="${BH_TREND:-}"
+    XDG_CACHE_HOME="$old_xdg"
+    _t "history render sparkline"  _eq "$sl3" "▁▅█"
+    _t "history render trend +26"  _eq "$tr3" "+26"
+  elif [ -z "$hdir" ]; then
+    printf 'SKIP: bh_history_render fixture (mktemp unavailable)\n'
+  fi
+  [ -z "$hdir" ] || rm -rf "$hdir" 2>/dev/null || true
 
   if [ "$fails" -eq 0 ]; then
     printf 'SELFTEST: all checks passed\n'
@@ -221,6 +466,7 @@ bh_step_summary() {
 
 main() {
   parse_args "$@"
+  BH_T_MAIN0="$(now_ms)"   # v5: wall-clock anchor for the rerun footer
 
   case "$BH_MODE" in
     help)     usage; exit 0 ;;
@@ -241,51 +487,100 @@ main() {
     BH_PORT_PROBE=0
   fi
 
+  # v5: progress-hint step totals (numbering follows each mode's sequence:
+  # all=8 detect info cpu mem disk extra net sec | bench=7 | detect=2 | info/sec=3)
+  case "$BH_MODE" in
+    all)      BHV5C15_TOTAL=8 ;;
+    bench)    BHV5C15_TOTAL=7 ;;
+    detect)   BHV5C15_TOTAL=2 ;;
+    info|sec) BHV5C15_TOTAL=3 ;;
+    *)        BHV5C15_TOTAL=0 ;;
+  esac
+  BHV5C15_STEP=0
+
   log "mode=$BH_MODE fast=$BH_FAST no_net=$BH_NO_NET redact=$BH_REDACT only=${BH_ONLY:-} skip=${BH_SKIP:-}"
-  detect_virt
+
+  bhv5c15_progress "virtualization detect..."
+  bh_timed virt detect_virt
 
   if [ "$BH_MODE" = "detect" ]; then
     # detection must work fully offline and instantly
     BH_BENCH_SKIPPED=1
     BH_SEC_SKIPPED=1
-    bh_mod_enabled info    && gather_info
-    bh_mod_enabled env     && gather_env
-    bh_mod_enabled gpu     && gather_gpu
-    bh_mod_enabled storage && gather_storage_map
+    bhv5c15_progress "system info..."
+    bh_mod_enabled info    && bh_timed info gather_info
+    bh_mod_enabled env     && bh_timed env gather_env
+    bh_mod_enabled gpu     && bh_timed gpu gather_gpu
+    bh_mod_enabled storage && bh_timed storage gather_storage_map
+    bhv5c15_v5_gathers
   else
-    bh_mod_enabled info    && gather_info
-    bh_mod_enabled env     && gather_env
-    bh_mod_enabled gpu     && gather_gpu
+    bhv5c15_progress "system info..."
+    bh_mod_enabled info    && bh_timed info gather_info
+    bh_mod_enabled env     && bh_timed env gather_env
+    bh_mod_enabled gpu     && bh_timed gpu gather_gpu
     if [ "$BH_NO_NET" != "1" ]; then
-      bh_mod_enabled cloud && cloud_metadata_probe
+      bh_mod_enabled cloud && bh_timed cloud cloud_metadata_probe
     fi
+    # v5 modules (region/spec/hw/container/mounts/health) — info context for
+    # every non-detect mode; double-guarded so a mid-merge tree still runs.
+    bhv5c15_v5_gathers --health
     if [ "$BH_MODE" = "info" ] || [ "$BH_MODE" = "sec" ]; then
       BH_BENCH_SKIPPED=1
-      bh_mod_enabled sec && run_sec_audit
+      bhv5c15_progress "security audit..."
+      bh_mod_enabled sec && bh_timed sec run_sec_audit
     elif [ "$BH_MODE" = "bench" ]; then
       BH_SEC_SKIPPED=1
-      bh_mod_enabled cpu     && bench_cpu
-      bh_mod_enabled mem     && bench_mem
-      bh_mod_enabled disk    && bench_disk
-      bh_mod_enabled storage && gather_storage_map
-      bh_mod_enabled extra   && bench_extra
-      bh_mod_enabled net     && bench_net
+      bhv5c15_progress "cpu bench..."
+      bh_mod_enabled cpu     && bh_timed cpu bench_cpu
+      bhv5c15_progress "memory bench..."
+      bh_mod_enabled mem     && bh_timed mem bench_mem
+      bhv5c15_progress "disk bench..."
+      bh_mod_enabled disk    && bh_timed disk bench_disk
+      bh_mod_enabled diskdur && declare -F bench_disk_dur >/dev/null 2>&1 && bh_timed diskdur bench_disk_dur || true
+      bh_mod_enabled storage && bh_timed storage gather_storage_map
+      bhv5c15_progress "extras bench..."
+      bh_mod_enabled extra   && bh_timed extra bench_extra
+      bhv5c15_progress "network bench..."
+      bh_mod_enabled net     && bh_timed net bench_net
+      bh_mod_enabled netextra && declare -F bench_net_extra >/dev/null 2>&1 && bh_timed netextra bench_net_extra || true
       compute_scores
+      declare -F bh_history_append >/dev/null 2>&1 && bh_history_append
+      declare -F bh_history_render >/dev/null 2>&1 && bh_history_render
     else
-      bh_mod_enabled cpu     && bench_cpu
-      bh_mod_enabled mem     && bench_mem
-      bh_mod_enabled disk    && bench_disk
-      bh_mod_enabled storage && gather_storage_map
-      bh_mod_enabled extra   && bench_extra
-      bh_mod_enabled net     && bench_net
+      bhv5c15_progress "cpu bench..."
+      bh_mod_enabled cpu     && bh_timed cpu bench_cpu
+      bhv5c15_progress "memory bench..."
+      bh_mod_enabled mem     && bh_timed mem bench_mem
+      bhv5c15_progress "disk bench..."
+      bh_mod_enabled disk    && bh_timed disk bench_disk
+      bh_mod_enabled diskdur && declare -F bench_disk_dur >/dev/null 2>&1 && bh_timed diskdur bench_disk_dur || true
+      bh_mod_enabled storage && bh_timed storage gather_storage_map
+      bhv5c15_progress "extras bench..."
+      bh_mod_enabled extra   && bh_timed extra bench_extra
+      bhv5c15_progress "network bench..."
+      bh_mod_enabled net     && bh_timed net bench_net
+      bh_mod_enabled netextra && declare -F bench_net_extra >/dev/null 2>&1 && bh_timed netextra bench_net_extra || true
       compute_scores
-      bh_mod_enabled sec && run_sec_audit
+      declare -F bh_history_append >/dev/null 2>&1 && bh_history_append
+      declare -F bh_history_render >/dev/null 2>&1 && bh_history_render
+      bhv5c15_progress "security audit..."
+      bh_mod_enabled sec && bh_timed sec run_sec_audit
     fi
   fi
 
   build_report
-  print_report
+  if [ "${BH_QUIET:-0}" = "1" ]; then
+    # quiet mode: suppress the full human body on stdout (the --output file
+    # sink inside print_report still runs); only the summary below prints.
+    print_report >/dev/null
+  else
+    print_report
+  fi
+  bhv5c15_quiet_summary
   write_outputs
+  bhv5c15_timing_out
+  bhv5c15_sinks_out
+  bhv5c15_footer
   if [ "$BH_MODE" = "sec" ]; then
     log "sec mode: Discord webhook skipped (zero-traffic mode)"
   else

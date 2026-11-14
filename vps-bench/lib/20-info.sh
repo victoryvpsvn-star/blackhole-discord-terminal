@@ -36,6 +36,11 @@ BH_CPU_AI_FEAT=""; BH_CPU_CRYPTO_FEAT=""
 BH_CPU_UCODE=""; BH_CPU_STEPPING=""
 # kernel same-page merging (C6)
 BH_KSM_STATE=""; BH_KSM_SHARING=""
+# v5.0 hardware extras (C6)
+# CPU cache topology summary, e.g. "L1d 32K L1i 32K L2 1024K L3 36864K shared=0-31"
+BH_CACHE_TXT=""
+# bench-disk block queue parameters, e.g. "512e nr=256 qd=32 wc=write back maxsec=1280"
+BH_BLOCKQ_TXT=""
 
 # bh_bracketed FILE — print the value of the [bracketed] token in FILE ("" if none)
 bh_bracketed() {
@@ -76,6 +81,189 @@ bh_cpu_steal_pct() {
       if (dt > 0) printf "%.1f", ds / dt * 100
     }' 2>/dev/null
   )
+}
+
+# =====================================================================
+# v5.0 hardware extras (C6) — private helpers, called from gather_info.
+# Contract: read-only sysfs/procfs, every read [ -r ]-guarded, missing
+# data -> "" (clean), never warn, no subshells beyond the two value
+# captures, budget well under 0.3s. BH_CPUFREQ_TXT is owned by 16-hw-deep
+# and is deliberately NOT touched here.
+# =====================================================================
+
+# bhv5c6_cache_txt — CPU cache topology of cpu0 (or the first cpuN that
+# exposes a cache dir), from /sys/devices/system/cpu/cpuN/cache/index*.
+# Output, one line: "L1d 32K L1i 32K L2 1024K L3 36864K shared=0-31"
+#   - per level (ascending): Data -> "L<lvl>d", Instruction -> "L<lvl>i",
+#     Unified -> "L<lvl>" (suffix "u" only when the same level also has
+#     d/i entries, so a mixed level stays unambiguous)
+#   - shared= is the shared_cpu_list of the highest level that exposes one
+#   - sizes are the raw sysfs tokens (32K / 1024K / 36864K)
+# When sysfs exposes no cache info at all: fallback to `lscpu -C`
+# (L1d/L1i/L2/L3 rows, first row per NAME wins). Empty on failure; never warns.
+# Prints on stdout.
+bhv5c6_cache_txt() {
+  local cdir="" c idx f lvl typ sz key sl out="" lv dh ih
+  local best_lvl=0 best_list=""
+  if [ -d /sys/devices/system/cpu/cpu0/cache ]; then
+    cdir="/sys/devices/system/cpu/cpu0/cache"
+  else
+    for c in /sys/devices/system/cpu/cpu*; do
+      [ -d "$c/cache" ] || continue
+      cdir="$c/cache"
+      break
+    done
+  fi
+  if [ -n "$cdir" ]; then
+    local -A csz=()   # "L<level><d|i|u>" -> size token (first index wins)
+    for idx in "$cdir"/index*; do
+      [ -d "$idx" ] || continue
+      f="$idx/level"; [ -r "$f" ] || continue
+      lvl="$(tr -d ' \t\n\r' < "$f" 2>/dev/null)"
+      case "$lvl" in ''|*[!0-9]*) continue ;; esac
+      f="$idx/type"; [ -r "$f" ] || continue
+      typ="$(tr -d ' \t\n\r' < "$f" 2>/dev/null)"
+      case "$typ" in
+        Data)        typ=d ;;
+        Instruction) typ=i ;;
+        Unified)     typ=u ;;
+        *) continue ;;
+      esac
+      f="$idx/size"; [ -r "$f" ] || continue
+      sz="$(tr -d ' \t\n\r' < "$f" 2>/dev/null)"
+      [ -n "$sz" ] || continue
+      key="L${lvl}${typ}"
+      [ -n "${csz[$key]:-}" ] || csz[$key]="$sz"
+      # shared_cpu_list: keep the highest level that exposes one
+      f="$idx/shared_cpu_list"
+      if [ -r "$f" ]; then
+        sl="$(tr -d ' \t\n\r' < "$f" 2>/dev/null)"
+        if [ -n "$sl" ] && [ "$lvl" -ge "$best_lvl" ] 2>/dev/null; then
+          best_lvl="$lvl"; best_list="$sl"
+        fi
+      fi
+    done
+    # emit per level, ascending; within a level: d, i, then unified
+    for lv in 1 2 3 4 5 6 7 8; do
+      dh="${csz[L${lv}d]:-}"
+      ih="${csz[L${lv}i]:-}"
+      if [ -n "$dh" ]; then out="${out}L${lv}d $dh "; fi
+      if [ -n "$ih" ]; then out="${out}L${lv}i $ih "; fi
+      sz="${csz[L${lv}u]:-}"
+      if [ -n "$sz" ]; then
+        # unified-only level (the common L2/L3 case) prints plain "L<lv>";
+        # a level that also has d/i entries gets the "u" suffix instead
+        if [ -n "$dh" ] || [ -n "$ih" ]; then
+          out="${out}L${lv}u $sz "
+        else
+          out="${out}L${lv} $sz "
+        fi
+      fi
+    done
+    if [ -n "$best_list" ]; then out="${out}shared=$best_list "; fi
+    out="${out% }"
+  fi
+  if [ -z "$out" ] && command_exists lscpu; then
+    # fallback: lscpu -C columns (ONE-SIZE-ALL), first row per NAME, mawk-safe
+    out="$(lscpu -C 2>/dev/null | awk '
+      $1 == "L1d" || $1 == "L1i" || $1 == "L2" || $1 == "L3" {
+        if (!seen[$1] && $2 != "" && $2 != "-") { seen[$1] = 1; printf "%s %s ", $1, $2 }
+      }' 2>/dev/null)"
+    out="${out% }"
+  fi
+  printf '%s' "$out"
+  return 0
+}
+
+# bhv5c6_blockq_txt — block queue parameters of the base disk device that
+# gather_info already resolved for rotational/scheduler (arg 1 = its name,
+# e.g. "sda" / "nvme0n1"). Re-derivation mirrors gather_info: lsblk PKNAME
+# -> readlink -f -> strip trailing digits -> /sys/block/<d>/queue; last
+# resort is the first /sys/block entry that is not loop/ram/zram.
+# Output: "4Kn|512e|512n nr=<n> qd=<d> wc=<write back|write through> maxsec=<kb>"
+#   - 4Kn  when physical=4096 and logical=4096
+#   - 512e when physical=4096 and logical=512
+#   - 512n when physical=512  and logical=512 (industry naming, spec silent)
+# Every piece is included only when its sysfs file is readable; write_cache
+# appeared in kernel 4.10, on older kernels the file is absent and wc= is
+# silently skipped. Empty on failure; never warns. Prints on stdout.
+bhv5c6_blockq_txt() {
+  local base="${1:-}" rp d q v out=""
+  local phys="" log="" nr="" qd="" wc="" mx=""
+  if [ -z "$base" ] || [ ! -d "/sys/block/$base/queue" ]; then
+    base=""
+    if [ -n "${BH_DISK_DEV:-}" ]; then
+      if command_exists lsblk; then
+        base="$(lsblk -no PKNAME "$BH_DISK_DEV" 2>/dev/null | head -n 1 | tr -d ' \t')"
+      fi
+      if [ -z "$base" ] || [ ! -d "/sys/block/$base/queue" ]; then
+        rp="$(readlink -f "$BH_DISK_DEV" 2>/dev/null)"
+        if [ -n "$rp" ]; then base="$(basename "$rp" 2>/dev/null)"; fi
+      fi
+      if [ -n "$base" ] && [ ! -d "/sys/block/$base/queue" ]; then
+        rp="${base%[0-9]*}"
+        if [ -n "$rp" ] && [ -d "/sys/block/$rp/queue" ]; then base="$rp"; fi
+      fi
+    fi
+    if [ -z "$base" ] || [ ! -d "/sys/block/$base/queue" ]; then
+      base=""
+      for d in /sys/block/*; do
+        [ -d "$d/queue" ] || continue
+        case "${d##*/}" in loop*|ram*|zram*) continue ;; esac
+        # only a device that actually reports block sizes is useful here
+        [ -r "$d/queue/logical_block_size" ] || continue
+        base="${d##*/}"
+        break
+      done
+    fi
+  fi
+  [ -n "$base" ] && [ -d "/sys/block/$base/queue" ] || return 0
+  q="/sys/block/$base/queue"
+  if [ -r "$q/physical_block_size" ]; then
+    phys="$(tr -d ' \t\n\r' < "$q/physical_block_size" 2>/dev/null)"
+  fi
+  if [ -r "$q/logical_block_size" ]; then
+    log="$(tr -d ' \t\n\r' < "$q/logical_block_size" 2>/dev/null)"
+  fi
+  if [ -n "$phys" ] && [ -n "$log" ]; then
+    case "$phys:$log" in
+      4096:4096) out="4Kn"  ;;
+      4096:512)  out="512e" ;;
+      512:512)   out="512n" ;;
+    esac
+  fi
+  if [ -r "$q/nr_requests" ]; then
+    v="$(tr -d ' \t\n\r' < "$q/nr_requests" 2>/dev/null)"
+    case "$v" in ''|*[!0-9]*) : ;; *) nr="$v" ;; esac
+  fi
+  if [ -r "$q/queue_depth" ]; then
+    v="$(tr -d ' \t\n\r' < "$q/queue_depth" 2>/dev/null)"
+    case "$v" in ''|*[!0-9]*) : ;; *) qd="$v" ;; esac
+  fi
+  if [ -r "$q/write_cache" ]; then
+    v="$(tr -d '\n\r' < "$q/write_cache" 2>/dev/null)"
+    v="${v#"${v%%[! ]*}"}"; v="${v%"${v##*[! ]}"}"   # trim edge spaces
+    case "$v" in write\ back|write\ through) wc="$v" ;; esac
+  fi
+  if [ -r "$q/max_sectors_kb" ]; then
+    v="$(tr -d ' \t\n\r' < "$q/max_sectors_kb" 2>/dev/null)"
+    case "$v" in ''|*[!0-9]*) : ;; *) mx="$v" ;; esac
+  fi
+  if [ -n "$nr" ]; then out="${out}${out:+ }nr=$nr"; fi
+  if [ -n "$qd" ]; then out="${out}${out:+ }qd=$qd"; fi
+  if [ -n "$wc" ]; then out="${out}${out:+ }wc=$wc"; fi
+  if [ -n "$mx" ]; then out="${out}${out:+ }maxsec=$mx"; fi
+  # value goes on stdout (caller captures it) — keeps the helper subshell-safe
+  printf '%s' "$out"
+  return 0
+}
+
+# bhv5c6_hw_extra — v5 (C6) hardware extras; called at the end of gather_info.
+# $1 (optional): base disk device name already resolved by gather_info.
+bhv5c6_hw_extra() {
+  BH_CACHE_TXT="$(bhv5c6_cache_txt)"
+  BH_BLOCKQ_TXT="$(bhv5c6_blockq_txt "${1:-}")"
+  return 0
 }
 
 gather_info() {
@@ -349,5 +537,11 @@ gather_info() {
   # This module therefore makes ZERO network calls ever: `sec` mode and
   # BH_NO_NET=1 stay fully offline. BH_IPV4 / BH_IPV6 / BH_IP_GEO / BH_IP_ASN
   # are declared above ("" default) and are filled by the module that owns them.
+
+  # ---- v5 (C6) hardware extras: CPU cache topology + bench-disk queue params ----
+  # "$base" is the disk base device resolved above (same one used for
+  # rotational/scheduler); empty when unresolvable — the helper re-derives.
+  # NOTE: BH_CPUFREQ_TXT belongs to 16-hw-deep and is NOT set here.
+  bhv5c6_hw_extra "$base"
   return 0
 }

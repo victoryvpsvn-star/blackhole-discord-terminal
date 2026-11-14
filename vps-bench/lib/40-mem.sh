@@ -4,12 +4,21 @@
 #            (cc/gcc/clang, -O2); 16 bytes/element counted (8 read + 8 write).
 # Fallback:  dd write-to-null CPU proxy with adaptive payload sizing
 #            (NOT memory bandwidth — kept only for compiler-less systems).
+#
+# v5 (C12) additions:
+#   - BH_MEM_LAT_NS: awk pointer-chase latency, ns/hop (median of passes).
+#   - BH_PGFAULT_RATE / BH_PGFAULT_SCOPE: host minor-fault rate around a
+#     /dev/zero dd window, read from /proc/vmstat.
 # =====================================================================
 # shellcheck shell=bash
 
 BH_MEM_GBS=""; BH_MEM_METHOD=""
 # context notes for the report layer (filled in by bench_mem)
 BH_MEM_THP_NOTE=""; BH_MEM_SWAP_NOTE=""
+# v5 (C12) additions
+BH_MEM_LAT_NS=""        # pointer-chase latency, ns/hop ("" when too little RAM / unknown)
+BH_PGFAULT_RATE=""      # minor faults/s across the dd window (system-wide counter)
+BH_PGFAULT_SCOPE=""     # "host-wide" when the counter is not cgroup-scoped
 
 # Stream-copy kernel. argv: [1]=per-buffer MB [2]=min seconds [3]=output file.
 # Copies src->dst repeatedly until >=min seconds elapsed or >=3 full passes.
@@ -189,4 +198,125 @@ bench_mem() {
     BH_MEM_GBS="$(awk -v b="$blocks" -v ms="$ms" 'BEGIN{ if (ms>=50) printf "%.2f", b*1048576/1e9/(ms/1000); else print 0 }')"
     BH_MEM_METHOD="cpu-proxy (dd)"
   fi
+
+  # ---- v5 (C12) additions: pointer-chase latency + host pgfault rate ----
+  bhv5c12_mem_latency
+  bhv5c12_pgfault
+}
+
+# =====================================================================
+# v5 additions (C12) — pointer-chase latency + host pgfault rate
+# =====================================================================
+
+# bhv5c12_median3 A B C — median of three float strings. Prefers the shared
+# bh_median3 helper (lib/05-noise.sh) when present, guarded by declare -F and
+# signature-validated (bh_median3 v1 v2 v3 -> float on stdout); falls back to
+# a dependency-free awk median.
+bhv5c12_median3() {
+  local m=""
+  if declare -F bh_median3 >/dev/null 2>&1; then
+    m="$(bh_median3 "$1" "$2" "$3" 2>/dev/null)"
+    case "$m" in ''|.*|*[!0-9.]*) m="" ;; esac
+    [ -n "$m" ] && { printf '%s\n' "$m"; return 0; }
+  fi
+  awk -v a="$1" -v b="$2" -v c="$3" 'BEGIN{
+    if ((a+0 <= b+0 && b+0 <= c+0) || (c+0 <= b+0 && b+0 <= a+0)) print b
+    else if ((b+0 <= a+0 && a+0 <= c+0) || (c+0 <= a+0 && a+0 <= b+0)) print a
+    else print c
+  }' 2>/dev/null
+}
+
+# bhv5c12_mem_latency — pointer-chase latency in ns/hop (awk, mawk-safe).
+# Chain: next[i] = (i * 32719 + 3) % N — a small-prime LCG: deterministic,
+# reproducible, and small enough that i * 32719 stays exact in awk doubles
+# (the classic 1103515245 multiplier would blow past the exact-integer and
+# printf %d ranges, so it is deliberately avoided). srand(42) fixes the start
+# node for reproducibility. Node count N = min(MemAvailable/16,
+# MEM_LIMIT_KB/16 when limited, 1000000); below the 65536-node floor the
+# metric stays "". Each pass times one whole awk invocation (build + chase)
+# with now_us; identical constant overhead on every system; 3 passes with
+# median in full mode, 1 pass in fast mode.
+bhv5c12_mem_latency() {
+  BH_MEM_LAT_NS=""
+  local avail_kb=0 limit_kb="${MEM_LIMIT_KB:-0}" n="" m
+  local passes=1 hops=100000 pass t0 t1 us ns
+  local p1="" p2="" p3=""
+  avail_kb="$(awk '/^MemAvailable:/{print $2; exit}' /proc/meminfo 2>/dev/null)"
+  case "$avail_kb" in ''|*[!0-9]*) avail_kb=0 ;; esac
+  [ "$avail_kb" -gt 0 ] 2>/dev/null && n=$(( avail_kb / 16 ))
+  if [ "$limit_kb" -gt 0 ] 2>/dev/null; then
+    m=$(( limit_kb / 16 ))
+    if [ -z "$n" ] || [ "$m" -lt "$n" ]; then n="$m"; fi
+  fi
+  [ -n "$n" ] || return 0
+  [ "$n" -gt 1000000 ] && n=1000000
+  [ "$n" -ge 65536 ] || return 0          # too little RAM — metric stays ""
+  [ "${BH_FAST:-0}" != "1" ] && passes=3
+  pass=0
+  while [ "$pass" -lt "$passes" ]; do
+    pass=$((pass + 1))
+    t0=$(now_us)
+    awk -v n="$n" -v h="$hops" 'BEGIN{
+      srand(42)
+      for (i = 0; i < n; i++) a[i] = (i * 32719 + 3) % n
+      p = int(rand() * n); if (p < 0 || p >= n) p = 0
+      s = 0
+      for (q = 0; q < h; q++) { p = a[p]; s += p }
+      printf "%.0f\n", s                 # keep the chase alive; < 2^53, exact
+    }' </dev/null >/dev/null 2>&1
+    t1=$(now_us)
+    us=$((t1 - t0))
+    [ "$us" -gt 0 ] || continue
+    ns="$(awk -v us="$us" -v h="$hops" 'BEGIN{ printf "%.1f", us * 1000 / h }' 2>/dev/null)"
+    case "$ns" in ''|.*|*[!0-9.]*) continue ;; esac
+    if [ -z "$p1" ]; then p1="$ns"
+    elif [ -z "$p2" ]; then p2="$ns"
+    else p3="$ns"; fi
+  done
+  if [ -n "$p1" ] && [ -n "$p2" ] && [ -n "$p3" ]; then
+    BH_MEM_LAT_NS="$(bhv5c12_median3 "$p1" "$p2" "$p3")"
+  else
+    BH_MEM_LAT_NS="$p1"
+  fi
+  case "$BH_MEM_LAT_NS" in ''|.*|*[!0-9.]*) BH_MEM_LAT_NS="" ;; esac
+  return 0
+}
+
+# bhv5c12_pgfault — minor-fault rate across a dd window (/proc/vmstat pgfault
+# before/after `dd if=/dev/zero bs=1M count=64`, fast: count=16). The counter
+# is system-wide (it also counts other processes), so BH_PGFAULT_SCOPE is set
+# to "host-wide" whenever we sit inside a cgroup (CG_VER != 0) or a container
+# marker exists. Skipped when the cgroup memory limit is < 256 MB (the 64 MB
+# payload would be irresponsible) or /proc/vmstat is missing. Raw pgfault can
+# exceed 2^31 — the two samples travel to awk as strings, deltas are computed
+# in awk doubles, output is a float (never printf %d).
+bhv5c12_pgfault() {
+  BH_PGFAULT_RATE=""
+  BH_PGFAULT_SCOPE=""
+  local mb=64
+  [ "${BH_FAST:-0}" = "1" ] && mb=16
+  if [ "${MEM_LIMIT_KB:-0}" -gt 0 ] 2>/dev/null && [ "$MEM_LIMIT_KB" -lt 262144 ] 2>/dev/null; then
+    return 0                              # < 256 MB memory limit — skip
+  fi
+  [ -r /proc/vmstat ] || return 0
+  local p0 p1 t0 t1 us rate
+  p0="$(awk '$1 == "pgfault" { print $2; exit }' /proc/vmstat 2>/dev/null)"
+  case "$p0" in ''|*[!0-9]*) return 0 ;; esac
+  t0=$(now_us)
+  dd if=/dev/zero of=/dev/null bs=1M count="$mb" 2>/dev/null
+  t1=$(now_us)
+  p1="$(awk '$1 == "pgfault" { print $2; exit }' /proc/vmstat 2>/dev/null)"
+  case "$p1" in ''|*[!0-9]*) return 0 ;; esac
+  us=$((t1 - t0))
+  [ "$us" -gt 0 ] || return 0
+  rate="$(awk -v a="$p0" -v b="$p1" -v us="$us" 'BEGIN{
+    d = b - a; if (d < 0) d = 0
+    printf "%.1f", d / (us / 1000000)
+  }' 2>/dev/null)"
+  case "$rate" in ''|.*|*[!0-9.]*) return 0 ;; esac
+  BH_PGFAULT_RATE="$rate"
+  if [ "${CG_VER:-0}" != "0" ] || [ -e /.dockerenv ] || [ -e /run/.containerenv ]; then
+    BH_PGFAULT_SCOPE="host-wide"
+  fi
+  return 0
 }

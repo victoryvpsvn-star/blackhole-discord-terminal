@@ -271,6 +271,11 @@ bench_net() {
     ) &
   fi
 
+  # --- v5 (C13) deep-intel probes: clock skew / PMTU / DNS hijack /
+  #     TCP jitter / v6 throughput — all parallel inside one worker that
+  #     joins THIS wave (wall time = max probe, never the sum).
+  bhv5c13_wave1 &
+
   wait   # ------- end of parallel wave -------
 
   # ================================================================
@@ -498,6 +503,13 @@ EOF
   done
 
   # ================================================================
+  # v5 (C13) DEEP NET INTEL — parse wave-1 results, then run the tiny
+  # PTR second wave (needs BH_IPV4, known only after the parse above).
+  # ================================================================
+  bhv5c13_parse
+  bhv5c13_wave2
+
+  # ================================================================
   # CLASSIC BENCH (v3, unchanged): download best-of-N + upload
   # ================================================================
 
@@ -580,4 +592,383 @@ EOF
   [ -n "$u" ] && [ "$u" != "0" ] && BH_UP_MBPS="$(awk -v s="$u" 'BEGIN{printf "%.1f", s*8/1000000}')"
 
   return 0
+}
+
+# =====================================================================
+# v5 (C13) — deep net intel: clock skew, egress proxy/tunnels, PTR
+# class, path MTU, DNS census + hijack, TCP jitter, conntrack/socket
+# pressure, IPv6 throughput.
+# Wave discipline: bhv5c13_wave1 is launched as ONE background job
+# inside bench_net's existing parallel wave (its own probes are fully
+# parallel inside, waited by the module's single `wait`). The PTR
+# reverse lookup needs BH_IPV4, which only exists after wave 1 parses,
+# so it runs as bhv5c13_wave2 — its own tiny wave (<= 2 s wall) right
+# before the classic download bench. Nothing is ever sequential.
+# Helpers are private: bhv5c13_*.
+# =====================================================================
+
+# ---- v5 globals ("" = not measured) ----
+BH_CLOCK_SKEW_S=""      # server clock (HTTPS Date header) minus local, seconds
+BH_CLOCK_SKEW_BAD=""    # 1 when |skew| > 5 s (TLS/log trouble ahead)
+BH_EGRESS_PROXY=""      # "env-proxy(host:port)" and/or "tunnel:<iface>" ("+"-joined)
+BH_PTR_CLASS=""         # cloud-pool | branded | no-ptr (email reputation risk)
+BH_PTR_HOST=""          # reverse hostname (redacted to class with BH_REDACT=1)
+BH_PMTU=""              # path MTU to 1.1.1.1 (+ " tunnel overhead" vs BH_NET_MTU)
+BH_DNS_NS=""            # ALL resolv.conf nameservers, well-known ones mapped
+BH_DNS_HIJACK=""        # "" | clean | nxdomain-hijack! | possible spoof ("+"-joined)
+BH_TCP_JITTER=""        # "<mean>±<mdev>" ms over 5 parallel TCP connects to 1.1.1.1:443
+BH_CONNTRACK_PCT=""     # "1234/65536 (2%)"
+BH_CONNTRACK_BAD=""     # 1 when the conntrack table is > 80% full
+BH_SOCKSTAT_TXT=""      # "tcp=12 tw=340 orph=0 mem=3 udp=5 udp_mem=1" (+ flood hint)
+BH_IPV6_MBPS=""         # IPv6 download throughput (Mbps) when v6 egress exists
+
+# bhv5c13_to SECS CMD... — timeout wrapper (60-net has none of its own)
+bhv5c13_to() {
+  local s="$1"; shift
+  if command_exists timeout; then
+    timeout "$s" "$@" 2>/dev/null
+  else
+    "$@" 2>/dev/null
+  fi
+}
+
+# bhv5c13_skew HEADERS_FILE LOCAL_EPOCH — PURE parser (no network, no forks
+# beyond the one awk): reads an HTTP response header dump, finds the Date:
+# header, prints (server_epoch - LOCAL_EPOCH) in whole seconds, or "" when
+# no parseable date. mawk-safe: month table via index(), epoch via mktime
+# with TZ=UTC pinned to the awk process.
+bhv5c13_skew() {
+  [ -r "$1" ] || return 0
+  TZ=UTC awk -v local="${2:-0}" '
+    tolower($1) == "date:" {
+      mt = "janfebmaraprmayjunjulaugsepoctnovdec"
+      mi = index(mt, tolower($4))
+      if (mi == 0 || $3 !~ /^[0-9]+$/ || $5 !~ /^[0-9]+$/) next
+      m = int((mi + 2) / 3)
+      if (split($6, t, ":") != 3) next
+      ep = mktime(sprintf("%04d %02d %02d %02d %02d %02d", $5, m, $3, t[1], t[2], t[3]))
+      if (ep > 1000000000) printf "%d\n", ep - local
+      exit
+    }' "$1" 2>/dev/null
+}
+
+# bhv5c13_proxy_scan — egress proxy intel, PURE local (env + /sys scan).
+# Prints "" | "env-proxy" | "env-proxy(host:port)" | "tunnel:<iface>" or a
+# "+"-joined combination ("env-proxy+tunnel:wg0"). The host:port value is
+# dropped entirely when BH_REDACT=1.
+bhv5c13_proxy_scan() {
+  local out="" v="" hp="" name hpv="" tun="" tn=0 d ifc
+  for name in https_proxy HTTPS_PROXY all_proxy; do
+    v="${!name:-}"
+    [ -n "$v" ] || continue
+    if [ "${BH_REDACT:-0}" != "1" ]; then
+      hp="$(printf '%s' "$v" | sed -e 's|^[a-zA-Z][a-zA-Z0-9+.-]*://||' -e 's|[/?#].*$||')"
+      case "$hp" in *@*) hp="${hp#*@}" ;; esac
+      case "$hp" in *[!0-9A-Za-z.:\[\]_-]*) hp="" ;; esac
+      [ -n "$hp" ] && hpv="$hp"
+    fi
+    break   # first hit wins — they all describe the same egress
+  done
+  if [ -n "$hpv" ]; then out="env-proxy($hpv)"
+  elif [ -n "$v" ]; then out="env-proxy"
+  fi
+  for d in /sys/class/net/*; do
+    [ -d "$d" ] || continue
+    ifc="${d##*/}"
+    case "$ifc" in
+      tun*|wg*|ppp*|zt*|tailscale*)
+        [ "$tn" -lt 3 ] || continue
+        tn=$((tn + 1))
+        tun="${tun}tunnel:${ifc}+"
+        ;;
+    esac
+  done
+  tun="${tun%+}"
+  [ -n "$tun" ] && out="${out:+$out+}$tun"
+  printf '%s' "$out"
+}
+
+# bhv5c13_dns_census — ALL nameservers from /etc/resolv.conf (not just the
+# first), well-known resolvers mapped to vendor names. Pure local read.
+bhv5c13_dns_census() {
+  [ -r /etc/resolv.conf ] || return 0
+  awk '
+    $1 == "nameserver" && $2 != "" && !($2 in seen) && count < 4 {
+      seen[$2] = 1
+      order[++count] = $2
+    }
+    END {
+      for (i = 1; i <= count; i++) {
+        ns = order[i]
+        m = ""
+        if      (ns == "8.8.8.8" || ns == "8.8.4.4") m = "Google"
+        else if (ns == "1.1.1.1" || ns == "1.0.0.1") m = "Cloudflare"
+        else if (ns == "9.9.9.9")                    m = "Quad9"
+        else if (ns == "208.67.222.222")             m = "OpenDNS"
+        else if (ns == "127.0.0.53")                 m = "systemd-resolved"
+        printf "%s%s%s", (i > 1 ? "," : ""), ns, (m != "" ? "(" m ")" : "")
+      }
+    }' /etc/resolv.conf 2>/dev/null
+}
+
+# bhv5c13_conntrack — conntrack table utilisation. Sets BH_CONNTRACK_PCT
+# ("1234/65536 (2%)") and BH_CONNTRACK_BAD=1 when > 80% full. Missing
+# /proc entries -> "".
+bhv5c13_conntrack() {
+  local cf=/proc/sys/net/netfilter/nf_conntrack_count
+  local mf=/proc/sys/net/netfilter/nf_conntrack_max
+  [ -r "$cf" ] && [ -r "$mf" ] || return 0
+  local c m
+  c="$(tr -dc '0-9' < "$cf" 2>/dev/null)"
+  m="$(tr -dc '0-9' < "$mf" 2>/dev/null)"
+  case "$c" in ''|0) return 0 ;; esac
+  case "$m" in ''|0) return 0 ;; esac
+  BH_CONNTRACK_PCT="$(awk -v c="$c" -v m="$m" 'BEGIN{ printf "%d/%d (%d%%)", c, m, c * 100 / m }')"
+  if awk -v c="$c" -v m="$m" 'BEGIN{ exit !(c * 100 / m > 80) }'; then
+    BH_CONNTRACK_BAD=1
+  fi
+}
+
+# bhv5c13_sockstat — socket pressure from /proc/net/sockstat, parsed BY
+# LABEL (never by field position — busybox reorders). Prints the summary
+# string, "" when the file/labels are absent.
+bhv5c13_sockstat() {
+  [ -r /proc/net/sockstat ] || return 0
+  awk '
+    /^[Tt][Cc][Pp]:/ { for (i = 1; i < NF; i++) {
+        if      ($i == "inuse")  ti   = $(i + 1)
+        else if ($i == "tw")     tw   = $(i + 1)
+        else if ($i == "orphan") orph = $(i + 1)
+        else if ($i == "mem")    tmem = $(i + 1) } }
+    /^[Uu][Dd][Pp]:/ { for (i = 1; i < NF; i++) {
+        if ($i == "inuse") ui   = $(i + 1)
+        if ($i == "mem")   umem = $(i + 1) } }
+    END {
+      if (ti == "") exit 0
+      s = "tcp=" ti " tw=" tw " orph=" orph " mem=" tmem
+      if (ui != "")   s = s " udp=" ui
+      if (umem != "") s = s " udp_mem=" umem
+      if (tw + 0 > 10000) s = s " TIME_WAIT flood?"
+      print s
+    }' /proc/net/sockstat 2>/dev/null
+}
+
+# bhv5c13_wave1 — deep-intel probes, launched as one background job inside
+# bench_net's parallel wave. Every probe below is its own background job;
+# the single `wait` at the end of the function joins them all.
+bhv5c13_wave1() {
+  # -- clock skew: HTTPS Date header from cloudflare, fallback google --
+  (
+    curl -s -D - -o /dev/null --max-time 3 'https://www.cloudflare.com' \
+      > "$BH_RUNDIR/c13_skew" 2>/dev/null
+    grep -qi '^date:' "$BH_RUNDIR/c13_skew" 2>/dev/null || \
+      curl -s -D - -o /dev/null --max-time 3 'https://www.google.com' \
+        > "$BH_RUNDIR/c13_skew" 2>/dev/null
+    date -u +%s > "$BH_RUNDIR/c13_skew_local" 2>/dev/null
+  ) &
+
+  # -- PMTU ladder: all 5 sizes fully parallel (~1 s); tracepath fallback
+  #    only when nothing succeeded (ICMP blocked / filtered). --
+  (
+    if command_exists ping; then
+      sup=1
+      perr="$(ping -M "do" -c 1 -W 1 127.0.0.1 2>&1 || true)"
+      case "$perr" in
+        *"invalid option"*|*"unrecognized option"*|*"unsupported"*|*"not supported"*) sup=0 ;;
+      esac
+      if [ "$sup" = "1" ]; then
+        for sz in 1472 1450 1420 1400 1350; do
+          ( ping -M "do" -s "$sz" -c 1 -W 1 1.1.1.1 >/dev/null 2>&1; \
+            printf '%s' "$?" > "$BH_RUNDIR/c13_pmtu.$sz" ) &
+        done
+        wait
+        for sz in 1472 1450 1420 1400 1350; do
+          if [ "$(cat "$BH_RUNDIR/c13_pmtu.$sz" 2>/dev/null)" = "0" ]; then
+            printf '%s' "$(( sz + 28 ))" > "$BH_RUNDIR/c13_pmtu_val"
+            break
+          fi
+        done
+      fi
+    fi
+    if [ ! -s "$BH_RUNDIR/c13_pmtu_val" ] && command_exists tracepath; then
+      tp="$(bhv5c13_to 4 tracepath -n -m 4 1.1.1.1 2>/dev/null || true)"
+      p="$(printf '%s\n' "$tp" | sed -n 's/.*pmtu \([0-9][0-9]*\).*/\1/p' | head -n 1)"
+      [ -n "$p" ] && printf '%s' "$p" > "$BH_RUNDIR/c13_pmtu_val"
+    fi
+  ) &
+
+  # -- DNS hijack: random-label NXDOMAIN test + dns.google -> 8.8.8.8/8.8.4.4
+  #    (only when dig or nslookup exists; the NXDOMAIN test and BOTH
+  #    dns.google attempts run in parallel -> <= 2 s wall) --
+  (
+    command_exists dig || command_exists nslookup || exit 0
+    : > "$BH_RUNDIR/c13_dns_tested"
+    lbl="$(head -c 16 /dev/urandom 2>/dev/null | md5sum 2>/dev/null | tr -dc '0-9a-f')"
+    lbl="${lbl:0:16}.invalid"
+    (
+      # (a) a random reserved-TLD label must NOT resolve
+      if [ "${#lbl}" -ge 17 ]; then
+        if command_exists dig; then
+          r="$(bhv5c13_to 2 dig +time=1 +tries=1 +short "$lbl")"
+          [ -n "$(printf '%s' "$r" | tr -d ' \t\n\r')" ] && : > "$BH_RUNDIR/c13_dns_nx"
+        else
+          r="$(bhv5c13_to 2 nslookup "$lbl")"
+          case "$r" in *"Name:"*|*"Addresses:"*) : > "$BH_RUNDIR/c13_dns_nx" ;; esac
+        fi
+      fi
+    ) &
+    (
+      # (b) dns.google must resolve to 8.8.8.8/8.8.4.4 (2 attempts)
+      k=0
+      while [ "$k" -lt 2 ]; do
+        k=$((k + 1))
+        (
+          if command_exists dig; then
+            g="$(bhv5c13_to 2 dig +time=1 +tries=1 +short dns.google)"
+          else
+            g="$(bhv5c13_to 2 nslookup dns.google | awk '/^Name:/{f = 1} f')"
+          fi
+          if printf '%s\n' "$g" | tr -s ' \t' '\n' | grep -qxE '8\.8\.8\.8|8\.8\.4\.4'; then
+            : > "$BH_RUNDIR/c13_dns_gok"
+          fi
+        ) &
+      done
+      wait
+      [ ! -e "$BH_RUNDIR/c13_dns_gok" ] && : > "$BH_RUNDIR/c13_dns_spoof"
+    ) &
+    wait
+  ) &
+
+  # -- TCP jitter: 5 parallel connects to 1.1.1.1:443 (skip --fast);
+  #    fallback jitter metric when ICMP is blocked --
+  if [ "$BH_FAST" != "1" ]; then
+    (
+      ji=0
+      while [ "$ji" -lt 5 ]; do
+        ji=$((ji + 1))
+        (
+          jt0="$(now_ms)"
+          if bh_tcp_probe 1.1.1.1 443 2; then jrc=0; else jrc=1; fi
+          jt1="$(now_ms)"
+          printf '%s %s\n' "$jrc" "$((jt1 - jt0))" > "$BH_RUNDIR/c13_jit.$ji"
+        ) &
+      done
+      wait
+    ) &
+  fi
+
+  # -- IPv6 download throughput (skip --fast; needs a global v6 addr) --
+  if [ "$BH_FAST" != "1" ] && bh_v6_global_addr; then
+    (
+      sp="$(curl -6 -s -o /dev/null --max-time 4 -w '%{speed_download}' \
+        'https://speed.cloudflare.com/__down?bytes=1048576' 2>/dev/null)"
+      [ -n "$sp" ] && printf '%s' "$sp" > "$BH_RUNDIR/c13_v6spd"
+    ) &
+  fi
+
+  wait
+}
+
+# bhv5c13_parse — after wave 1: turn runfiles into BH_* globals. All local,
+# instant, read-only work (no network).
+bhv5c13_parse() {
+  # -- clock skew --
+  local lv sk
+  lv="$(cat "$BH_RUNDIR/c13_skew_local" 2>/dev/null)"
+  case "$lv" in ''|*[!0-9]*) lv="" ;; esac
+  if [ -n "$lv" ]; then
+    sk="$(bhv5c13_skew "$BH_RUNDIR/c13_skew" "$lv")"
+    case "$sk" in
+      ''|-*) case "${sk#-}" in ''|*[!0-9]*) sk="" ;; esac ;;
+      *)     case "$sk" in *[!0-9]*) sk="" ;; esac ;;
+    esac
+    if [ -n "$sk" ]; then
+      BH_CLOCK_SKEW_S="$sk"
+      if awk -v s="$sk" 'BEGIN{ if (s < 0) s = -s; exit !(s > 5) }'; then
+        BH_CLOCK_SKEW_BAD=1
+      fi
+    fi
+  fi
+
+  # -- egress proxy / tunnel interfaces --
+  BH_EGRESS_PROXY="$(bhv5c13_proxy_scan)"
+
+  # -- PMTU (+ tunnel-overhead flag vs the interface MTU from 20-info) --
+  local pv
+  pv="$(cat "$BH_RUNDIR/c13_pmtu_val" 2>/dev/null)"
+  case "$pv" in ''|*[!0-9]*|0) pv="" ;; esac
+  if [ -n "$pv" ]; then
+    BH_PMTU="$pv"
+    case "${BH_NET_MTU:-}" in
+      ''|*[!0-9]*|0) : ;;
+      *)
+        if awk -v p="$pv" -v m="$BH_NET_MTU" 'BEGIN{ d = p - m; if (d < 0) d = -d; exit !(d >= 20) }'; then
+          BH_PMTU="$BH_PMTU tunnel overhead"
+        fi
+        ;;
+    esac
+  fi
+
+  # -- DNS census + hijack verdict --
+  BH_DNS_NS="$(bhv5c13_dns_census)"
+  local dj=""
+  if [ -e "$BH_RUNDIR/c13_dns_tested" ]; then
+    [ -e "$BH_RUNDIR/c13_dns_nx" ]    && dj="nxdomain-hijack!"
+    [ -e "$BH_RUNDIR/c13_dns_spoof" ] && dj="${dj:+$dj+}possible spoof"
+    [ -z "$dj" ] && dj="clean"
+  fi
+  BH_DNS_HIJACK="$dj"
+
+  # -- TCP jitter (mean±mdev over successful connects) --
+  if [ "$BH_FAST" != "1" ]; then
+    BH_TCP_JITTER="$(cat "$BH_RUNDIR"/c13_jit.[1-5] 2>/dev/null | awk '
+      $1 == 0 && $2 + 0 > 0 { v[NR] = $2; s += $2; n++ }
+      END {
+        if (n < 1) exit 0
+        m = s / n
+        for (i = 1; i <= n; i++) { d = v[i] - m; if (d < 0) d = -d; t += d }
+        printf "%.1f±%.1f", m, t / n
+      }')"
+  fi
+
+  # -- conntrack + socket pressure (pure /proc reads) --
+  bhv5c13_conntrack
+  BH_SOCKSTAT_TXT="$(bhv5c13_sockstat)"
+
+  # -- IPv6 throughput --
+  local v6s
+  v6s="$(cat "$BH_RUNDIR/c13_v6spd" 2>/dev/null)"
+  case "$v6s" in ''|*[!0-9.]*) v6s="" ;; esac
+  [ -n "$v6s" ] && \
+    BH_IPV6_MBPS="$(awk -v s="$v6s" 'BEGIN{ m = s * 8 / 1000000; if (m > 0) printf "%.1f", m }')"
+}
+
+# bhv5c13_wave2 — tiny second parallel wave: the PTR reverse lookup needs
+# BH_IPV4, which is only known after wave 1 has been parsed. Adds <= 2 s.
+bhv5c13_wave2() {
+  BH_PTR_CLASS=""; BH_PTR_HOST=""
+  [ -n "$BH_IPV4" ] || return 0
+  command_exists getent || return 0
+  (
+    bhv5c13_to 2 getent hosts "$BH_IPV4" > "$BH_RUNDIR/c13_ptr" 2>/dev/null
+  ) &
+  wait
+  local h
+  h="$(awk 'NR == 1 { print $2; exit }' "$BH_RUNDIR/c13_ptr" 2>/dev/null)"
+  case "$h" in ''|*[!0-9A-Za-z.-]*) h="" ;; esac
+  [ "$h" = "$BH_IPV4" ] && h=""   # getent echoes the bare IP when no PTR exists
+  if [ -z "$h" ]; then
+    BH_PTR_CLASS="no-ptr (email reputation risk)"
+    return 0
+  fi
+  if printf '%s' "$h" | grep -qiE 'amazonaws|compute|vultr|linode|hetzner|digitalocean|contabo|ovh|scw|upcloud'; then
+    BH_PTR_CLASS="cloud-pool"
+  else
+    BH_PTR_CLASS="branded"
+  fi
+  if [ "${BH_REDACT:-0}" = "1" ]; then
+    BH_PTR_HOST="$BH_PTR_CLASS"
+  else
+    BH_PTR_HOST="$h"
+  fi
 }

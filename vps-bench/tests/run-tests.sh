@@ -21,10 +21,10 @@ echo "== 1. help =="
 
 echo "== 2. version =="
 v="$(./bin/blackhole-vps-bench --version 2>/dev/null)"
-# v3/v4: the version line must carry the tool name + major version (v4.0
+# v3/v4/v5: the version line must carry the tool name + major version (v5.0
 # bumped BH_VERSION in lib/00-core.sh; accept both so the suite is green at
 # every merge state)
-case "$v" in *"blackhole-vps-bench v3."*|*"blackhole-vps-bench v4."*) pass "version ($v)" ;; *) flunk "version ($v)" ;; esac
+case "$v" in *"blackhole-vps-bench v3."*|*"blackhole-vps-bench v4."*|*"blackhole-vps-bench v5."*) pass "version ($v)" ;; *) flunk "version ($v)" ;; esac
 
 echo "== 3. detect mode =="
 out="$(./bin/blackhole-vps-bench detect 2>/dev/null)"

@@ -15,6 +15,14 @@
 # (login.defs + root chage), auditd state, time-sync status and pre-login
 # banner OS-info leaks.
 # No root required — checks degrade gracefully and say so.
+# v5 additions (C10): sshd config syntax gate (sshd -t, root), daemon
+# version, declared-vs-effective config diff (sshd -T cross-check),
+# systemd socket-activation false-positive guard, authorized_keys deep scan
+# (DSA keys, comment CLASS counts, >2y rotation age, RSA bit fallback),
+# host key audit (type/size/mtime, 16-char fingerprints only), certificate
+# auth posture, Match/SFTP block scan, forwarding sweep, port/topology
+# cross-check, auth-log deep counts, MFA posture. Counts only — never key
+# material, public keys, usernames or IPs in the lines (BH_REDACT-safe).
 # =====================================================================
 # shellcheck shell=bash
 
@@ -49,6 +57,31 @@ BH_SEC_ROOT_EXPIRE=""    # root password expiry: never | YYYY-MM-DD | "" (unknow
 BH_SEC_AUDITD="unknown"  # running | installed-not-running | not-installed | unknown
 BH_SEC_NTP="unknown"     # synced (chronyd) | synced (timesyncd) | not-synced | unknown
 BH_SEC_BANNER=""         # leaks OS info (...) | custom | none | "" (no sshd)
+# --- v5.0 deep-scan additions (C10; raw values, the report layer may read) ---
+BH_SSHD_CFG_VALID=""     # ok | invalid | skipped (non-root) | n/a (no binary)
+BH_SSHD_VER=""           # daemon OpenSSH_x.y from sshd -V/-h ("" = unknown)
+BH_SSH_EFF_DECL="n/a"    # declared=effective | overrides:N | n/a
+BH_SSH_SOCKET_FP=0       # 1 = sshd answers via systemd socket-activation
+BH_AK_WEAK=0             # (v4) weak authorized_keys (<2048-bit / DSA)
+BH_AK_DSA=0              # DSA keys found in authorized_keys
+BH_AK_STALE=0            # authorized_keys files older than 730 days
+BH_AK_RSA_FB=0           # RSA keys bit-counted via the od/awk fallback
+BH_AK_DEEP_KEYS=0        # key lines classified by the deep scan
+BH_AK_CMT_EMAIL=0        # key comments that look like an email (count only)
+BH_AK_CMT_HOST=0         # key comments that look like a host (count only)
+BH_AK_CMT_NONE=0         # key comments absent (count only)
+BH_AK_CMT_OTHER=0        # key comments in no known class (count only)
+BH_HOSTKEY_AUDIT=""      # "keys:N dsa:M rsa_lt2048:K rsa_2048:J"
+BH_SSH_CA="none"         # none | ca | command | ca+command
+BH_SSH_MATCH_SFTP=""     # "N block(s)" when sftp-only chroot Match blocks found
+BH_SSH_FWD=""            # forwarding sweep summary (tcp/agent/tunnel/gw/pen)
+BH_SSH_TOPO=""           # ports/listen/masters/unconf/bind summary
+BH_AUTH_LOG_SUM=""       # "fail:N invalid-users:M pw-accepted:K"
+BH_AUTH_PW_LOGIN=0       # 'Accepted password' hits in the auth logs
+BH_AUTH_INVALID_USERS=0  # distinct 'Invalid user' names (count only)
+BH_LASTB_N=0             # lastb entries in /var/log/btmp (capped at 20)
+BH_F2B_BANNED=-1         # fail2ban sshd jail currently-banned count (-1 unknown)
+BH_SSH_MFA=""            # enforced | methods-only | usepam-no | none
 
 # sec_line STATUS TEXT — record one audit line (plain, badged) and count it.
 # STATUS: ok | warn | bad | info (info is not counted in the posture score)
@@ -599,6 +632,594 @@ sec_misc() {
   fi
 }
 
+# =====================================================================
+# v5.0 deep-scan additions (C10) — helpers + checks called from sec_audit.
+# All checks are passive local reads, timeout-wrapped, degrade to silence,
+# and print through sec_line so the posture counters stay correct.
+# =====================================================================
+
+# bhv5c10_to_err SECS CMD... — timeout wrapper that KEEPS stderr (sshd -t/-V
+# report there); stdin is closed so nothing can block on a tty.
+bhv5c10_to_err() {
+  local s="$1"; shift
+  if command_exists timeout; then
+    timeout "$s" "$@" 2>&1 </dev/null
+  else
+    "$@" 2>&1 </dev/null
+  fi
+}
+
+# bhv5c10_sanitize TEXT — one short single-line printable message safe for
+# report sinks: control bytes and tabs flattened, capped at 140 chars. With
+# BH_REDACT=1 home-directory paths (which embed usernames) are masked too.
+bhv5c10_sanitize() {
+  local s
+  s="$(printf '%s' "$1" | tr -d '\000-\010\013\014\015\016-\037' | tr '\011' ' ')"
+  if [ "${BH_REDACT:-0}" = "1" ]; then
+    s="$(printf '%s' "$s" | sed 's#/home/[^/[:space:]]*#/home/<redacted>#g')"
+  fi
+  printf '%s' "${s:0:140}"
+}
+
+# bhv5c10_norm VALUE — lowercase, strip quotes, normalize root-login synonyms
+# so both sides of the declared/effective diff compare equal ("without-password"
+# is a legacy synonym sshd -T always prints as "prohibit-password").
+bhv5c10_norm() {
+  local v
+  v="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '"')"
+  case "$v" in without-password) v="prohibit-password" ;; esac
+  printf '%s' "$v"
+}
+
+# bhv5c10_decl KEY — first match of KEY in the raw declared stream (Match
+# blocks skipped, inline comments stripped, value lowercased); mirrors the
+# raw-config branch of sec_sshd_opt.
+bhv5c10_decl() {
+  [ "${#BH_SSH_CFG_LINES[@]}" -gt 0 ] 2>/dev/null || return 0
+  printf '%s\n' "${BH_SSH_CFG_LINES[@]}" | awk -v k="$1" '
+    { sub(/#.*/, "") }
+    tolower($1)=="match" { inmatch=1; next }
+    inmatch { next }
+    tolower($1)==tolower(k){ $1=""; sub(/^[ \t]+/, ""); print tolower($0); exit }'
+}
+
+# bhv5c10_decl_ports — every Port value in the raw declared stream (Port is
+# cumulative in sshd, unlike the single-value directives).
+bhv5c10_decl_ports() {
+  [ "${#BH_SSH_CFG_LINES[@]}" -gt 0 ] 2>/dev/null || return 0
+  printf '%s\n' "${BH_SSH_CFG_LINES[@]}" | awk '
+    { sub(/#.*/, "") }
+    tolower($1)=="match" { inmatch=1; next }
+    inmatch { next }
+    tolower($1)=="port" { print tolower($2) }'
+}
+
+# bhv5c10_rsa_bits BLOB — RSA modulus bit count via base64+od+awk (SSH wire
+# format: 4-byte BE len(type) + type + 4-byte BE len(mpint) + mpint; the
+# leading zero bits of the first modulus byte are subtracted — a sign-marker
+# 0x00 byte counts as exactly 8). Prints nothing when the blob is unusable.
+# Fallback only for systems without ssh-keygen; never prints key material.
+bhv5c10_rsa_bits() {
+  local dec
+  dec="$(printf '%s' "$1" | base64 -d 2>/dev/null | od -An -v -tu1 | tr -s ' \n' ' ')"
+  [ -n "$dec" ] || return 0
+  printf '%s\n' "$dec" | awk '
+    { for (i = 1; i <= NF; i++) b[i] = $i }
+    END {
+      if (NF < 16) exit
+      n1 = b[1]*16777216 + b[2]*65536 + b[3]*256 + b[4]
+      if (n1 < 1 || n1 > 100) exit
+      p = 4 + n1
+      if (NF < p + 5) exit
+      n2 = b[p+1]*16777216 + b[p+2]*65536 + b[p+3]*256 + b[p+4]
+      if (n2 < 1 || n2 > 1024) exit
+      lz = 0
+      for (i = 7; i >= 0; i--) { if (int(b[p+5] / (2 ^ i)) % 2 == 1) break; lz++ }
+      print n2 * 8 - lz
+    }'
+}
+
+# (C1) sshd config syntax gate — `sshd -t` is a test-mode read (parses the
+# config, loads nothing, starts nothing). A config that fails -t means the
+# NEXT restart breaks SSH: [BAD]. Non-root: skip silently (host keys unread).
+# Also records the daemon version (cheap, unprivileged) in BH_SSHD_VER.
+bhv5c10_sshd_cfg_valid() {
+  BH_SSHD_CFG_VALID="n/a"; BH_SSHD_VER=""
+  [ -n "$BH_SSHD_BIN" ] || return 0
+  local vout
+  vout="$(bhv5c10_to_err 2 "$BH_SSHD_BIN" -V | head -n 1)"
+  BH_SSHD_VER="$(printf '%s\n' "$vout" | sed -n 's/.*\(OpenSSH_[0-9][0-9.p]*\).*/\1/p')"
+  if [ -z "$BH_SSHD_VER" ]; then
+    vout="$(bhv5c10_to_err 2 "$BH_SSHD_BIN" -h | head -n 1)"
+    BH_SSHD_VER="$(printf '%s\n' "$vout" | sed -n 's/.*\(OpenSSH_[0-9][0-9.p]*\).*/\1/p')"
+  fi
+  [ "$(id -u 2>/dev/null)" = "0" ] || { BH_SSHD_CFG_VALID="skipped (non-root)"; return 0; }
+  local err rc msg
+  err="$(bhv5c10_to_err 3 "$BH_SSHD_BIN" -t)"
+  rc=$?
+  if [ "$rc" = "0" ]; then
+    BH_SSHD_CFG_VALID="ok"
+    sec_line ok "sshd config syntax valid (sshd -t)"
+  else
+    BH_SSHD_CFG_VALID="invalid"
+    msg="$(bhv5c10_sanitize "$(printf '%s\n' "$err" | head -n 1)")"
+    if [ -n "$msg" ] && [ "${BH_REDACT:-0}" != "1" ]; then
+      sec_line bad "sshd config INVALID — next restart will fail ssh: $msg"
+    else
+      sec_line bad "sshd config INVALID — next restart will fail ssh (no error detail)"
+    fi
+  fi
+}
+
+# (C2) declared vs effective config — when sshd -T worked, diff the raw
+# (declared) first-match values against the effective ones: a difference
+# means a Match block or drop-in overrode the global setting -> WARN.
+bhv5c10_eff_decl() {
+  BH_SSH_EFF_DECL="n/a"
+  [ "$BH_SSH_T_OK" = "1" ] || return 0
+  if [ "${#BH_SSH_CFG_LINES[@]}" -eq 0 ] 2>/dev/null; then
+    # v4 only builds the raw line stream when sshd -T fails; build it here so
+    # both views exist (sec_sshd_read is the same Include-aware reader).
+    BH_SSH_CFG_LINES=()
+    [ -r /etc/ssh/sshd_config ] && sec_sshd_read /etc/ssh/sshd_config 0
+  fi
+  [ "${#BH_SSH_CFG_LINES[@]}" -gt 0 ] 2>/dev/null || return 0
+  local n=0 key d e dps eps
+  for key in passwordauthentication permitrootlogin pubkeyauthentication \
+             x11forwarding kbdinteractiveauthentication maxauthtries; do
+    d="$(bhv5c10_norm "$(bhv5c10_decl "$key")")"
+    e="$(bhv5c10_norm "$(sec_sshd_opt "$key" "")")"
+    [ -n "$d" ] && [ -n "$e" ] || continue
+    if [ "$d" != "$e" ]; then
+      n=$((n + 1))
+      sec_line warn "declared '$key $d' overridden to '$e' (Match/drop-in)"
+    fi
+  done
+  # Port is cumulative (may repeat) — compare the sorted unique port SETS
+  dps="$(bhv5c10_decl_ports | sed '/^$/d' | sort -n | uniq | paste -sd ',' -)"
+  eps="$(sec_sshd_all port | tr ',' '\n' | sed '/^$/d' | sort -n | uniq | paste -sd ',' -)"
+  if [ -n "$dps" ] && [ -n "$eps" ] && [ "$dps" != "$eps" ]; then
+    n=$((n + 1))
+    sec_line warn "declared 'Port $dps' overridden to '$eps' (Match/drop-in)"
+  fi
+  if [ "$n" -gt 0 ]; then
+    BH_SSH_EFF_DECL="overrides:$n"
+  else
+    BH_SSH_EFF_DECL="declared=effective"
+    sec_line ok "sshd declared config matches effective config (raw lines cross-checked with sshd -T)"
+  fi
+  return 0
+}
+
+# (C3) socket-activation false-positive guard — Ubuntu 24.04 / Debian 12 ship
+# ssh.socket, so no daemon process exists until the first connection. When the
+# socket units are active, flip the earlier "NOT detected" warn verdict to OK.
+bhv5c10_socket_fp() {
+  BH_SSH_SOCKET_FP=0
+  [ "$BH_SSH_RUNNING" = "0" ] || return 0
+  [ "$BH_SSH_FOUND" = "1" ] || return 0
+  [ -d /run/systemd/system ] || return 0
+  local u act=0 i flipped=0
+  for u in ssh.socket sshd.socket; do
+    if sec_to 3 systemctl is-active "$u" >/dev/null 2>&1; then act=1; break; fi
+  done
+  [ "$act" = "1" ] || return 0
+  if [ "${#BH_SEC_LINES[@]}" -gt 0 ] 2>/dev/null; then
+    for i in "${!BH_SEC_LINES[@]}"; do
+      case "${BH_SEC_LINES[i]}" in
+        *"sshd process: NOT detected"*)
+          BH_SEC_LINES[i]="  [OK]  sshd via systemd socket-activation (no daemon process — normal on Ubuntu 24.04/Debian 12)"
+          BH_SEC_WARN=$((BH_SEC_WARN - 1))
+          BH_SEC_PASS=$((BH_SEC_PASS + 1))
+          flipped=1
+          ;;
+      esac
+    done
+  fi
+  BH_SSH_SOCKET_FP=1
+  [ "$flipped" = "1" ] || sec_line ok "sshd via systemd socket-activation (no daemon process — normal on Ubuntu 24.04/Debian 12)"
+  return 0
+}
+
+# (C4) authorized_keys deep scan behind sec_auth_keys: DSA key detection
+# (removed in OpenSSH 9.8+), comment CLASS counting (never the comment
+# content), key-file rotation age (>730 days), and an RSA bit-count fallback
+# via od/awk when ssh-keygen is unavailable. Counts only — no key material,
+# no usernames, no comment text ever reaches the report.
+bhv5c10_ak_deep() {
+  BH_AK_DSA=0; BH_AK_STALE=0; BH_AK_RSA_FB=0; BH_AK_DEEP_KEYS=0
+  BH_AK_CMT_EMAIL=0; BH_AK_CMT_HOST=0; BH_AK_CMT_NONE=0; BH_AK_CMT_OTHER=0
+  local have_kg=0 have_b64=0
+  command_exists ssh-keygen && have_kg=1
+  command_exists base64 && have_b64=1
+  local d kf owner tok path now cutoff mt kt cls bits f_dsa seen=""
+  local homes="/root"
+  for d in /home/*; do [ -d "$d" ] && homes="$homes $d"; done
+  now="$(date +%s 2>/dev/null)"
+  case "$now" in ''|*[!0-9]*) now=0 ;; esac
+  cutoff=$(( now - 730 * 86400 ))
+  for d in $homes; do
+    owner="$(stat -c %U "$d" 2>/dev/null)"
+    [ -n "$owner" ] || owner="${d##*/}"
+    for tok in ${BH_SEC_AUTHKEYS_PATH:-".ssh/authorized_keys"}; do
+      path="$tok"
+      case "$path" in *%h*) path="${path//%h/$d}" ;; esac
+      case "$path" in *%u*) path="${path//%u/$owner}" ;; esac
+      case "$path" in
+        /*) : ;;
+        *)  path="$d/$path" ;;
+      esac
+      # dedup like sec_auth_keys: absolute (%u-free) paths repeat per home
+      case ",$seen," in *",${path},"*) continue ;; esac
+      seen="$seen,$path"
+      kf="$path"
+      [ -f "$kf" ] && [ -r "$kf" ] || continue
+      f_dsa=0
+      # one awk pass per file: key type + comment CLASS per key line
+      # (IFS=" " — with IFS= unset-field-splitting would put the whole line in $kt)
+      while IFS=" " read -r kt cls; do
+        [ -n "$kt" ] || continue
+        BH_AK_DEEP_KEYS=$((BH_AK_DEEP_KEYS + 1))
+        case "$kt" in
+          ssh-dss*)
+            f_dsa=1
+            BH_AK_DSA=$((BH_AK_DSA + 1))
+            # ssh-keygen -lf already counted DSA (1024 bits) as weak in v4;
+            # only add here when that path is unavailable (no double count)
+            [ "$have_kg" = "1" ] || BH_AK_WEAK=$((BH_AK_WEAK + 1))
+            ;;
+        esac
+        case "$cls" in
+          email) BH_AK_CMT_EMAIL=$((BH_AK_CMT_EMAIL + 1)) ;;
+          host)  BH_AK_CMT_HOST=$((BH_AK_CMT_HOST + 1)) ;;
+          other) BH_AK_CMT_OTHER=$((BH_AK_CMT_OTHER + 1)) ;;
+          *)     BH_AK_CMT_NONE=$((BH_AK_CMT_NONE + 1)) ;;
+        esac
+      done < <(awk '
+        {
+          t = ""
+          for (i = 1; i <= 6 && i <= NF; i++) {
+            if ($i ~ /^(ssh-dss|ssh-rsa|ecdsa-sha2-|ssh-ed25519|sk-)/ && $i !~ /[",=]/) { t = $i; break }
+          }
+          if (t == "" || i + 1 > NF) next
+          cls = "none"
+          if (i + 2 <= NF) {
+            c = $(i + 2)
+            if (c ~ /@/) cls = "email"
+            else if (c ~ /^[A-Za-z0-9._:-]+$/ && (c ~ /\./ || c ~ /^[0-9]+$/)) cls = "host"
+            else cls = "other"
+          }
+          print t, cls
+        }' "$kf")
+      [ "$f_dsa" = "1" ] && sec_line warn "DSA key present (removed in OpenSSH 9.8+)"
+      # RSA bit-count fallback when v4's ssh-keygen -lf path is unavailable
+      if [ "$have_kg" = "0" ] && [ "$have_b64" = "1" ]; then
+        while IFS= read -r bits; do
+          [ -n "$bits" ] || continue
+          BH_AK_RSA_FB=$((BH_AK_RSA_FB + 1))
+          bits="$(bhv5c10_rsa_bits "$bits")"
+          case "$bits" in
+            ''|*[!0-9]*) : ;;
+            *) [ "$bits" -lt 2048 ] && BH_AK_WEAK=$((BH_AK_WEAK + 1)) ;;
+          esac
+        done < <(awk '{ for (i = 1; i <= 6 && i <= NF; i++) if ($i == "ssh-rsa") { if (i + 1 <= NF) print $(i + 1); break } }' "$kf")
+      fi
+      mt="$(stat -c %Y "$kf" 2>/dev/null)"
+      case "$mt" in
+        ''|*[!0-9]*) : ;;
+        *) [ "$now" -gt 0 ] && [ "$mt" -lt "$cutoff" ] && BH_AK_STALE=$((BH_AK_STALE + 1)) ;;
+      esac
+    done
+  done
+  if [ "$BH_AK_STALE" -gt 0 ]; then
+    sec_line info "authorized_keys not rotated in >2y: $BH_AK_STALE file(s)"
+  fi
+  if [ "$BH_AK_DEEP_KEYS" -gt 0 ]; then
+    local cmt_other=""
+    [ "$BH_AK_CMT_OTHER" -gt 0 ] && cmt_other=" other:$BH_AK_CMT_OTHER"
+    sec_line info "key comment classes: email:$BH_AK_CMT_EMAIL host:$BH_AK_CMT_HOST none:$BH_AK_CMT_NONE${cmt_other} (content never printed)"
+  fi
+  return 0
+}
+
+# (C5) host key audit — /etc/ssh/ssh_host_*_key.pub is world-readable by
+# design: DSA -> deprecated warn, RSA < 2048 -> BAD, RSA 2048 -> prefer
+# 3072+/ed25519 note, all keys sharing one mtime second -> image-clone note.
+# Fingerprints print to 16 chars only. ssh-keygen -lf on a .pub is a pure read.
+bhv5c10_hostkey_audit() {
+  BH_HOSTKEY_AUDIT=""
+  local f n=0 dsa=0 small=0 mid=0 first_mt="" same=1 out bits tp fp fps mt
+  for f in /etc/ssh/ssh_host_*_key.pub; do
+    [ -f "$f" ] && [ -r "$f" ] || continue
+    n=$((n + 1))
+    if command_exists ssh-keygen; then
+      out="$(sec_to 2 ssh-keygen -lf "$f" | head -n 1)"
+      bits="${out%%[[:space:]]*}"
+      tp="$(printf '%s\n' "$out" | sed -n 's/.*(\([A-Za-z0-9-]*\)).*/\1/p')"
+      fp="$(printf '%s\n' "$out" | awk '{print $2}')"
+      fps=""
+      [ -n "$fp" ] && fps=" (fp ${fp:0:16})"
+      case "$tp" in
+        DSA)
+          dsa=$((dsa + 1))
+          sec_line warn "host key type DSA deprecated${fps} — regenerate with ed25519"
+          ;;
+        RSA)
+          case "$bits" in
+            ''|*[!0-9]*) : ;;
+            *)
+              if [ "$bits" -lt 2048 ]; then
+                small=$((small + 1))
+                sec_line bad "host key RSA too small: $bits bits${fps} — regenerate with 3072+ bits or ed25519"
+              elif [ "$bits" -eq 2048 ]; then
+                mid=$((mid + 1))
+                sec_line info "host key RSA 2048 bits${fps} — prefer 3072+ or ed25519"
+              fi
+              ;;
+          esac
+          ;;
+      esac
+    fi
+    mt="$(stat -c %Y "$f" 2>/dev/null)"
+    case "$mt" in
+      ''|*[!0-9]*) : ;;
+      *)
+        if [ -z "$first_mt" ]; then first_mt="$mt"
+        elif [ "$mt" != "$first_mt" ]; then same=0
+        fi
+        ;;
+    esac
+  done
+  [ "$n" -gt 0 ] || return 0
+  if [ "$n" -gt 1 ] && [ "$same" = "1" ] && [ -n "$first_mt" ]; then
+    sec_line info "host keys copied from image (all public keys share one mtime second)"
+  fi
+  BH_HOSTKEY_AUDIT="keys:$n dsa:$dsa rsa_lt2048:$small rsa_2048:$mid"
+  return 0
+}
+
+# (C6) certificate auth posture: TrustedUserCAKeys / AuthorizedKeysCommand /
+# RevokedKeys / CASignatureAlgorithms from the effective (or declared) config.
+bhv5c10_cert_auth() {
+  BH_SSH_CA="none"
+  [ "$BH_SSH_FOUND" = "1" ] || return 0
+  local ca cmd rev casig
+  ca="$(sec_sshd_opt trustedusercakeys "")"
+  cmd="$(sec_sshd_opt authorizedkeyscommand "")"
+  rev="$(sec_sshd_opt revokedkeys "")"
+  casig="$(sec_sshd_opt casignaturealgorithms "")"
+  case "$(bhv5c10_norm "$ca")" in ''|none) ca="" ;; esac
+  case "$(bhv5c10_norm "$cmd")" in ''|none|internal) cmd="" ;; esac
+  case "$(bhv5c10_norm "$rev")" in ''|none) rev="" ;; esac
+  BH_SSH_CA=""
+  [ -n "$ca" ] && BH_SSH_CA="ca"
+  [ -n "$cmd" ] && BH_SSH_CA="${BH_SSH_CA:+$BH_SSH_CA+}command"
+  [ -n "$BH_SSH_CA" ] || BH_SSH_CA="none"
+  if [ -n "$ca" ]; then
+    sec_line ok "certificate-based auth available (TrustedUserCAKeys configured${casig:+, CASignatureAlgorithms set})"
+    if [ -z "$rev" ]; then
+      sec_line info "certificate CA configured but no RevokedKeys — consider 'RevokedKeys /etc/ssh/revoked_keys'"
+    fi
+  fi
+  [ -n "$cmd" ] && sec_line info "AuthorizedKeysCommand: external key source configured"
+  return 0
+}
+
+# (C7) Match-block scan over the raw config stream: sftp-only chroot blocks
+# (ForceCommand internal-sftp + ChrootDirectory) are counted, any external
+# ForceCommand is flagged, and a missing Subsystem sftp is noted.
+bhv5c10_match_sftp() {
+  BH_SSH_MATCH_SFTP=""
+  [ "$BH_SSH_FOUND" = "1" ] || return 0
+  local res sftp_n=0 ext_n=0 has_sftp=""
+  if [ "${#BH_SSH_CFG_LINES[@]}" -gt 0 ] 2>/dev/null; then
+    # one "block" = everything up to the next Match line (a global ForceCommand
+    # before any Match counts as the first block); BEGIN{seen=1} seeds it
+    res="$(printf '%s\n' "${BH_SSH_CFG_LINES[@]}" | awk '
+      BEGIN { seen = 1 }
+      { sub(/#.*/, "") }
+      tolower($1)=="match" {
+        if (seen) { if (ch && sfc) sftp++; else if (efc) other++ }
+        seen=1; sfc=0; efc=0; ch=0; next
+      }
+      tolower($1)=="forcecommand" {
+        if (tolower($2) ~ /^internal-sftp/) sfc=1; else efc=1; next
+      }
+      tolower($1)=="chrootdirectory" { ch=1; next }
+      END {
+        if (seen) { if (ch && sfc) sftp++; else if (efc) other++ }
+        print sftp + 0, other + 0
+      }')"
+  fi
+  sftp_n="${res%% *}"; ext_n="${res#* }"
+  case "$sftp_n" in ''|*[!0-9]*) sftp_n=0 ;; esac
+  case "$ext_n" in ''|*[!0-9]*) ext_n=0 ;; esac
+  if [ "$sftp_n" -gt 0 ]; then
+    BH_SSH_MATCH_SFTP="$sftp_n block(s)"
+    sec_line info "sftp-only chroot accounts: $sftp_n Match block(s) (ForceCommand internal-sftp + ChrootDirectory)"
+  fi
+  if [ "$ext_n" -gt 0 ]; then
+    sec_line warn "ForceCommand runs an external command in $ext_n block(s) — review what it executes"
+  fi
+  if [ "${#BH_SSH_CFG_LINES[@]}" -gt 0 ] 2>/dev/null; then
+    has_sftp="$(printf '%s\n' "${BH_SSH_CFG_LINES[@]}" | awk '{ sub(/#.*/, "") } tolower($1)=="subsystem" && tolower($2)=="sftp" { f=1 } END { print f + 0 }')"
+  elif [ "$BH_SSH_T_OK" = "1" ] && [ -n "$BH_SSH_T_OUT" ]; then
+    has_sftp="$(printf '%s\n' "$BH_SSH_T_OUT" | awk 'tolower($1)=="subsystem" && tolower($2)=="sftp" { f=1 } END { print f + 0 }')"
+  fi
+  [ "$has_sftp" = "0" ] && sec_line info "Subsystem sftp: not configured (SFTP file transfers unavailable)"
+  return 0
+}
+
+# (C8) forwarding sweep: TCP/agent forwarding plus permissive root login is a
+# pivot surface on multi-user boxes; PerSourcePenalties no (OpenSSH 9.8+)
+# disables the per-source brute-force penalties.
+bhv5c10_fwd_sweep() {
+  BH_SSH_FWD=""
+  [ "$BH_SSH_FOUND" = "1" ] || return 0
+  local tcp agent tunnel gw pen lu multi=0 fwd_on=0
+  tcp="$(sec_sshd_opt allowtcpforwarding "")"
+  agent="$(sec_sshd_opt allowagentforwarding "")"
+  tunnel="$(sec_sshd_opt permittunnel "")"
+  gw="$(sec_sshd_opt gatewayports "")"
+  pen="$(sec_sshd_opt persourcepenalties "")"
+  BH_SSH_FWD="tcp:${tcp:-unset} agent:${agent:-unset} tunnel:${tunnel:-unset} gatewayports:${gw:-unset} penalties:${pen:-unset}"
+  case "$(bhv5c10_norm "$tcp")" in yes|local|remote) fwd_on=1 ;; esac
+  [ "$(bhv5c10_norm "$agent")" = "yes" ] && fwd_on=1
+  lu="$(awk -F: '$7 ~ /(bash|zsh|ksh|sh)$/{n++} END{print n+0}' /etc/passwd 2>/dev/null)"
+  [ "$lu" -gt 1 ] 2>/dev/null && multi=1
+  if [ "$fwd_on" = "1" ] && [ "$BH_SSH_ROOTLOGIN" = "permissive" ] && [ "$multi" = "1" ]; then
+    sec_line info "forwarding enabled (pivot surface): AllowTcpForwarding/AllowAgentForwarding on with PermitRootLogin permissive on a multi-user box"
+  fi
+  case "$(bhv5c10_norm "$pen")" in
+    no) sec_line warn "PerSourcePenalties: no — per-source brute-force penalties disabled (OpenSSH 9.8+)" ;;
+  esac
+  return 0
+}
+
+# (C9) topology cross-check: listeners that are NOT in the configured Port
+# set, the sshd master process count (sshd-session children excluded via
+# PPid), and wildcard binds from the ss listener table.
+bhv5c10_topology() {
+  BH_SSH_TOPO=""
+  [ "$BH_SSH_RUNNING" = "1" ] || return 0
+  local p unconf="" masters="" kids=0 total=0 bind_wild=0 ssout line la
+  if [ -n "$BH_SSH_LISTENING" ]; then
+    for p in $(printf '%s\n' "$BH_SSH_LISTENING" | tr ',' ' '); do
+      case ",$BH_SSH_PORTS," in *",${p},"*) : ;; *) unconf="${unconf:+$unconf,}$p" ;; esac
+    done
+    [ -n "$unconf" ] && sec_line warn "unconfigured sshd listener: port(s) $unconf — not in the sshd_config Port set"
+  fi
+  if command_exists pgrep; then
+    local pids all pid ppid
+    pids="$(pgrep -x sshd 2>/dev/null || true)"
+    if [ -n "$pids" ]; then
+      total="$(printf '%s\n' "$pids" | grep -c . || true)"
+      all=" $(printf '%s\n' "$pids" | tr '\n' ' ')"
+      for pid in $pids; do
+        ppid="$(awk '/^PPid/{print $2}' "/proc/$pid/status" 2>/dev/null)"
+        case "$all" in *" $ppid "*) kids=$((kids + 1)) ;; esac
+      done
+      masters=$(( total - kids ))
+      [ "$masters" -lt 0 ] 2>/dev/null && masters=0
+      if [ "$masters" -gt 1 ]; then
+        sec_line warn "multiple sshd master processes detected ($masters) — one daemon should own the port(s)"
+      fi
+    fi
+  fi
+  if command_exists ss; then
+    ssout="$(sec_to 3 ss -tlnpH || true)"
+    [ -n "$ssout" ] || ssout="$(sec_to 3 ss -tlnH || true)"
+    if [ -n "$ssout" ]; then
+      while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        # shellcheck disable=SC2086  # fixed-column split of an ss line
+        set -- $line
+        la="$4"
+        case "$la" in ''|LISTEN) continue ;; esac
+        case "$line" in
+          *sshd*) : ;;
+          *) case ",$BH_SSH_LISTENING," in *",${la##*:},"*) : ;; *) continue ;; esac ;;
+        esac
+        la="${la%:*}"
+        case "$la" in
+          0.0.0.0|\*|::|\[::\]) bind_wild=1 ;;
+        esac
+      done < <(printf '%s\n' "$ssout")
+    fi
+  fi
+  BH_SSH_TOPO="cfg:${BH_SSH_PORTS:-?} listen:${BH_SSH_LISTENING:-none} masters:${masters:-n/a}${unconf:+ unconf:$unconf}"
+  if [ "$bind_wild" = "1" ]; then
+    BH_SSH_TOPO="$BH_SSH_TOPO bind:wildcard"
+    sec_line info "sshd binds all interfaces (0.0.0.0/[::]) — confirm the firewall limits exposure"
+  fi
+  return 0
+}
+
+# (C10) auth-log deep view behind sec_failed_logins: accepted PASSWORD logins
+# (proof password auth is live), distinct invalid-user names, btmp/lastb
+# volume, fail2ban banned count. Counts only — no usernames, IPs or hosts.
+bhv5c10_auth_log_deep() {
+  BH_AUTH_PW_LOGIN=0; BH_AUTH_INVALID_USERS=0; BH_LASTB_N=0; BH_F2B_BANNED=-1
+  BH_AUTH_LOG_SUM=""
+  local pw=0 inv=0 src="" n=0 jout fb
+  local jerr="$BH_RUNDIR/journal.err"
+  # same journal gate as sec_failed_logins (journalctl "succeeds" with no files)
+  if command_exists journalctl && journalctl -n 1 >/dev/null 2>&1; then
+    if command_exists timeout; then
+      jout="$(timeout 5 journalctl -u ssh -u sshd --since '-24 hours' --no-pager 2>"$jerr" || true)"
+    else
+      jout="$(journalctl -u ssh -u sshd --since '-24 hours' --no-pager 2>"$jerr" || true)"
+    fi
+    if [ -n "$jout" ] && ! grep -qi 'no journal files' "$jerr" 2>/dev/null; then
+      src="journalctl"
+      pw="$(printf '%s\n' "$jout" | grep -c 'Accepted password' || true)"
+      inv="$(printf '%s\n' "$jout" | awk '/Invalid user/{print $8}' | sort -u | grep -c . || true)"
+    fi
+  fi
+  if [ -z "$src" ] && [ -r /var/log/auth.log ]; then
+    src="auth.log"
+    pw="$(grep -hc 'Accepted password' /var/log/auth.log 2>/dev/null || true)"
+    inv="$(grep -h 'Invalid user' /var/log/auth.log 2>/dev/null | awk '{print $8}' | sort -u | grep -c . || true)"
+  fi
+  case "$pw" in ''|*[!0-9]*) pw=0 ;; esac
+  case "$inv" in ''|*[!0-9]*) inv=0 ;; esac
+  BH_AUTH_PW_LOGIN="$pw"; BH_AUTH_INVALID_USERS="$inv"
+  if [ -r /var/log/btmp ] && command_exists lastb; then
+    n="$(sec_to 3 lastb -n 20 | awk 'NF && $0 !~ /btmp begins/ {n++} END{print n+0}')"
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    BH_LASTB_N="$n"
+    [ "$n" -gt 0 ] && sec_line info "lastb: $n failed-login entr(ies) in /var/log/btmp (showing up to 20)"
+  fi
+  if command_exists fail2ban-client; then
+    fb="$(sec_to 3 fail2ban-client status sshd | sed -n 's/.*Currently banned:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+    case "$fb" in ''|*[!0-9]*) fb="" ;; esac
+    if [ -n "$fb" ]; then
+      BH_F2B_BANNED="$fb"
+      [ "$fb" -gt 0 ] 2>/dev/null && sec_line info "fail2ban sshd jail: $fb IP(s) currently banned"
+    fi
+  fi
+  if [ "$pw" -gt 0 ]; then
+    sec_line warn "password logins observed in logs (live use): $pw accepted password login(s) in $src"
+  fi
+  if [ "$inv" -gt 0 ]; then
+    sec_line info "invalid-user probes: $inv distinct name(s) — brute-force background noise (count only)"
+  fi
+  if [ -n "$src" ] || [ "$BH_LASTB_N" -gt 0 ] || [ "$BH_F2B_BANNED" -ge 0 ] 2>/dev/null; then
+    local fl="$BH_SSH_FAILS_N"
+    [ "$fl" -ge 0 ] 2>/dev/null || fl="n/a"
+    BH_AUTH_LOG_SUM="fail:$fl invalid-users:$BH_AUTH_INVALID_USERS pw-accepted:$BH_AUTH_PW_LOGIN"
+  fi
+  return 0
+}
+
+# (C11) MFA posture: AuthenticationMethods plus a 2FA PAM stack; UsePAM no
+# also means account policies (expiry/lockout) are bypassed for SSH logins.
+bhv5c10_mfa() {
+  BH_SSH_MFA=""
+  [ "$BH_SSH_FOUND" = "1" ] || return 0
+  local am up pam2fa=0
+  am="$(sec_sshd_opt authenticationmethods "")"
+  up="$(sec_sshd_opt usepam "")"
+  if [ -r /etc/pam.d/sshd ] && grep -qsE 'pam_google_authenticator|pam_u2f|pam_oath|pam_duo' /etc/pam.d/sshd; then
+    pam2fa=1
+  fi
+  case "$(bhv5c10_norm "$am")" in ''|any|none) am="" ;; esac
+  if [ -n "$am" ] && [ "$pam2fa" = "1" ]; then
+    BH_SSH_MFA="enforced"
+    sec_line ok "MFA enforced (AuthenticationMethods: $am + 2FA PAM module in /etc/pam.d/sshd)"
+  elif [ "$(bhv5c10_norm "$up")" = "no" ]; then
+    BH_SSH_MFA="usepam-no"
+    sec_line warn "UsePAM no — account policies (expiry/lockout/2FA hooks) bypassed for SSH"
+  elif [ -n "$am" ]; then
+    BH_SSH_MFA="methods-only"
+    sec_line info "AuthenticationMethods: $am but no 2FA PAM module found in /etc/pam.d/sshd"
+  else
+    BH_SSH_MFA="none"
+    sec_line info "MFA: not configured (single-factor SSH)"
+  fi
+  return 0
+}
+
 # run_sec_audit — gate used by main: honors --no-sec / BH_NO_SEC and sets
 # BH_SEC_SKIPPED so the report can say why the audit is missing.
 run_sec_audit() {
@@ -744,6 +1365,15 @@ sec_audit() {
       custom) sec_line info "Pre-login banner: custom (no OS info detected)" ;;
       *)      sec_line info "Pre-login banner: none" ;;
     esac
+
+    # ---- v5 deep checks (C10): syntax gate, declared-vs-effective diff, ----
+    # ---- certificate auth, Match/SFTP scan, forwarding sweep, MFA      ----
+    bhv5c10_sshd_cfg_valid
+    bhv5c10_eff_decl
+    bhv5c10_cert_auth
+    bhv5c10_match_sftp
+    bhv5c10_fwd_sweep
+    bhv5c10_mfa
   else
     BH_SSH_PORTS=""
     sec_line info "sshd: not found on this machine (no SSH server installed)"
@@ -757,6 +1387,15 @@ sec_audit() {
     sec_line info "OpenSSH version: $BH_SSH_VERSION"
   else
     sec_line info "OpenSSH version: n/a (ssh client not found)"
+  fi
+  # daemon and client versions can drift after partial upgrades — report the
+  # daemon binary when it adds information beyond the client line above
+  if [ -n "$BH_SSHD_VER" ] && [ "$BH_SSHD_VER" != "$BH_SSH_VERSION" ]; then
+    if [ -n "$BH_SSH_VERSION" ]; then
+      sec_line info "sshd daemon version: $BH_SSHD_VER (ssh client: $BH_SSH_VERSION — client/daemon differ)"
+    else
+      sec_line info "sshd daemon version: $BH_SSHD_VER (no ssh client for comparison)"
+    fi
   fi
 
   # ---- sshd runtime state ----
@@ -773,8 +1412,13 @@ sec_audit() {
     sec_line info "sshd process: not detected (no SSH server installed)"
   fi
 
+  # ---- v5 (C3/C9): socket-activation false-positive guard + listener topology ----
+  bhv5c10_socket_fp
+  bhv5c10_topology
+
   # ---- authorized keys ----
   sec_auth_keys
+  bhv5c10_ak_deep
   if [ "$BH_AK_TOTAL" -gt 0 ]; then
     local weaktxt=""
     [ "$BH_AK_WEAK" -gt 0 ] && weaktxt=" — $BH_AK_WEAK WEAK (<2048-bit)"
@@ -782,6 +1426,9 @@ sec_audit() {
   else
     sec_line info "authorized_keys: none found (root + /home/*)"
   fi
+
+  # ---- v5 (C5): host key audit (type/size/mtime; fingerprints truncated) ----
+  bhv5c10_hostkey_audit
 
   # ---- failed logins ----
   sec_failed_logins
@@ -792,6 +1439,7 @@ sec_audit() {
   else
     sec_line info "Failed SSH logins: $BH_SSH_FAILS"
   fi
+  bhv5c10_auth_log_deep
 
   # ---- firewall / fail2ban ----
   sec_firewall
@@ -893,6 +1541,10 @@ sec_audit() {
   if command -v sec_hardening >/dev/null 2>&1; then
     sec_hardening
   fi
+
+  # ---- v5 companion modules (86/87, another coder owns them) ----
+  declare -F sec_system_sec >/dev/null 2>&1 && sec_system_sec
+  declare -F sec_malware_hunt >/dev/null 2>&1 && sec_malware_hunt
 
   # ---- posture ----
   if [ "$BH_SEC_BAD" -gt 0 ]; then

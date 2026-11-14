@@ -17,6 +17,13 @@
 #   - BH_BASH_OPS / BH_AWK_OPS: pure-bash vs awk integer loop cross-check (B6).
 #   - BH_OSSL_SHA256_KS: openssl sha256 cross-check, tolerant of both the
 #     OpenSSL 3.x ("SHA2-256") and 1.x ("sha256") summary-row formats.
+#
+# v5 (C12) additions:
+#   - BH_THROTTLE_PCT / BH_THROTTLE_NR: cgroup CPU-controller throttling
+#     sampled around the multi-core sha256 window (v2 cpu.stat and v1
+#     cpu/cpu.stat both supported).
+#   - BH_NOISY_PCT: A/B interference probe (full mode only) — slowdown % of a
+#     1-core loop while BH_PAR_JOBS background loops run.
 # =====================================================================
 # shellcheck shell=bash
 
@@ -33,6 +40,10 @@ BH_CPU_THREADS=""        # jobs used by the multi-core bench
 BH_STEAL_UNDER_LOAD=""   # steal % across the multi-core window ("" if unknown)
 BH_BASH_OPS=""           # pure-bash integer loop rate, ops/s
 BH_AWK_OPS=""            # awk BEGIN-loop rate, ops/s
+# v5 (C12) additions
+BH_THROTTLE_PCT=""       # % of the multi-core wall window spent throttled ("") if unknown
+BH_THROTTLE_NR=""        # % of cgroup periods that saw throttling ("" when zero periods)
+BH_NOISY_PCT=""          # A/B interference probe: % slowdown under self-load (full mode only)
 
 BH_RUNDIR="${BH_RUNDIR:-/tmp}"
 
@@ -184,10 +195,121 @@ bh_cpu_openssl() {
   return 0
 }
 
+# =====================================================================
+# v5 additions (C12) — cgroup CPU throttling + noisy-neighbor probe
+# =====================================================================
+
+# bhv5c12_cgstat — "<nr_periods> <nr_throttled> <throttled_usec>" from the
+# cgroup CPU controller: v2 (/sys/fs/cgroup/cpu.stat, throttled_usec) or
+# v1 (/sys/fs/cgroup/cpu/cpu.stat, throttled_time — also microseconds).
+# "" when neither file is readable or the throttle counter is missing.
+# Raw counters can exceed 2^31, so they only ever travel as STRINGS into awk
+# doubles — never printf %d (mawk saturates at INT32_MAX).
+bhv5c12_cgstat() {
+  local f=""
+  if [ -r /sys/fs/cgroup/cpu.stat ]; then f=/sys/fs/cgroup/cpu.stat
+  elif [ -r /sys/fs/cgroup/cpu/cpu.stat ]; then f=/sys/fs/cgroup/cpu/cpu.stat
+  else return 0; fi
+  awk '
+    $1 == "nr_periods"     { np = $2 }
+    $1 == "nr_throttled"   { nt = $2 }
+    $1 == "throttled_usec" { tu = $2 }
+    $1 == "throttled_time" { tu = $2 }
+    END { if (np != "" && tu != "") print np + 0, nt + 0, tu + 0 }
+  ' "$f" 2>/dev/null
+}
+
+# bhv5c12_throttle A B W0_MS W1_MS — turn two bhv5c12_cgstat samples (A taken
+# before, B after the multi-core window) plus the window wall time (ms) into:
+#   BH_THROTTLE_PCT = throttled_usec_delta / wall_delta_us * 100  (awk float)
+#   BH_THROTTLE_NR  = nr_throttled_delta / nr_periods_delta * 100
+# Zero elapsed periods (no active CPU controller) -> both stay "".
+bhv5c12_throttle() {
+  BH_THROTTLE_PCT=""
+  BH_THROTTLE_NR=""
+  local a="$1" b="$2" w0="${3:-0}" w1="${4:-0}" wall_us out
+  [ -n "$a" ] && [ -n "$b" ] || return 0
+  wall_us=$(( (w1 - w0) * 1000 ))
+  [ "$wall_us" -gt 0 ] || return 0
+  out="$(awk -v a="$a" -v b="$b" -v w="$wall_us" 'BEGIN{
+    split(a, A, " "); split(b, B, " ")
+    dnp = B[1] - A[1]; dnt = B[2] - A[2]; dtu = B[3] - A[3]
+    if (dnp < 0) dnp = 0
+    if (dnt < 0) dnt = 0
+    if (dtu < 0) dtu = 0
+    if (dnp > 0) printf "%.2f %.1f\n", dtu / w * 100, dnt / dnp * 100
+  }' 2>/dev/null)"
+  [ -n "$out" ] || return 0
+  BH_THROTTLE_PCT="${out%% *}"
+  BH_THROTTLE_NR="${out#* }"
+  case "$BH_THROTTLE_PCT" in ''|.*|*[!0-9.]*) BH_THROTTLE_PCT=""; BH_THROTTLE_NR="" ;; esac
+  case "$BH_THROTTLE_NR"    in ''|.*|*[!0-9.]*) BH_THROTTLE_NR="" ;; esac
+  return 0
+}
+
+# bhv5c12_noisy_probe — A/B interference probe (full mode only, ~<=2s):
+# 1) time a short single-core awk arithmetic loop with nothing else running;
+# 2) launch BH_PAR_JOBS background copies of a longer version of the same loop
+#    and re-time the short loop while they run;
+# BH_NOISY_PCT = (t_loaded - t_solo) / t_solo * 100 (>25% = noisy-neighbor
+# evidence). Background jobs are plain awk BEGIN loops (self-terminating) and
+# are killed AND reaped before returning, so later metrics are not disturbed.
+bhv5c12_noisy_probe() {
+  BH_NOISY_PCT=""
+  [ "${BH_FAST:-0}" = "1" ] && return 0
+  local jobs="${BH_PAR_JOBS:-1}"
+  case "$jobs" in ''|*[!0-9]*|0) jobs=1 ;; esac
+  local n=300000 nl=1200000            # measured iters; load-loop iters (4x)
+  local prog='BEGIN{ x = 0; for (i = 0; i < n; i++) x += i; print x }'
+  local t0 t1 solo loaded out i p
+  local pids=()
+
+  # ---- A: solo ----
+  t0=$(now_us)
+  if command_exists timeout; then
+    timeout 5 awk -v n="$n" "$prog" </dev/null >/dev/null 2>&1
+  else
+    awk -v n="$n" "$prog" </dev/null >/dev/null 2>&1
+  fi
+  t1=$(now_us)
+  solo=$((t1 - t0))
+  [ "$solo" -gt 0 ] || return 0
+
+  # ---- background load: BH_PAR_JOBS copies of a longer loop (no timeout
+  # wrapper: kill must hit awk itself, not orphan a child) ----
+  i=0
+  while [ "$i" -lt "$jobs" ]; do
+    awk -v n="$nl" "$prog" </dev/null >/dev/null 2>&1 &
+    pids+=("$!")
+    i=$((i + 1))
+  done
+
+  # ---- B: loaded ----
+  t0=$(now_us)
+  if command_exists timeout; then
+    timeout 5 awk -v n="$n" "$prog" </dev/null >/dev/null 2>&1
+  else
+    awk -v n="$n" "$prog" </dev/null >/dev/null 2>&1
+  fi
+  t1=$(now_us)
+  loaded=$((t1 - t0))
+
+  # ---- teardown: kill every background job, then reap ----
+  for p in "${pids[@]}"; do kill "$p" 2>/dev/null; done
+  for p in "${pids[@]}"; do wait "$p" 2>/dev/null; done
+
+  [ "$loaded" -gt 0 ] || return 0
+  out="$(awk -v l="$loaded" -v s="$solo" 'BEGIN{ if (s + 0 > 0) printf "%.1f", (l - s) / s * 100 }' 2>/dev/null)"
+  case "$out" in ''|.*|*[!0-9.]*) return 0 ;; esac
+  BH_NOISY_PCT="$out"
+  return 0
+}
+
 bench_cpu() {
   local n=256
   [ "$BH_FAST" = "1" ] && n=96
   local ms reps j sa sb src
+  local bhv5c12_cg0="" bhv5c12_cg1="" bhv5c12_w0=0 bhv5c12_w1=0   # v5 throttle window (C12)
 
   # ---- shared random payload (G3: never benchmark /dev/zero's zero fast-path) ----
   bh_make_cpu_input "$n"
@@ -221,6 +343,8 @@ bench_cpu() {
   BH_CPU_THREADS="$j"
   log "CPU bench: sha256 multi-core (${j} jobs, ${n} MB per rep, same payload each)..."
   sa="$(_bh_stat_steal)"                 # steal sample immediately before the window
+  bhv5c12_cg0="$(bhv5c12_cgstat)"       # v5: cgroup throttle sample before the window (C12)
+  bhv5c12_w0="$(now_ms)"
   reps=1
   while :; do
     bh_hash_reps "$n" "$j" "$reps"
@@ -229,6 +353,9 @@ bench_cpu() {
     reps=$((reps * 2))
   done
   sb="$(_bh_stat_steal)"                 # ... and immediately after
+  bhv5c12_cg1="$(bhv5c12_cgstat)"       # v5: throttle sample after the window (C12)
+  bhv5c12_w1="$(now_ms)"
+  bhv5c12_throttle "$bhv5c12_cg0" "$bhv5c12_cg1" "$bhv5c12_w0" "$bhv5c12_w1"
   BH_SHANC="$(awk -v n="$BH_LAST_N" -v j="$j" -v ms="$ms" 'BEGIN{ if (ms>=50) printf "%.1f", n*j*1048576/(ms/1000)/1048576; else print 0 }')"
 
   # steal % over the multi-core wall window — same math as 20-info's
@@ -256,4 +383,8 @@ bench_cpu() {
 
   # ---- openssl sha256 cross-check (info only) ----
   bh_cpu_openssl
+
+  # ---- v5 (C12): A/B interference probe, full mode only (self-contained,
+  #      background load killed + reaped inside) ----
+  bhv5c12_noisy_probe
 }

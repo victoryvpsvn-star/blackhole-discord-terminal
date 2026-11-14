@@ -43,6 +43,17 @@ BH_OOM_ADJ=""         # /proc/self/oom_score_adj | ""=unknown
 BH_OOM_SCORE=""       # /proc/self/oom_score | ""=unknown
 BH_CG_CONTROLLERS=""  # v2 controller list | cgroup-v1 | unknown
 
+# ------- v5 (C11) additions — identity & pressure truth -------
+#   E9 uid/gid map truth  (/proc/self/{uid,gid}_map: real root vs mapped root)
+#   E10 seccomp posture   (/proc/self/status Seccomp[+Seccomp_filters] + uid)
+#   E11 PSI snapshot      (core's bh_psi; labelled host-wide because
+#                          /proc/pressure is host-wide inside containers)
+BH_UIDMAP_MODE=""     # initial user-ns (real root) | rootless (mapped
+                      # container root)[; note] | mapped (idmapped?) | unknown
+BH_SECCOMP_MODE=""    # none | strict | filter [+ filters=N][+ note] | unknown
+BH_PSI_TXT=""         # "psi(host): cpu s=.. f=.. | mem .. | io .." |
+                      # "psi(host): off" [+ " (CPU throttling evidence)"]
+
 # canonical capability names, bits 0..40 (include/uapi/linux/capability.h)
 BH_CAP_NAMES=(
   cap_chown dac_override dac_read_search fowner fsetid kill setgid setuid
@@ -100,6 +111,127 @@ bh_rl_val() {
 # bh_yn 0|1 — yes/no token for the device map
 bh_yn() {
   if [ "$1" = "1" ]; then printf 'yes'; else printf 'no'; fi
+  return 0
+}
+
+# =====================================================================
+# v5 (C11) private helpers — identity & pressure truth (no stdout except
+# where a helper is documented to print; all guarded, read-only, pure
+# bash so the module stays mawk-safe by construction)
+# =====================================================================
+
+# bhv5c11_map_mode IN OUT COUNT — classify one user-ns map line
+# ("id-inside id-outside map-length", all three must be numeric).
+# Prints: initial | rootless | mapped | unknown. Pure bash, no forks.
+bhv5c11_map_mode() {
+  local a="$1" b="$2" c="$3"
+  case "$a$b$c" in ''|*[!0-9]*) printf 'unknown'; return 0 ;; esac
+  if [ "$a" = "0" ] && [ "$b" = "0" ] && [ "$c" = "4294967295" ]; then
+    printf 'initial'                 # full map: we are the initial user-ns
+  elif [ "$a" = "0" ] && [ "$b" != "0" ] && [ "$c" = "1" ]; then
+    printf 'rootless'                # container root 0 -> host uid N, length 1
+  else
+    printf 'mapped'                  # partial / idmapped-style mapping
+  fi
+  return 0
+}
+
+# bhv5c11_dec_gt0 DECIMAL — return 0 when DECIMAL ("12" | "0.42" | "00.10")
+# parses and is strictly greater than zero. Pure bash integer/fraction
+# digit walk (mawk-safe: no floating-point arithmetic anywhere).
+bhv5c11_dec_gt0() {
+  local s="$1" ip fp i c
+  case "$s" in ''|*[!0-9.]*) return 1 ;; esac
+  case "$s" in *.*) ip="${s%%.*}"; fp="${s#*.}" ;; *) ip="$s"; fp="" ;; esac
+  case "$ip" in ''|*[!0-9]*) return 1 ;; esac
+  case "$fp" in *.*|*[!0-9]*) return 1 ;; esac   # reject "1.2.3" / "1.2a"
+  while [ "${#ip}" -gt 1 ] && [ "${ip:0:1}" = "0" ]; do ip="${ip:1}"; done
+  if [ "$ip" != "0" ]; then return 0; fi
+  i=0
+  while [ "$i" -lt "${#fp}" ]; do
+    c="${fp:i:1}"
+    [ "$c" != "0" ] && return 0
+    i=$(( i + 1 ))
+  done
+  return 1
+}
+
+# bhv5c11_priv_truth — called at the end of gather_env. Fills:
+#   BH_UIDMAP_MODE  BH_SECCOMP_MODE  BH_PSI_TXT  (see globals above)
+bhv5c11_priv_truth() {
+  # ---- E9: uid/gid map truth ----
+  local u_in="" u_out="" u_cnt="" g_in="" g_out="" g_cnt=""
+  local uid_mode="unknown" gid_mode="unknown" mode=""
+  if [ -r /proc/self/uid_map ]; then
+    read -r u_in u_out u_cnt < /proc/self/uid_map 2>/dev/null || u_in=""
+  fi
+  if [ -r /proc/self/gid_map ]; then
+    read -r g_in g_out g_cnt < /proc/self/gid_map 2>/dev/null || g_in=""
+  fi
+  uid_mode="$(bhv5c11_map_mode "$u_in" "$u_out" "$u_cnt")"
+  gid_mode="$(bhv5c11_map_mode "$g_in" "$g_out" "$g_cnt")"
+  mode="$uid_mode"
+  if [ "$mode" = "unknown" ]; then mode="$gid_mode"; fi
+  # uid and gid maps both readable but disagree: treat as mapped, not trusted
+  if [ "$uid_mode" != "unknown" ] && [ "$gid_mode" != "unknown" ] \
+    && [ "$uid_mode" != "$gid_mode" ]; then
+    mode="mapped"
+  fi
+  case "$mode" in
+    initial)  BH_UIDMAP_MODE="initial user-ns (real root)" ;;
+    rootless) BH_UIDMAP_MODE="rootless (mapped container root); root but confined (unprivileged container)" ;;
+    mapped)   BH_UIDMAP_MODE="mapped (idmapped?)" ;;
+    *)        BH_UIDMAP_MODE="unknown" ;;
+  esac
+
+  # ---- E10: seccomp posture (Seccomp / Seccomp_filters / Uid) ----
+  local key val seccomp="" sfilt="" realuid=""
+  if [ -r /proc/self/status ]; then
+    while read -r key val _ || [ -n "${key:-}" ]; do
+      case "$key" in
+        Seccomp:)         seccomp="${val:-}" ;;
+        Seccomp_filters:) sfilt="${val:-}" ;;
+        Uid:)             realuid="${val:-}" ;;
+      esac
+    done < /proc/self/status
+  fi
+  case "$seccomp" in
+    0) BH_SECCOMP_MODE="none" ;;
+    1) BH_SECCOMP_MODE="strict" ;;
+    2) BH_SECCOMP_MODE="filter" ;;
+    *) BH_SECCOMP_MODE="unknown" ;;
+  esac
+  if [ "$BH_SECCOMP_MODE" != "unknown" ]; then
+    case "$sfilt" in ''|*[!0-9]*) : ;; *)
+      BH_SECCOMP_MODE="$BH_SECCOMP_MODE filters=$sfilt" ;;
+    esac
+  fi
+  # uid 0 with seccomp fully off is the classic "privileged-looking but
+  # actually unprivileged container" tell (no filter => no syscall jail)
+  if [ "$seccomp" = "0" ] && [ "$realuid" = "0" ]; then
+    BH_SECCOMP_MODE="${BH_SECCOMP_MODE} (unprivileged container without seccomp)"
+  fi
+
+  # ---- E11: PSI snapshot, labelled host-wide ----
+  # /proc/pressure reflects the HOST, not this cgroup, when we run inside a
+  # container — hence the "psi(host): " prefix on whatever bh_psi returns.
+  local psi cpu_s=""
+  psi="$(bh_psi)"
+  case "$psi" in
+    off) BH_PSI_TXT="psi(host): off" ;;
+    *)
+      BH_PSI_TXT="psi(host): $psi"
+      case "$psi" in
+        cpu\ s=*)
+          cpu_s="${psi#cpu s=}"
+          cpu_s="${cpu_s%%[!0-9.]*}"
+          if bhv5c11_dec_gt0 "$cpu_s"; then
+            BH_PSI_TXT="$BH_PSI_TXT (CPU throttling evidence)"
+          fi
+          ;;
+      esac
+      ;;
+  esac
   return 0
 }
 
@@ -318,6 +450,9 @@ gather_env() {
     1) BH_CG_CONTROLLERS="cgroup-v1" ;;
     *) BH_CG_CONTROLLERS="unknown" ;;
   esac
+
+  # ---- E9/E10/E11 (v5, C11): uid-map / seccomp / PSI truth ----
+  bhv5c11_priv_truth
 
   return 0
 }

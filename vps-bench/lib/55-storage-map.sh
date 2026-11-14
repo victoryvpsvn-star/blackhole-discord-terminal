@@ -12,6 +12,13 @@
 #   S8  NVMe controller detail (PCIe gen)     -> BH_NVME_INFO
 #   R5  raw disk model strings (oversell ev.) -> BH_DISK_MODELS
 #   one-line verdict                          -> BH_STORAGE_SUMMARY
+# v5.0 (C07) storage health extras (bhv5c7_health, called at the end):
+#   H1  block-layer queue topology (sysfs)    -> BH_QUEUE_MATRIX
+#   H2  mdraid health (mdstat + sysfs)        -> BH_MDRAID_TXT
+#   H3  zpool health/capacity                 -> BH_ZFS_TXT
+#   H4  btrfs device error counters           -> BH_BTRFS_TXT
+#   H5  lvm overview + thin-pool risk         -> BH_LVM_TXT
+#   (inode pressure / mount flags / fstrim are owned by 57-*.sh, not here)
 #
 # Contract: sets BH_* globals only (never stdout); every potentially-slow
 # external command is guarded (command_exists + `timeout 2` via bh_t2);
@@ -45,6 +52,12 @@ BH_SWAP_KIND=""        # "zram none | disk none" | "zram 2G prio100 | disk 4G"
 BH_NVME_INFO=""        # "nvme0 SAMSUNG MZQL296H, PCIe4 x4 pcie" | "" = no nvme
 BH_DISK_MODELS=""      # "QEMU_HARDDISK,INTEL SSDSC2KB019T" (max 3, deduped)
 BH_STORAGE_SUMMARY=""  # "root=virtio stack=none zram=no trim=yes"
+# v5.0 (C07) storage health extras — empty when unavailable/unreadable
+BH_QUEUE_MATRIX=""     # "sda: nr=256 qd=1024 wc=write back mq=8 io=none | vda: nr=128 mq=2"
+BH_MDRAID_TXT=""       # "md0: 2/1 DEGRADED F=1 recovery=42%" | "" = no md arrays
+BH_ZFS_TXT=""          # "tank: ONLINE 34% | pool2: DEGRADED 55% why: ..." | "" = no zfs
+BH_BTRFS_TXT=""        # "/data ok | /mnt/big ERR total=17" | "" = none/unreadable
+BH_LVM_TXT=""          # "thinpool data: 91% used (overprovision risk)" | "lvm: 3 lv" | ""
 
 # bh_t2 CMD... — run a possibly-hanging external command under `timeout 2`
 # when available (same pattern as 85-hardening.sh / 10-detect.sh).
@@ -213,6 +226,241 @@ bh_root_class_from_stack() {
     *"zram"*)                       printf 'zram' ;;
     *)                              printf '' ;;
   esac
+  return 0
+}
+
+# =====================================================================
+# v5.0 (C07) — storage health extras (bhv5c7_* are private to this file)
+# =====================================================================
+# Answers "is my storage HEALTHY?" on top of the v4 topology map above:
+# queue topology, mdraid degradation, zfs/btrfs/lvm checks. Strictly
+# additive + read-only: every external CLI runs under `timeout 3` via
+# bh_t3, sysfs/proc reads are plain tr/awk (same idiom as S4/S5/S8);
+# missing tooling or unreadable input => "" (never fails, no stdout).
+
+# bh_t3 CMD... — bh_t2 with a 3s ceiling (v5 C07 additions).
+bh_t3() {
+  if command_exists timeout; then
+    timeout 3 "$@" 2>/dev/null </dev/null
+  else
+    "$@" 2>/dev/null </dev/null
+  fi
+}
+
+# bhv5c7_queue_matrix — per-disk block-layer facts from sysfs (max 6 disks):
+#   "sda: nr=256 qd=1024 wc=write back mq=8 io=mq-deadline | vda: nr=128 mq=2"
+#   nr=queue/nr_requests   qd=device/queue_depth   wc=queue/write_cache
+#   mq=count of /sys/block/X/mq/mq* dirs   io=active scheduler (bracketed
+#   name in queue/scheduler); the params inside queue/iosched/ are scheduler
+#   specific and deliberately NOT dumped — presence only.
+# Excluded: loop*/ram*/zram*/md*/sr*/fd* (not real bench targets).
+bhv5c7_queue_matrix() {
+  BH_QUEUE_MATRIX=""
+  local d dev nr wc qd io sched mq ent qm cnt=0
+  for d in /sys/block/*; do
+    [ -e "$d" ] || continue
+    dev="${d##*/}"
+    case "$dev" in loop*|ram*|zram*|md*|sr*|fd*) continue ;; esac
+    [ -d "$d/queue" ] || continue
+    nr="$(tr -cd '0-9' < "$d/queue/nr_requests" 2>/dev/null)"
+    wc="$(tr -d ' \t\n\r' < "$d/queue/write_cache" 2>/dev/null)"
+    qd="$(tr -cd '0-9' 2>/dev/null < "$d/device/queue_depth")"
+    io=""
+    sched="$(tr -d ' \t\n\r' < "$d/queue/scheduler" 2>/dev/null)"
+    case "$sched" in
+      *"["*"]"*) io="${sched#*\[}"; io="${io%%\]*}" ;;
+      *) [ -d "$d/queue/iosched" ] && io="present" ;;
+    esac
+    mq=0
+    for qm in "$d"/mq/mq*; do
+      [ -e "$qm" ] || continue
+      mq=$(( mq + 1 ))
+    done
+    ent="${dev}:"
+    [ -n "$nr" ] && ent="${ent} nr=$nr"
+    [ -n "$qd" ] && ent="${ent} qd=$qd"
+    [ -n "$wc" ] && ent="${ent} wc=$wc"
+    [ "$mq" -gt 0 ] && ent="${ent} mq=$mq"
+    [ -n "$io" ] && ent="${ent} io=$io"
+    [ "$ent" = "${dev}:" ] && continue   # nothing readable -> skip disk
+    BH_QUEUE_MATRIX="${BH_QUEUE_MATRIX:+$BH_QUEUE_MATRIX | }$ent"
+    cnt=$(( cnt + 1 )); [ "$cnt" -ge 6 ] && break
+  done
+  return 0
+}
+
+# bhv5c7_mdraid — software-raid health from /proc/mdstat, cross-checked with
+# /sys/block/mdX/md/{degraded,mismatch_cnt,sync_action} (max 4 arrays):
+#   "md0: 2/1 DEGRADED F=1 recovery=42% | md1: 2/2"
+#   n/m=[total/active] members, F= members flagged (F) in mdstat,
+#   mm=mismatch_cnt>0, recovery/resync/reshape/check/rebuild=<int>% progress,
+#   sync=<sync_action> when a sync runs without a progress line.
+# No md arrays in mdstat => "".
+bhv5c7_mdraid() {
+  BH_MDRAID_TXT=""
+  [ -r /proc/mdstat ] || return 0
+  local hasmd=0 l0 mdlines mdc mem flt prog mstat deg mm ent sa degyes out="" cnt=0
+  while IFS= read -r l0; do
+    case "$l0" in md[0-9]*\ :*) hasmd=1; break ;; esac
+  done < /proc/mdstat
+  [ "$hasmd" = "1" ] || return 0
+  # shellcheck disable=SC2016  # awk program: $ refs are for awk, not bash
+  mdlines="$(bh_t3 awk '
+    $1 ~ /^md[0-9]+$/ && $2 == ":" {
+      if (md != "") print md "|" mem "|" f "|" prog "|" state
+      md = $1; mem = ""; prog = ""; state = ""
+      if ($0 ~ / inactive/) state = "inactive"
+      f = gsub(/\(F\)/, "&")
+      next
+    }
+    md != "" && $0 == "" {
+      print md "|" mem "|" f "|" prog "|" state
+      md = ""
+      next
+    }
+    md != "" {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^\[[0-9]+\/[0-9]+\]$/ && mem == "")
+          mem = substr($i, 2, length($i) - 2)
+        if ($i ~ /^(recovery|resync|reshape|check|rebuild)$/ && $(i+1) == "=" && $(i+2) ~ /%/) {
+          p = $(i+2); sub(/%.*$/, "", p); sub(/\..*$/, "", p)
+          if (p ~ /^[0-9]+$/) prog = $i "=" p "%"
+        }
+      }
+      next
+    }
+    END { if (md != "") print md "|" mem "|" f "|" prog "|" state }
+  ' /proc/mdstat)"
+  [ -n "$mdlines" ] || return 0
+  while IFS='|' read -r mdc mem flt prog mstat; do
+    [ -n "$mdc" ] || continue
+    ent="$mdc:"
+    degyes=0
+    case "$mem" in
+      [0-9]*/[0-9]*)
+        ent="$ent $mem"
+        [ "${mem#*/}" -lt "${mem%%/*}" ] 2>/dev/null && degyes=1
+        ;;
+    esac
+    deg="$(tr -cd '0-9' < "/sys/block/$mdc/md/degraded" 2>/dev/null)"
+    [ "$deg" = "1" ] && degyes=1
+    [ "$degyes" = "1" ] && ent="$ent DEGRADED"
+    case "$flt" in ''|*[!0-9]*) flt=0 ;; esac
+    [ "$flt" -gt 0 ] && ent="$ent F=$flt"
+    mm="$(tr -cd '0-9' < "/sys/block/$mdc/md/mismatch_cnt" 2>/dev/null)"
+    case "$mm" in ''|0) : ;; *) [ "$mm" -gt 0 ] && ent="$ent mm=$mm" ;; esac
+    if [ -n "$prog" ]; then
+      ent="$ent $prog"
+    else
+      sa="$(tr -d ' \t\n\r' < "/sys/block/$mdc/md/sync_action" 2>/dev/null)"
+      [ -n "$sa" ] && [ "$sa" != "idle" ] && ent="$ent sync=$sa"
+    fi
+    [ -n "$mstat" ] && ent="$ent $mstat"
+    out="${out:+$out | }$ent"
+    cnt=$(( cnt + 1 )); [ "$cnt" -ge 4 ] && break
+  done <<< "$mdlines"
+  BH_MDRAID_TXT="$out"
+  return 0
+}
+
+# bhv5c7_zfs — zpool health/capacity (needs zpool; else ""):
+#   "tank: ONLINE 34% | slow: DEGRADED 55% why: One or more devices ..."
+# Unhealthy pools get a one-line `zpool status -x` reason (capped 100 chars).
+bhv5c7_zfs() {
+  BH_ZFS_TXT=""
+  command_exists zpool || return 0
+  local lst hlth cap name out bad detail cnt=0
+  lst="$(bh_t3 zpool list -Ho health,cap,name 2>/dev/null)"
+  [ -n "$lst" ] || return 0
+  out=""; bad=0
+  while read -r hlth cap name; do
+    [ -n "$name" ] || continue
+    case "$cap" in ''|*[!0-9]*) cap="" ;; esac
+    out="${out:+$out | }$name: ${hlth:-unknown}${cap:+ ${cap}%}"
+    case "$hlth" in ONLINE) : ;; *) bad=1 ;; esac
+    cnt=$(( cnt + 1 )); [ "$cnt" -ge 4 ] && break
+  done <<< "$lst"
+  if [ "$bad" = "1" ]; then
+    detail="$(bh_t3 zpool status -x 2>/dev/null | awk '/^status:/ { $1=""; sub(/^ +/, ""); print; exit }')"
+    [ -n "$detail" ] && out="${out} why: ${detail:0:100}"
+  fi
+  BH_ZFS_TXT="$out"
+  return 0
+}
+
+# bhv5c7_btrfs — btrfs device error counters on the first 2 btrfs mounts
+# (needs the btrfs CLI + readable stats; else ""):
+#   "/data ok | /mnt/big ERR total=17"   (sum of write/read/flush/corruption/
+#   generation errs across the fs' devices)
+bhv5c7_btrfs() {
+  BH_BTRFS_TXT=""
+  command_exists btrfs || return 0
+  [ -r /proc/mounts ] || return 0
+  local mnt fst seen stats rc total out cnt=0
+  out=""; seen=""
+  while read -r _bhdev mnt fst _bhrest; do
+    [ "$fst" = "btrfs" ] || continue
+    if [ -n "$seen" ]; then
+      # shellcheck disable=SC2254  # literal mountpoint set membership
+      case ",$seen," in *",$mnt,"*) continue ;; esac
+    fi
+    seen="${seen:+$seen,}$mnt"
+    stats="$(bh_t3 btrfs device stats "$mnt" 2>/dev/null)"; rc=$?
+    { [ "$rc" = "0" ] && [ -n "$stats" ]; } || continue   # unreadable => skip
+    total="$(printf '%s\n' "$stats" | awk '
+      { for (i = 1; i <= NF; i++)
+          if ($i ~ /(write|read|flush|corruption|generation)_errs$/) s += $(i+1) }
+      END { printf "%d", s+0 }')"
+    case "$total" in ''|*[!0-9]*) continue ;; esac
+    if [ "$total" -gt 0 ]; then
+      out="${out:+$out | }$mnt ERR total=$total"
+    else
+      out="${out:+$out | }$mnt ok"
+    fi
+    cnt=$(( cnt + 1 )); [ "$cnt" -ge 2 ] && break
+  done < /proc/mounts
+  BH_BTRFS_TXT="$out"
+  return 0
+}
+
+# bhv5c7_lvm — LVM overview + thin-pool overprovision warning
+# (needs lvs with readable output, usually root; else ""):
+#   "thinpool data: 91% used (overprovision risk)"  when a thin pool (attr
+#   type 't') is >=80% full, else the plain "lvm: <n> lv" summary.
+bhv5c7_lvm() {
+  BH_LVM_TXT=""
+  command_exists lvs || return 0
+  local lvout lv attr pct n warn
+  lvout="$(bh_t3 lvs --noheadings -o lv_name,lv_attr,lv_size,pool_lv,data_percent 2>/dev/null)"
+  [ -n "$lvout" ] || return 0
+  n=0; warn=""
+  while read -r lv attr _bhsize _bhpool pct _bhrest; do
+    [ -n "$lv" ] || continue
+    n=$(( n + 1 ))
+    case "$attr" in t*) : ;; *) continue ;; esac   # lv_attr[1]=='t' => thin pool
+    case "$pct" in ''|*[!0-9.]*) continue ;; esac
+    pct="${pct%%.*}"                                # floor 85.50 -> 85
+    case "$pct" in ''|*[!0-9]*) continue ;; esac
+    [ "$pct" -ge 80 ] || continue
+    warn="${warn:+$warn | }thinpool $lv: ${pct}% used (overprovision risk)"
+  done <<< "$lvout"
+  if [ -n "$warn" ]; then
+    BH_LVM_TXT="$warn"
+  elif [ "$n" -gt 0 ]; then
+    BH_LVM_TXT="lvm: $n lv"
+  fi
+  return 0
+}
+
+# bhv5c7_health — v5.0 entry point, called at the END of gather_storage_map():
+# fills BH_QUEUE_MATRIX / BH_MDRAID_TXT / BH_ZFS_TXT / BH_BTRFS_TXT /
+# BH_LVM_TXT. Budget <1s (sysfs reads + at most 3 guarded external CLIs).
+bhv5c7_health() {
+  bhv5c7_queue_matrix
+  bhv5c7_mdraid
+  bhv5c7_zfs
+  bhv5c7_btrfs
+  bhv5c7_lvm
   return 0
 }
 
@@ -460,6 +708,9 @@ gather_storage_map() {
   trs="${BH_TRIM_SUPPORT:-}"
   [ -n "$trs" ] || trs="?"   # owned by 50-disk.sh; not recomputed here
   BH_STORAGE_SUMMARY="root=${BH_ROOT_CLASS:-unknown} stack=$stackwords zram=$zr trim=$trs"
+
+  # ============ v5.0 (C07): storage health extras (H1-H5) ============
+  bhv5c7_health
 
   return 0
 }

@@ -3,7 +3,7 @@
 # =====================================================================
 # shellcheck shell=bash
 
-BH_VERSION="4.0.0"
+BH_VERSION="5.0.0"
 BH_TOOL="blackhole-vps-bench"
 BH_REPO="victoryvpsvn-star/blackhole-discord-terminal"
 
@@ -29,6 +29,12 @@ BH_SKIP="${BH_SKIP:-}"               # comma list: skip these modules
 BH_PROM_OUT="${BH_PROM_OUT:-}"       # prometheus textfile output path
 BH_COMPARE_IN="${BH_COMPARE_IN:-}"   # previous JSON report for run-to-run diff
 BH_PORT_PROBE="${BH_PORT_PROBE:-1}"  # 1 = outbound port viability checks (auto-off in fast/sec)
+# v5 additions
+BH_QUIET="${BH_QUIET:-0}"           # 1 = log() silent, print only final summary (sinks unaffected)
+BH_TIMING_OUT="${BH_TIMING_OUT:-}"  # --timing PATH: TSV module wall-time table
+BH_BADGE_OUT="${BH_BADGE_OUT:-}"    # --badge PATH: shields.io endpoint JSON
+BH_SVG_OUT="${BH_SVG_OUT:-}"        # --svg PATH: static SVG gauge chart
+BH_HISTORY="${BH_HISTORY:-1}"       # 0 = disable run-history TSV append
 
 # ------- colors (report bodies stay ANSI-free; only the banner gets color on a TTY) -------
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "$BH_NO_COLOR" != "1" ]; then
@@ -39,7 +45,7 @@ else
 fi
 
 # ------- logging -------
-log()  { printf '[%s] %s\n' "$BH_TOOL" "$*" >&2; }
+log()  { [ "$BH_QUIET" = "1" ] && return 0; printf '[%s] %s\n' "$BH_TOOL" "$*" >&2; }
 warn() { printf '[%s] WARN: %s\n' "$BH_TOOL" "$*" >&2; }
 die()  { printf '[%s] ERROR: %s\n' "$BH_TOOL" "$*" >&2; exit "${2:-2}"; }
 
@@ -224,3 +230,54 @@ json_val() { # quote unless it matches a strict JSON number: ^-?[0-9]+(\.[0-9]+)
 # ------- misc -------
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 awk_min2() { awk -v a="$1" -v b="$2" 'BEGIN{ if (b+0<a+0) print b; else print a }'; }
+
+# =====================================================================
+# v5 helpers (shared contract — used by modules and 99-main wiring)
+# =====================================================================
+
+# bh_timed NAME CMD... — run a gather/bench entry point, record wall-time ms
+# into BH_TIMINGS ("name:ms name:ms ..."). Preserves the command's exit code.
+BH_TIMINGS="${BH_TIMINGS:-}"
+bh_timed() {
+  local name="$1"; shift
+  local t0 rc dt
+  t0=$(now_ms)
+  "$@"
+  rc=$?
+  dt=$(( $(now_ms) - t0 ))
+  BH_TIMINGS="${BH_TIMINGS}${BH_TIMINGS:+ }${name}:${dt}"
+  return $rc
+}
+
+# bh_timing_table — render BH_TIMINGS sorted by ms desc: one "name   N ms" line.
+bh_timing_table() {
+  local t
+  for t in $BH_TIMINGS; do
+    printf '%s\n' "$t"
+  done | sort -t: -k2 -rn | awk -F: '{ printf "  %-12s %6s ms\n", $1, $2 }'
+}
+
+# bh_psi [FILEPREFIX] — parse PSI (Pressure Stall Information).
+# Returns one line: "cpu s=0.00 f=0.00 | mem s=0.00 f=0.00 | io s=0.00 f=0.00"
+# or "off" when PSI is unavailable (kernel <4.20, psi=0, file missing).
+# Optional arg 1: absolute path prefix for testability (e.g. a fixture dir
+# containing cpu/memory/io fixture files); default /proc/pressure.
+bh_psi() {
+  local base="${1:-/proc/pressure}" f name some full line sec
+  local out=""
+  for name in cpu memory io; do
+    f="$base/$name"
+    if [ -r "$f" ]; then
+      some=""; full=""
+      while IFS= read -r line; do
+        case "$line" in
+          some*) some=$(printf '%s\n' "$line" | awk '{ for (i=1;i<=NF;i++) if ($i ~ /^avg10=/) { sub(/^avg10=/, "", $i); print $i } }') ;;
+          full*) full=$(printf '%s\n' "$line" | awk '{ for (i=1;i<=NF;i++) if ($i ~ /^avg10=/) { sub(/^avg10=/, "", $i); print $i } }') ;;
+        esac
+      done < "$f"
+      case "$name" in cpu) [ -z "$full" ] && full="n/a" ;; esac
+      out="${out}${out:+ | }${name} s=${some:-n/a} f=${full:-n/a}"
+    fi
+  done
+  [ -n "$out" ] && printf '%s\n' "$out" || printf 'off\n'
+}

@@ -12,6 +12,11 @@
 # settings, fs.protected_* race sysctls, legacy network-daemon packages,
 # sudo/pkexec version age (INFO only), configured umask, forensics
 # toolkit presence.
+# Checks (v5 stage 2, C09): second-pass kernel sysctls (mmap_min_addr,
+# sysrq bitmask, perf_event_paranoid, kexec_load_disabled,
+# unprivileged_userns_clone), kernel lockdown mode, kernel taint decode,
+# world-writable entries under /etc. All passive; absent sysctls/files
+# (old kernels, hardened containers) are skipped silently.
 # Offline contract: when BH_NO_NET=1 nothing here touches the network —
 # apt reads are cache-only and stay, but dnf/yum check-update (which
 # refreshes repo metadata over the network) is skipped entirely.
@@ -49,6 +54,16 @@ BH_SEC_PKEXEC_VER="unknown"    # first line of `pkexec --version` (INFO-level on
 BH_SEC_UMASK="n/a"             # "UMASK=NN (source)" (+ WARN:permissive) | "unset→distro default"
 BH_SEC_FORENSICS="n/a"         # rkhunter/chkrootkit/clamscan/freshclam/aide found | "none"
 BH_SEC_SCAN_DIRS=""            # internal: resolved bin dirs (≤3) shared by the X1/X2 scans
+
+# ---- v5 hardening globals (stage 2, C09; raw values, report layer may read) ----
+BH_SEC_MMAP_MIN="n/a"   # vm.mmap_min_addr raw ("n/a" = file absent/unreadable)
+BH_SEC_SYSRQ="n/a"      # kernel.sysrq raw bitmask
+BH_SEC_PERF_PAR="n/a"   # kernel.perf_event_paranoid raw (may be negative)
+BH_SEC_KEXEC="n/a"      # kernel.kexec_load_disabled raw ("n/a" = file absent)
+BH_SEC_USERNS="n/a"     # kernel.unprivileged_userns_clone raw ("n/a" = absent)
+BH_SEC_LOCKDOWN="n/a"   # none | integrity | confidentiality | "n/a" (absent)
+BH_SEC_TAINT="n/a"      # "0" | "N (W warning)" | "N (P proprietary…)" | "n/a"
+BH_SEC_ETC_WW="n/a"     # "0" | "N: path1 path2 path3" — world-writable under /etc
 
 # Standalone-sourceable: the real sec_line lives in 80-ssh.sh. When this
 # module is sourced on its own (tests, one-off debugging) provide a quiet
@@ -663,6 +678,190 @@ sec_hardening_forensics() {
   fi
 }
 
+# =====================================================================
+# v5 stage 2 (C09) — second-pass kernel hardening + /etc write audit.
+# Strictly read-only; every backing file/sysctl is probed for existence
+# first and missing pieces are skipped silently (old kernels, unprivi-
+# leged containers, hardened /sys). Deliberately does NOT re-touch the
+# v3 sysctls above (kptr/dmesg/bpf/yama live in sec_hardening_sysctl).
+# =====================================================================
+
+# bhv5c9_in_container — best-effort container probe (docker/lxc/podman/k8s)
+bhv5c9_in_container() {
+  [ -f /.dockerenv ] && return 0
+  [ -f /run/.containerenv ] && return 0
+  grep -qaE 'docker|lxc|containerd|kubepods|libpod|podman' /proc/1/cgroup 2>/dev/null && return 0
+  return 1
+}
+
+bhv5c9_stage2_sysctl() {
+  local v
+  # vm.mmap_min_addr — 0 lets unprivileged users map page 0 (NULL-deref bait)
+  v="$(cat /proc/sys/vm/mmap_min_addr 2>/dev/null)"
+  case "$v" in ''|*[!0-9]*) : ;; *)
+    v=$(( 10#$v ))
+    BH_SEC_MMAP_MIN="$v"
+    if [ "$v" -eq 0 ]; then
+      sec_line bad "mmap_min_addr=0 — page-0 mmap allowed for unprivileged users (NULL-deref exploit bait)"
+    else
+      sec_line ok "mmap_min_addr=$v — low virtual-memory mappings blocked"
+    fi
+  ;; esac
+  # kernel.sysrq — decode the magic-SysRq bitmask (bit 64 sync, 128 reboot)
+  v="$(cat /proc/sys/kernel/sysrq 2>/dev/null)"
+  case "$v" in ''|*[!0-9]*) : ;; *)
+    v=$(( 10#$v ))
+    BH_SEC_SYSRQ="$v"
+    if [ "$v" -eq 0 ]; then
+      sec_line ok "sysrq disabled (kernel.sysrq=0)"
+    elif [ $(( v & 128 )) -ne 0 ] || [ $(( v & 64 )) -ne 0 ]; then
+      sec_line warn "kernel.sysrq=$v — reboot/poweroff via sysrq enabled (bits 64/128 set); set kernel.sysrq=0"
+    else
+      sec_line info "kernel.sysrq=$v (limited bitmask — no reboot/poweroff bit)"
+    fi
+  ;; esac
+  # kernel.perf_event_paranoid — <=1 hands profiling counters to non-root;
+  # only a WARN on boxes that actually have interactive (multi-)users
+  v="$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null)"
+  case "$v" in ''|*[!0-9-]*) : ;; *)
+    case "$v" in -*) case "${v#-}" in ''|*[!0-9]*) : ;; *)
+      BH_SEC_PERF_PAR="$v"
+      bhv5c9_perf_verdict "$v"
+    ;; esac ;; *)
+      BH_SEC_PERF_PAR="$v"
+      bhv5c9_perf_verdict "$v"
+    ;; esac
+  ;; esac
+  # kernel.kexec_load_disabled — 0 means runtime kernel replacement is open
+  v="$(cat /proc/sys/kernel/kexec_load_disabled 2>/dev/null)"
+  case "$v" in ''|*[!0-9]*) : ;; *)
+    v=$(( 10#$v ))
+    BH_SEC_KEXEC="$v"
+    if [ "$v" -eq 0 ]; then
+      sec_line info "kexec_load_disabled=0 — runtime kernel replacement permitted (set 1 to harden)"
+    else
+      sec_line ok "kexec_load_disabled=1 — runtime kexec loads blocked"
+    fi
+  ;; esac
+  # kernel.unprivileged_userns_clone (Debian/Ubuntu patch; absent elsewhere)
+  v="$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null)"
+  case "$v" in ''|*[!0-9]*) : ;; *)
+    v=$(( 10#$v ))
+    BH_SEC_USERNS="$v"
+    if [ "$v" -eq 0 ]; then
+      sec_line ok "unprivileged_userns_clone=0 — unprivileged user namespaces blocked"
+    elif bhv5c9_in_container; then
+      sec_line info "unprivileged_userns_clone=1 (container) — userns sandboxing open to all users"
+    else
+      sec_line info "unprivileged_userns_clone=1 — userns sandboxing open to all users"
+    fi
+  ;; esac
+}
+
+# bhv5c9_perf_verdict N — verdict for a validated (possibly negative)
+# perf_event_paranoid value. Split out so the caller stays flat.
+bhv5c9_perf_verdict() {
+  local users
+  if [ "$1" -ge 2 ]; then
+    sec_line ok "perf_event_paranoid=$1 — kernel profiling restricted to root"
+    return 0
+  fi
+  users="$(awk -F: '$3+0>=1000 && $7 !~ /(false|nologin|sync|halt|shutdown)$/ {n++} END {print n+0}' /etc/passwd 2>/dev/null)"
+  case "$users" in ''|*[!0-9]*) users=0 ;; esac
+  if [ "$users" -gt 0 ]; then
+    sec_line warn "perf_event_paranoid=$1 with $users interactive account(s) — perf counters open to non-root (info leak); set kernel.perf_event_paranoid=2"
+  else
+    sec_line info "perf_event_paranoid=$1 (single-user box — acceptable)"
+  fi
+}
+
+# lockdown — /sys/kernel/security/lockdown reads e.g. "none [integrity]
+# confidentiality"; the bracketed token is the ACTIVE mode.
+bhv5c9_stage2_lockdown() {
+  [ -r /sys/kernel/security/lockdown ] || return 0
+  local mode
+  mode="$(awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^\[.*\]$/) { gsub(/[][]/, "", $i); print $i; exit } }' /sys/kernel/security/lockdown 2>/dev/null)"
+  [ -n "$mode" ] || return 0
+  BH_SEC_LOCKDOWN="$mode"
+  case "$mode" in
+    integrity|confidentiality) sec_line ok "kernel lockdown: $mode (write-protected kernel interfaces)" ;;
+    *) sec_line info "kernel lockdown: $mode (inactive — boot with 'lockdown=integrity' to harden)" ;;
+  esac
+}
+
+# taint — /proc/sys/kernel/tainted bitfield. Only hardware/kernel-fault
+# bits (4 M, 5 B, 7 D, 9 W, 14 L) WARN; proprietary-module bits (0 P,
+# 12 O, 13 E) are INFO-only because they are VPS-common and benign.
+bhv5c9_stage2_taint() {
+  local t wtxt="" itxt="" bit
+  t="$(cat /proc/sys/kernel/tainted 2>/dev/null)"
+  case "$t" in ''|*[!0-9]*) return 0 ;; esac
+  t=$(( 10#$t ))
+  if [ "$t" -eq 0 ]; then
+    BH_SEC_TAINT="0"
+    sec_line ok "kernel untainted (taint=0)"
+    return 0
+  fi
+  bit=4;  [ $(( t & (1 << bit) )) -ne 0 ] && wtxt="M machine-check"
+  bit=5;  [ $(( t & (1 << bit) )) -ne 0 ] && wtxt="${wtxt:+$wtxt, }B bad-page"
+  bit=7;  [ $(( t & (1 << bit) )) -ne 0 ] && wtxt="${wtxt:+$wtxt, }D oops"
+  bit=9;  [ $(( t & (1 << bit) )) -ne 0 ] && wtxt="${wtxt:+$wtxt, }W warning"
+  bit=14; [ $(( t & (1 << bit) )) -ne 0 ] && wtxt="${wtxt:+$wtxt, }L lockup"
+  bit=0;  [ $(( t & (1 << bit) )) -ne 0 ] && itxt="P proprietary"
+  bit=12; [ $(( t & (1 << bit) )) -ne 0 ] && itxt="${itxt:+$itxt, }O out-of-tree"
+  bit=13; [ $(( t & (1 << bit) )) -ne 0 ] && itxt="${itxt:+$itxt, }E unsigned"
+  if [ -n "$wtxt" ]; then
+    BH_SEC_TAINT="$t ($wtxt)"
+    sec_line warn "kernel tainted: taint=$t ($wtxt) — check dmesg for the source"
+  elif [ -n "$itxt" ]; then
+    BH_SEC_TAINT="$t ($itxt)"
+    sec_line info "kernel tainted: taint=$t ($itxt) — proprietary/out-of-tree modules (VPS-common)"
+  else
+    BH_SEC_TAINT="$t (unclassified)"
+    sec_line info "kernel tainted: taint=$t (bits outside M/B/D/W/L/P/O/E)"
+  fi
+}
+
+# /etc world-writables — files with o+w and dirs with o+w and no sticky
+# bit (same predicate as sec_hardening_path_ww, but rooted at /etc).
+bhv5c9_stage2_etcww() {
+  BH_SEC_ETC_WW="n/a"
+  if ! command_exists find; then
+    sec_line info "/etc world-writable scan skipped (find unavailable)"
+    return 0
+  fi
+  local out rc n disp trunc=0
+  out="$(bh_run_to 3 find /etc -xdev \( -type f -perm -0002 -o -type d -perm -0002 \! -perm -1000 \) -print)"
+  rc=$?
+  n="$(printf '%s\n' "$out" | sed '/^$/d' | wc -l | tr -d ' ')"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  if [ "$n" -eq 0 ]; then
+    if [ -z "$out" ] && [ "$rc" -gt 1 ]; then
+      sec_line info "/etc world-writable scan failed (find rc=$rc)"
+      return 0                      # BH_SEC_ETC_WW stays "n/a"
+    fi
+    BH_SEC_ETC_WW="0"
+    sec_line ok "/etc: no world-writable files / unsticky dirs"
+    return 0
+  fi
+  disp="$(printf '%s\n' "$out" | sed '/^$/d' | head -n 3 | tr '\n' ' ')"
+  disp="${disp% }"
+  [ ${#disp} -gt 140 ] && { disp="${disp:0:140}"; trunc=1; }
+  [ "$n" -gt 3 ] && trunc=1
+  [ "$trunc" = "1" ] && disp="$disp …"
+  BH_SEC_ETC_WW="$n: $disp"
+  sec_line warn "/etc world-writable entries: $BH_SEC_ETC_WW — root-escalation bait"
+}
+
+# bhv5c9_stage2 — v5 stage-2 orchestrator (called at the end of sec_hardening)
+bhv5c9_stage2() {
+  bhv5c9_stage2_sysctl
+  bhv5c9_stage2_lockdown
+  bhv5c9_stage2_taint
+  bhv5c9_stage2_etcww
+  return 0
+}
+
 # sec_hardening — entry point called (guarded) at the end of sec_audit.
 # Every verdict goes through sec_line; posture counting is automatic.
 sec_hardening() {
@@ -684,5 +883,7 @@ sec_hardening() {
   sec_hardening_versions
   sec_hardening_umask
   sec_hardening_forensics
+  # v5 stage 2 (C09) — lockdown/taint + 2nd-pass sysctls + /etc write audit
+  bhv5c9_stage2
   return 0
 }

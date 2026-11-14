@@ -254,5 +254,26 @@ blackhole-vps-bench detect    # KVM hay Docker? — 1 giây, có bằng chứng
 
 CI tự test tool trên GitHub Actions (ubuntu host + container Alpine/Debian/Rocky/Fedora, shellcheck, hàng tuần theo cron) và có workflow riêng để **bench VPS thật qua SSH** — chi tiết xem [`vps-bench/README.md`](vps-bench/README.md).
 
+### v5.0.0 — dò sâu hơn (45 tính năng mới, build bởi pipeline 10→5→15 AI agent)
+
+Bản nâng cấp "bá hơn" do **10 idea agent đề xuất → 5 review agent chấm → 15 coder agent code song song** (quy trình ghi đầy đủ trong [`docs/INTERNAL_PLAN.md`](docs/INTERNAL_PLAN.md)). Nổi bật:
+
+- **Đối chiếu spec "provider có lừa mình không"** (`24-speccheck.sh`): bảng spec chính thức nhúng sẵn (AWS t3/t4g, GCP e2, Azure B-series, DO, Hetzner cx/cpx, Scaleway, Vultr, Linode, OCI, UpCloud) so với vCPU/RAM đo được → ✓/⚠/✗ từng chiều + gắn cờ burstable ("bench peak ≠ sustain").
+- **Fingerprint VMM sâu** (`10-detect.sh`): phát hiện QEMU TCG (CPU bị **emulate**, không KVM accel), DMI spoofed, PCI vendor census, kernel module census, `dmesg Hypervisor detected`, ACPI OEM ID, Xen version, ARM device-tree, cmdline Firecracker.
+- **Container/K8s đối chất** (`25/26`): runtime pinpoint (docker/containerd/cri-o/podman + container ID), **namespace k8s từ resolv.conf**, serviceaccount (tồn tại — không bao giờ in token), pod UID, uid_map (rootless "root nhưng vô quyền"), seccomp mode, PSI pressure.
+- **Bench khoa học hơn**: **fsync durability p50/p99** (số quyết định cho DB/etcd), memory latency (pointer-chase ns/hop), page-fault rate, pipe ping-pong µs, stat syscall rate (máy dò sandbox gVisor/FUSE), **cgroup CPU throttle % + A/B noisy-neighbor**, sqlite insert/s.
+- **Network intelligence**: clock skew qua HTTPS header (trôi >5s = cert/cron hỏng), egress proxy/tunnel tell, PTR class (email reputation), path-MTU (tunnel overhead), **DNS hijack test**, TCP jitter, conntrack, TLS handshake ms.
+- **Security mở rộng**: sysctl stage2 (mmap_min_addr/sysrq/perf/kexec), kernel lockdown+taint decode, /etc world-writable, PAM 2FA/lockout, EDR census, **cron pipe-to-shell triage**, reboot-required, journald volatility, **malware hunt** (process chạy binary trong /tmp/deleted).
+- **SSH audit lỗ hổng mới vá**: `sshd -t` (config INVALID → restart sẽ mất SSH), **declared-vs-effective** (bắt Match/drop-in override), socket-activation FP fix (Ubuntu 24.04), DSA/weak-key quét thủ công (OpenSSH 9.8), host key audit, MFA signals.
+- **Storage health**: SMART/NVMe wear+temp (root), mount flags matrix, inode pressure, mdraid degraded, ZFS pool, btrfs errs, LVM thin overprovision, fstrim timer.
+- **UX**: TOP TIPS engine (3 lệnh fix cá nhân hoá), truth-strip machine-readable, fingerprint tag (`docker/debian13/2c4g/s375`), shields.io badge (`--badge`), SVG gauge (`--svg`), run history + sparkline ▁▂▅█ (`--history`), per-module timing X-ray (`--timing`), `--quiet`.
+
+```sh
+blackhole-vps-bench all                    # full: detect + bench + sec
+blackhole-vps-bench detect                 # 1 giây — verdict + bằng chứng
+blackhole-vps-bench all --fast --json r.json --badge b.json --svg s.svg
+blackhole-vps-bench sec --fail-on warn     # CI gate an ninh
+```
+
 ## License
 MIT — dùng thoải mái. Đừng quên: user token = rủi ro ToS, tự chịu trách nhiệm nhé.

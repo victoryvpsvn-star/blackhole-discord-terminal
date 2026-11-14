@@ -239,6 +239,53 @@ bh_redact_sink() {
         ;;
     esac
   fi
+  # ---- v5 redaction (C14): container/runtime + net identity + hardware ----
+  # Idempotency: every branch skips values already carrying a mask marker
+  # ("redacted" / trailing ellipsis), so chained emitters cannot double-mask.
+  if [ -n "${BH_RT_CTR_ID:-}" ]; then
+    case "$BH_RT_CTR_ID" in
+      *"…"*) : ;;
+      *)     BH_RT_CTR_ID="${BH_RT_CTR_ID:0:8}…" ;;   # 8-char prefix + ellipsis
+    esac
+  fi
+  if [ -n "${BH_POD_UID:-}" ]; then
+    case "$BH_POD_UID" in
+      *"…"*) : ;;
+      *)     BH_POD_UID="${BH_POD_UID:0:8}…" ;;
+    esac
+  fi
+  if [ -n "${BH_PTR_HOST:-}" ]; then
+    case "$BH_PTR_HOST" in
+      *redacted*) : ;;
+      *)
+        if [ -n "${BH_PTR_CLASS:-}" ]; then
+          BH_PTR_HOST="${BH_PTR_CLASS} (host redacted)"   # keep class only
+        else
+          BH_PTR_HOST="<redacted-ptr>"
+        fi ;;
+    esac
+  fi
+  if [ -n "${BH_K8S_CTX:-}" ]; then
+    case "$BH_K8S_CTX" in
+      *redacted*) : ;;
+      */*)        BH_K8S_CTX="${BH_K8S_CTX%%/*}/<redacted-domain>" ;;  # ns ok, domain masked
+      *.*)        BH_K8S_CTX="<redacted-domain>" ;;
+    esac
+  fi
+  if [ -n "${BH_DIMM_TXT:-}" ]; then
+    # DIMM text is already serial-free in v5; scrub defensively anyway
+    case "$BH_DIMM_TXT" in
+      *redacted*) : ;;
+      *) BH_DIMM_TXT="$(printf '%s' "$BH_DIMM_TXT" | sed 's/[Ss][Nn][:=][A-Za-z0-9_-]\{4,\}/SN=<redacted>/g')" ;;
+    esac
+  fi
+  if [ -n "${BH_CLOUD_META2:-}" ]; then
+    case "$BH_CLOUD_META2" in
+      *redacted*) : ;;
+      *) BH_CLOUD_META2="$(printf '%s' "$BH_CLOUD_META2" \
+           | sed -e 's/i-[0-9a-fA-F]\{8,\}/<redacted-id>/g' -e 's/[0-9a-fA-F]\{16,\}/<redacted-id>/g')" ;;
+    esac
+  fi
   return 0
 }
 
@@ -311,6 +358,540 @@ bh_share_card() {
 
 # bh_compute_verdicts — render-time derivations shared by every sink.
 bh_compute_verdicts() { bh_oversell_verdict; bh_share_card; return 0; }
+
+# ======================================================= v5.0 (C14) =========
+# v5 render helpers — same contract as the v4 block above: pure render logic,
+# every module global ${BH_X:-} guarded, every new global referenced with a
+# default so the tool never crashes under `set -u` when an optional module
+# did not run. Private helpers carry the bhv5c14_ prefix; the two public
+# entry points (bh_fingerprint / bh_fp_sanitize) are consumed by selftest.
+BH_ORCH=""   # runtime orchestrator (assigned at runtime by 25-env; default for lint/set -u)
+
+# bh_fp_sanitize TOKEN — fingerprint token sanitizer (PURE, stdout only):
+# lowercase, map anything outside [A-Za-z0-9._-] to '_', collapse '//' runs,
+# return EMPTY for empty/private/identity-looking tokens (selftest-covered).
+bh_fp_sanitize() {
+  local s="${1:-}"
+  [ -n "$s" ] || return 0
+  case "$s" in
+    *redacted*|*private*|*Private*|*reserved*|*Reserved*|*internal*) return 0 ;;
+    10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*|127.*|169.254.*|fc*|fd*) return 0 ;;
+    10-*|192-168-*|127-*) return 0 ;;
+  esac
+  # collapse '//' runs first (so a slash never survives into the joined tag),
+  # then lowercase and map everything outside [A-Za-z0-9._-] to '_'
+  s="$(printf '%s' "$s" | sed 's;//*;/;g' | tr '[:upper:]' '[:lower:]' | tr -c 'A-Za-z0-9._-' '_')"
+  case "$s" in
+    *[!._-]*) printf '%s' "$s" ;;
+    *) : ;;
+  esac
+  return 0
+}
+
+# bh_fingerprint — machine-tag one-liner into BH_FINGERPRINT (no "tag: " prefix;
+# build_report renders "  tag: $BH_FINGERPRINT" and build_json the "fingerprint" key):
+#   "kvm/aws/t3.medium/ubuntu-22.04/2c4g/500mbps/s612"
+# Empty/private tokens are skipped (no empty "//" slots).
+bh_fingerprint() {
+  BH_FINGERPRINT=""
+  local tok out="" _g
+  tok="$(bh_fp_sanitize "${BH_TYPE:-}")"
+  [ -n "$tok" ] || tok="$(bh_fp_sanitize "${BH_KIND:-}")"
+  [ -n "$tok" ] && out="$tok"
+  tok="$(bh_fp_sanitize "${BH_CLOUD:-}")"
+  [ -n "$tok" ] && out="${out:+$out/}$tok"
+  tok="$(bh_fp_sanitize "${BH_CLOUD_DETAIL:-}")"
+  [ -n "$tok" ] && out="${out:+$out/}$tok"
+  tok="$(bh_fp_sanitize "${BH_OS:-}")"
+  [ -n "$tok" ] && out="${out:+$out/}$tok"
+  if [ -n "${BH_EFF_CORES:-}" ] && [ "${BH_EFF_CORES:-0}" -ge 1 ] 2>/dev/null &&
+     [ -n "${BH_MEM_TOTAL_MB:-}" ] && [ "${BH_MEM_TOTAL_MB:-0}" -gt 0 ] 2>/dev/null; then
+    _g="$(awk -v m="${BH_MEM_TOTAL_MB:-0}" 'BEGIN{printf "%.0f", m/1024}')"
+    out="${out:+$out/}${BH_EFF_CORES:-?}c${_g}g"
+  fi
+  case "${BH_DOWN_MBPS:-}" in
+    ''|*[!0-9.]*) : ;;
+    *) out="${out:+$out/}$(awk -v d="${BH_DOWN_MBPS:-}" 'BEGIN{printf "%.0fmbps", d+0}')" ;;
+  esac
+  case "${BH_SCORE_TOTAL:-0}" in
+    ''|0|*[!0-9]*) : ;;
+    *) out="${out:+$out/}s${BH_SCORE_TOTAL:-0}" ;;
+  esac
+  BH_FINGERPRINT="$out"
+  return 0
+}
+
+# bhv5c14_truth_strip — machine-greppable honesty strip built from the v4
+# globals (steal-under-load / efficiency / live busy / net tries-loss) plus
+# the new v5 signals (cgroup throttling, KSM, PSI):
+#   "truth: cpu=ok mem=ok disk=warn net=ok"   (values: ok|warn|bad)
+bhv5c14_truth_strip() {
+  local cpu="ok" mem="ok" disk="ok" net="ok" _psiv
+  case "${BH_STEAL_UNDER_LOAD:-}" in
+    ''|*[!0-9.]*) : ;;
+    *) awk -v s="${BH_STEAL_UNDER_LOAD:-}" 'BEGIN{exit !(s+0>5)}' 2>/dev/null && cpu="bad" ;;
+  esac
+  if [ "$cpu" != "bad" ]; then
+    case "${BH_STEAL_PCT:-}" in
+      ''|*[!0-9.]*) : ;;
+      *) awk -v s="${BH_STEAL_PCT:-}" 'BEGIN{exit !(s+0>5)}' 2>/dev/null && cpu="warn" ;;
+    esac
+  fi
+  if [ "$cpu" != "bad" ]; then
+    case "${BH_CPU_EFFICIENCY:-}" in
+      ''|*[!0-9.]*) : ;;
+      *)
+        if awk -v e="${BH_CPU_EFFICIENCY:-}" 'BEGIN{exit !(e+0<50)}' 2>/dev/null; then cpu="bad"
+        elif awk -v e="${BH_CPU_EFFICIENCY:-}" 'BEGIN{exit !(e+0<75)}' 2>/dev/null; then cpu="warn"
+        fi ;;
+    esac
+  fi
+  if [ "$cpu" != "bad" ] && [ "$cpu" != "warn" ]; then
+    case "${BH_THROTTLE_PCT:-}" in
+      ''|*[!0-9.]*) : ;;
+      *) awk -v t="${BH_THROTTLE_PCT:-}" 'BEGIN{exit !(t+0>5)}' 2>/dev/null && cpu="warn" ;;
+    esac
+  fi
+  case "${BH_KSM_SHARING:-}" in
+    ''|*[!0-9]*) : ;;
+    *) [ "${BH_KSM_SHARING:-0}" -gt 0 ] 2>/dev/null && mem="warn" ;;
+  esac
+  if [ "$mem" != "warn" ]; then
+    case "${BH_PSI_TXT:-}" in
+      *"mem s="*)
+        _psiv="$(awk -v t="${BH_PSI_TXT:-}" 'BEGIN{
+          if (match(t, /mem s=[0-9.]+/)) print substr(t, RSTART + 6, RLENGTH - 6)
+        }' 2>/dev/null)"
+        case "$_psiv" in
+          ''|*[!0-9.]*) : ;;
+          *) awk -v v="$_psiv" 'BEGIN{exit !(v+0>10)}' 2>/dev/null && mem="warn" ;;
+        esac ;;
+    esac
+  fi
+  case "${BH_LIVE_BUSY_PCT:-}" in
+    ''|*[!0-9.]*) : ;;
+    *) awk -v b="${BH_LIVE_BUSY_PCT:-}" 'BEGIN{exit !(b+0>85)}' 2>/dev/null && disk="warn" ;;
+  esac
+  [ -n "${BH_DISK_WARN:-}" ] && disk="warn"
+  case "${BH_NET_TRIES:-}" in
+    *:fail*) net="bad" ;;
+  esac
+  case "${BH_PACKET_LOSS:-}" in
+    ""|"0%"|"0.0%"|"n/a (no icmp)") : ;;
+    *) net="warn" ;;
+  esac
+  BH_TRUTH="truth: cpu=$cpu mem=$mem disk=$disk net=$net"
+  return 0
+}
+
+# bhv5c14_chip_rpt CHIP TEXT — rpt with the house chip padding
+# ("  [OK]   t" / "  [WARN] t" / "  [BAD]  t"; empty chip -> plain dim line).
+bhv5c14_chip_rpt() {
+  case "$1" in
+    "[OK]")   rpt "  [OK]   $2" ;;
+    "[WARN]") rpt "  [WARN] $2" ;;
+    "[BAD]")  rpt "  [BAD]  $2" ;;
+    *)        rpt "  $2" ;;
+  esac
+  return 0
+}
+
+# bhv5c14_verdict_chip VALUE — [OK]/[WARN]/[BAD] for ok/warn/bad, "" otherwise.
+bhv5c14_verdict_chip() {
+  case "$1" in
+    ok)   printf '[OK]' ;;
+    warn) printf '[WARN]' ;;
+    bad)  printf '[BAD]' ;;
+  esac
+  return 0
+}
+
+# ---- [1] virt extras — accel / VMM tells / DMI spoof / Xen / ACPI OEM -------
+bhv5c14_render_virt_extras() {
+  case "${BH_QEMU_ACCEL:-}" in
+    "") : ;;
+    *tcg*|*TCG*) rpt "  [WARN] accel: ${BH_QEMU_ACCEL:-} (EMULATED — benchmarks meaningless)" ;;
+    *)           rpt "  Accel   : ${BH_QEMU_ACCEL:-}" ;;
+  esac
+  [ -n "${BH_VMM_TELLS:-}" ] && rpt "  VMMtells: ${BH_VMM_TELLS:-}"
+  [ "${BH_DMI_SPOOF:-0}" = "1" ] && rpt "  [WARN] DMI contradicts hypervisor evidence — custom/spoofed DMI"
+  [ -n "${BH_XEN_VER:-}" ]  && rpt "  Xen     : ${BH_XEN_VER:-}"
+  [ -n "${BH_ACPI_OEM:-}" ] && rpt "  ACPI OEM: ${BH_ACPI_OEM:-}"
+  return 0
+}
+
+# ---- cloud-init / meta2 / hints / spec lie-check (rendered inside [1]) ------
+bhv5c14_render_cloud_extras() {
+  if [ -n "${BH_CI_CLOUD:-}" ]; then
+    rpt "  cloud-init: ${BH_CI_CLOUD:-}${BH_CI_REGION:+ ${BH_CI_REGION:-}}${BH_CI_AZ:+ ${BH_CI_AZ:-}}"
+  fi
+  [ -n "${BH_CLOUD_META2:-}" ] && rpt "  meta2   : ${BH_CLOUD_META2:-}"
+  local _hints=""
+  [ -n "${BH_RESOLV_HINT:-}" ]    && _hints="resolv: ${BH_RESOLV_HINT:-}"
+  [ -n "${BH_NTP_HINT:-}" ]       && _hints="${_hints:+$_hints · }ntp: ${BH_NTP_HINT:-}"
+  [ -n "${BH_V6_PREFIX_HINT:-}" ] && _hints="${_hints:+$_hints · }v6-prefix: ${BH_V6_PREFIX_HINT:-}"
+  [ -n "$_hints" ] && rpt "  Hints   : $_hints"
+  if [ -z "${BH_SPEC_SUMMARY:-}" ] && [ -z "${BH_SPEC_CPU_V:-}" ] &&
+     [ -z "${BH_SPEC_RAM_V:-}" ] && [ -z "${BH_SPEC_BURST:-}" ]; then
+    return 0
+  fi
+  local _chip _skip=0
+  case "${BH_SPEC_SUMMARY:-}" in
+    "") : ;;
+    *no-plan*) rpt "  plan    : no-plan (provider advertises no specs — nothing to verify)"; _skip=1 ;;
+    *)         rpt "  plan    : ${BH_SPEC_SUMMARY:-}" ;;
+  esac
+  [ "$_skip" = "1" ] && return 0
+  if [ -n "${BH_SPEC_CPU_V:-}" ]; then
+    _chip="$(bhv5c14_verdict_chip "${BH_SPEC_CPU_V%% *}")"
+    bhv5c14_chip_rpt "$_chip" "LIE-CHECK cpu: ${BH_SPEC_CPU_V:-}"
+  fi
+  if [ -n "${BH_SPEC_RAM_V:-}" ]; then
+    _chip="$(bhv5c14_verdict_chip "${BH_SPEC_RAM_V%% *}")"
+    bhv5c14_chip_rpt "$_chip" "LIE-CHECK ram: ${BH_SPEC_RAM_V:-}"
+  fi
+  if [ -n "${BH_SPEC_BURST:-}" ]; then
+    _chip="$(bhv5c14_verdict_chip "${BH_SPEC_BURST%% *}")"
+    bhv5c14_chip_rpt "$_chip" "LIE-CHECK burst: ${BH_SPEC_BURST:-}"
+  fi
+  return 0
+}
+
+# ---- [2] info extras — cache / block queue / NUMA / freq / thermal / DIMM ---
+bhv5c14_render_info_extras() {
+  [ -n "${BH_CACHE_TXT:-}" ]    && rpt "  Cache   : ${BH_CACHE_TXT:-}"
+  [ -n "${BH_BLOCKQ_TXT:-}" ]   && rpt "  BlkQ    : ${BH_BLOCKQ_TXT:-}"
+  [ -n "${BH_NUMA_TXT:-}" ]     && rpt "  NUMA    : ${BH_NUMA_TXT:-}${BH_NUMA_OFFLINE:+ (offline: ${BH_NUMA_OFFLINE:-})}"
+  [ -n "${BH_CPUFREQ_TXT:-}" ]  && rpt "  CpuFreq : ${BH_CPUFREQ_TXT:-}"
+  [ -n "${BH_THERMAL_TXT:-}" ]  && rpt "  Thermal : ${BH_THERMAL_TXT:-}"
+  [ -n "${BH_THROTTLE_CNT:-}" ] && rpt "  Throttle: ${BH_THROTTLE_CNT:-}"
+  [ -n "${BH_HWERR_TXT:-}" ]    && rpt "  HWErr   : ${BH_HWERR_TXT:-}"
+  [ -n "${BH_DIMM_TXT:-}" ]     && rpt "  DIMM    : ${BH_DIMM_TXT:-}"
+  return 0
+}
+
+# ---- [ENV] container / runtime / pressure -----------------------------------
+bhv5c14_render_env_extras() {
+  local _any="${BH_UIDMAP_MODE:-}${BH_SECCOMP_MODE:-}${BH_PSI_TXT:-}${BH_RT_NAME:-}${BH_ORCH:-}${BH_RT_CTR_ID:-}${BH_K8S_CTX:-}${BH_SA_TXT:-}${BH_POD_UID:-}${BH_PROJ_VOL:-}${BH_NS_FP:-}"
+  [ -n "$_any" ] || return 0
+  # open a header only when the v4 [ENV] section did not render
+  if [ -z "${BH_CAPS_CLASS:-}${BH_DEV_MAP:-}${BH_PIDS_MAX:-}${BH_PID1_LSM:-}${BH_CG_CONTROLLERS:-}${BH_RL_NOFILE:-}${BH_OOM_ADJ:-}" ]; then
+    rpt ""
+    rpt "[ENV] container runtime & pressure"
+  fi
+  [ -n "${BH_UIDMAP_MODE:-}" ]  && rpt "  Uidmap  : ${BH_UIDMAP_MODE:-}"
+  [ -n "${BH_SECCOMP_MODE:-}" ] && rpt "  Seccomp : ${BH_SECCOMP_MODE:-}"
+  case "${BH_PSI_TXT:-}" in ""|off) : ;; *) rpt "  PSI     : ${BH_PSI_TXT:-}" ;; esac
+  if [ -n "${BH_RT_NAME:-}" ] || [ -n "${BH_ORCH:-}" ] || [ -n "${BH_RT_CTR_ID:-}" ]; then
+    rpt "  Runtime : ${BH_RT_NAME:-?}${BH_ORCH:+ (${BH_ORCH:-})}${BH_RT_CTR_ID:+ id=${BH_RT_CTR_ID:-}}"
+  fi
+  [ -n "${BH_K8S_CTX:-}" ]  && rpt "  K8s     : ${BH_K8S_CTX:-}"
+  [ -n "${BH_SA_TXT:-}" ]   && rpt "  SvcAcct : ${BH_SA_TXT:-}"
+  [ -n "${BH_POD_UID:-}" ]  && rpt "  PodUID  : ${BH_POD_UID:-}"
+  [ -n "${BH_PROJ_VOL:-}" ] && rpt "  ProjVol : ${BH_PROJ_VOL:-}"
+  [ -n "${BH_NS_FP:-}" ]    && rpt "  NsFp    : ${BH_NS_FP:-}"
+  return 0
+}
+
+# ---- [STORAGE] queue / mdraid / zfs / btrfs / lvm / smart / trim ------------
+bhv5c14_render_storage_extras() {
+  local _any="${BH_QUEUE_MATRIX:-}${BH_MDRAID_TXT:-}${BH_ZFS_TXT:-}${BH_BTRFS_TXT:-}${BH_LVM_TXT:-}${BH_SMART_TXT:-}${BH_NVME_TXT:-}${BH_CG_IO_TXT:-}${BH_MOUNT_FLAGS_TXT:-}${BH_INODE_TXT:-}${BH_FSTRIM_TXT:-}"
+  [ -n "$_any" ] || return 0
+  # open a header only when the v4 [STORAGE] section did not render
+  if [ -z "${BH_STORAGE_SUMMARY:-}${BH_ROOT_STACK:-}" ]; then
+    rpt ""
+    rpt "[STORAGE] extras"
+  fi
+  [ -n "${BH_QUEUE_MATRIX:-}" ]    && rpt "  Queue   : ${BH_QUEUE_MATRIX:-}"
+  [ -n "${BH_MDRAID_TXT:-}" ]      && rpt "  MDRAID  : ${BH_MDRAID_TXT:-}"
+  [ -n "${BH_ZFS_TXT:-}" ]         && rpt "  ZFS     : ${BH_ZFS_TXT:-}"
+  [ -n "${BH_BTRFS_TXT:-}" ]       && rpt "  BTRFS   : ${BH_BTRFS_TXT:-}"
+  [ -n "${BH_LVM_TXT:-}" ]         && rpt "  LVM     : ${BH_LVM_TXT:-}"
+  [ -n "${BH_SMART_TXT:-}" ]       && rpt "  SMART   : ${BH_SMART_TXT:-}"
+  [ -n "${BH_NVME_TXT:-}" ]        && rpt "  NVMeTxt : ${BH_NVME_TXT:-}"
+  [ -n "${BH_CG_IO_TXT:-}" ]       && rpt "  CgIO    : ${BH_CG_IO_TXT:-}"
+  [ -n "${BH_MOUNT_FLAGS_TXT:-}" ] && rpt "  MntFlags: ${BH_MOUNT_FLAGS_TXT:-}"
+  [ -n "${BH_INODE_TXT:-}" ]       && rpt "  Inodes  : ${BH_INODE_TXT:-}"
+  [ -n "${BH_FSTRIM_TXT:-}" ]      && rpt "  Fstrim  : ${BH_FSTRIM_TXT:-}"
+  return 0
+}
+
+# ---- [4] net extras — skew / egress / PTR / PMTU / DNS / jitter / TLS -------
+bhv5c14_render_net_extras() {
+  local _any="${BH_CLOCK_SKEW_S:-}${BH_EGRESS_PROXY:-}${BH_PTR_CLASS:-}${BH_PTR_HOST:-}${BH_PMTU:-}${BH_DNS_NS:-}${BH_DNS_HIJACK:-}${BH_TCP_JITTER:-}${BH_CONNTRACK_PCT:-}${BH_SOCKSTAT_TXT:-}${BH_IPV6_MBPS:-}${BH_TLS_MS:-}"
+  [ -n "$_any" ] || return 0
+  # open a header only when the v4 [4] section did not render
+  if [ -z "${BH_GEO_LOC:-}${BH_GEO_CLO:-}${BH_LAT_MATRIX:-}${BH_NAT_MODE:-}${BH_DNS_MS:-}${BH_PACKET_LOSS:-}${BH_IPV4:-}${BH_IPV6:-}${BH_IP_GEO:-}${BH_IP_ASN:-}${BH_IPV6_GRADE:-}" ]; then
+    rpt ""
+    rpt "[NET] extras"
+  fi
+  case "${BH_CLOCK_SKEW_S:-}" in
+    "") : ;;
+    *[!0-9.+-]*) rpt "  Skew    : clock skew: ${BH_CLOCK_SKEW_S:-}" ;;
+    *)
+      if awk -v s="${BH_CLOCK_SKEW_S:-}" 'BEGIN{ s=(s<0)?-s:s; exit !(s>5) }' 2>/dev/null; then
+        rpt "  [WARN] clock skew: ${BH_CLOCK_SKEW_S:-} (>5s)"
+      else
+        rpt "  Skew    : clock skew: ${BH_CLOCK_SKEW_S:-} [OK]"
+      fi ;;
+  esac
+  [ -n "${BH_EGRESS_PROXY:-}" ]  && rpt "  Egress  : ${BH_EGRESS_PROXY:-}"
+  if [ -n "${BH_PTR_CLASS:-}" ] || [ -n "${BH_PTR_HOST:-}" ]; then
+    rpt "  PTR     : class ${BH_PTR_CLASS:-?} · host ${BH_PTR_HOST:-?}"
+  fi
+  [ -n "${BH_PMTU:-}" ]          && rpt "  PMTU    : ${BH_PMTU:-}"
+  [ -n "${BH_DNS_NS:-}" ]        && rpt "  DNS NS  : ${BH_DNS_NS:-}"
+  case "${BH_DNS_HIJACK:-}" in
+    clean)            rpt "  [OK] DNS: clean (NXDOMAIN + known-host checks passed)" ;;
+    *hijack*|*spoof*) rpt "  [WARN] DNS: ${BH_DNS_HIJACK:-}" ;;
+    ?*)               rpt "  [INFO] DNS: ${BH_DNS_HIJACK:-}" ;;
+  esac
+  [ -n "${BH_TCP_JITTER:-}" ]    && rpt "  Jitter  : ${BH_TCP_JITTER:-}"
+  [ -n "${BH_CONNTRACK_PCT:-}" ] && rpt "  ConnTrk : ${BH_CONNTRACK_PCT:-}"
+  [ -n "${BH_SOCKSTAT_TXT:-}" ]  && rpt "  Socks   : ${BH_SOCKSTAT_TXT:-}"
+  [ -n "${BH_IPV6_MBPS:-}" ]     && rpt "  IPv6 thr: ${BH_IPV6_MBPS:-}"
+  [ -n "${BH_TLS_MS:-}" ]        && rpt "  TLS     : handshake ${BH_TLS_MS:-} ms"
+  return 0
+}
+
+# ---- [3] bench extras — throttle / noisy / memlat / micro-bench / fsync -----
+bhv5c14_render_bench_extras() {
+  if [ -n "${BH_THROTTLE_PCT:-}" ]; then
+    local _thr="  Throttle: ${BH_THROTTLE_PCT:-}%"
+    [ -n "${BH_THROTTLE_NR:-}" ] && _thr="$_thr across ${BH_THROTTLE_NR:-} windows"
+    case "${BH_THROTTLE_PCT:-}" in
+      *[!0-9.]*) rpt "$_thr" ;;
+      *)
+        if awk -v t="${BH_THROTTLE_PCT:-}" 'BEGIN{exit !(t+0>5)}' 2>/dev/null; then
+          rpt "  [WARN] Throttle: cgroup CPU throttling ${BH_THROTTLE_PCT:-}%${BH_THROTTLE_NR:+ across ${BH_THROTTLE_NR:-} windows}"
+        else
+          rpt "$_thr"
+        fi ;;
+    esac
+  fi
+  [ -n "${BH_NOISY_PCT:-}" ]    && rpt "  Noisy   : ${BH_NOISY_PCT:-}"
+  [ -n "${BH_MEM_LAT_NS:-}" ]   && rpt "  MemLat  : ${BH_MEM_LAT_NS:-} ns"
+  [ -n "${BH_PGFAULT_RATE:-}" ] && rpt "  PgFlt   : ${BH_PGFAULT_RATE:-}${BH_PGFAULT_SCOPE:+ (${BH_PGFAULT_SCOPE:-})}"
+  [ -n "${BH_PIPE_US:-}" ]      && rpt "  Pipe    : ${BH_PIPE_US:-} us"
+  [ -n "${BH_SQLITE_RPS:-}" ]   && rpt "  SQLite  : ${BH_SQLITE_RPS:-} rps${BH_SQLITE_BATCH:+ (batch ${BH_SQLITE_BATCH:-})}"
+  [ -n "${BH_STAT_KPS:-}" ]     && rpt "  Stat    : ${BH_STAT_KPS:-} k calls/s"
+  [ -n "${BH_URANDOM_MBPS:-}" ] && rpt "  URand   : ${BH_URANDOM_MBPS:-} MB/s"
+  # fsync durability: p99 >25ms = bad, >10ms = warn, otherwise the plain row
+  if [ -n "${BH_FSYNC_P50_MS:-}" ] || [ -n "${BH_FSYNC_P99_MS:-}" ] || [ -n "${BH_FSYNC_RPS:-}" ]; then
+    local _fs="  Fsync   : p50 ${BH_FSYNC_P50_MS:-?} ms · p99 ${BH_FSYNC_P99_MS:-?} ms"
+    [ -n "${BH_FSYNC_RPS:-}" ] && _fs="$_fs · ${BH_FSYNC_RPS:-} fs/s"
+    case "${BH_FSYNC_P99_MS:-}" in
+      ''|*[!0-9.]*) rpt "$_fs" ;;
+      *)
+        if awk -v v="${BH_FSYNC_P99_MS:-}" 'BEGIN{exit !(v+0>25)}' 2>/dev/null; then
+          rpt "  [BAD]  Fsync   : p99 ${BH_FSYNC_P99_MS:-} ms (>25ms — slow durability)"
+        elif awk -v v="${BH_FSYNC_P99_MS:-}" 'BEGIN{exit !(v+0>10)}' 2>/dev/null; then
+          rpt "  [WARN] Fsync   : p99 ${BH_FSYNC_P99_MS:-} ms (>10ms)"
+        else
+          rpt "$_fs"
+        fi ;;
+    esac
+  fi
+  # run-to-run trend — only when the sparkline module produced data
+  [ -n "${BH_SPARKLINE:-}" ] && rpt "  trend: ${BH_SPARKLINE:-}${BH_TREND:+ ${BH_TREND:-}}"
+  return 0
+}
+
+# ---- [T] TOP TIPS — top 3 records from 63-tips.sh + fix command lines -------
+bhv5c14_render_tips_section() {
+  rpt ""
+  rpt "[T] TOP TIPS"
+  if declare -F bh_tips_engine >/dev/null 2>&1; then
+    bh_tips_engine
+  fi
+  local _rec _sev _title _fix _n=0
+  if [ -n "${BH_TIPS:-}" ]; then
+    while IFS= read -r _rec; do
+      [ -n "$_rec" ] || continue
+      [ "$_n" -lt 3 ] || break
+      _sev="${_rec%%|*}"
+      _title="${_rec#*|}"
+      case "$_title" in
+        *'|'*) _fix="${_title#*|}"; _title="${_title%%|*}" ;;
+        *)     _fix="" ;;
+      esac
+      _n=$((_n + 1))
+      case "$_sev" in
+        bad)  rpt "  [BAD]  $_title" ;;
+        warn) rpt "  [WARN] $_title" ;;
+        *)    rpt "  [INFO]  $_title" ;;
+      esac
+      [ -n "$_fix" ] && rpt "         fix: $_fix"
+    done <<BHV5C14TIPS
+${BH_TIPS:-}
+BHV5C14TIPS
+  fi
+  [ "$_n" -eq 0 ] && rpt "  [INFO]  no tips — nothing flagged by the tips engine"
+  return 0
+}
+
+# ---- sinks: JSON numeric-key helper (skips empty / non-numeric values) ------
+bhv5c14_json_num() { # KEY VALUE — emits "key":<number>, when VALUE is a clean number
+  case "${2:-}" in
+    ''|*[!0-9.]*) return 0 ;;
+  esac
+  case "$(awk -v v="$2" 'BEGIN{print (v ~ /^[0-9]+(\.[0-9]+)?$/) ? "ok" : "no"}' 2>/dev/null)" in
+    ok) printf '"%s":%s,' "$1" "$2" ;;
+  esac
+  return 0
+}
+
+# ---- sinks: Prometheus numeric gauge helper ---------------------------------
+bhv5c14_prom_gauge() { # NAME HELP VALUE — HELP/TYPE/gauge triple, skipped when non-numeric
+  case "${3:-}" in
+    ''|*[!0-9.]*) return 0 ;;
+  esac
+  printf '# HELP %s %s\n# TYPE %s gauge\n%s %s\n' "$1" "$2" "$1" "$1" "$3"
+  return 0
+}
+
+# ---- sinks: shields.io endpoint JSON badge (atomic tmp+mv) ------------------
+build_badge() {
+  [ -n "${BH_BADGE_OUT:-}" ] || return 0
+  case "${BH_BADGE_OUT#-}" in "") return 0 ;; esac
+  local color="lightgrey" msg grade="${BH_GRADE:-}"
+  case "$grade" in
+    S|A) color="good" ;;
+    B)   color="yellowgreen" ;;
+    C)   color="yellow" ;;
+    D)   color="orange" ;;
+    F)   color="red" ;;
+    *)   color="lightgrey" ;;
+  esac
+  if [ -n "$grade" ]; then
+    msg="$(num_or_0 "${BH_SCORE_TOTAL:-0}") | $grade"
+  else
+    msg="$(num_or_0 "${BH_SCORE_TOTAL:-0}")"   # no grade yet -> lightgrey badge
+  fi
+  local tmp="${BH_BADGE_OUT}.tmp" _json
+  _json="$(printf '%s' "$msg" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  {
+    printf '{"schemaVersion":1,"label":"BH-SCORE","message":"%s","color":"%s"}' "$_json" "$color"
+  } > "$tmp" 2>/dev/null
+  if mv -f "$tmp" "${BH_BADGE_OUT}" 2>/dev/null; then
+    log "badge JSON written to ${BH_BADGE_OUT}"
+  else
+    rm -f "$tmp" 2>/dev/null
+    warn "cannot write badge output ${BH_BADGE_OUT}"
+  fi
+  return 0
+}
+
+# ---- sinks: static SVG gauge chart (atomic tmp+mv, pure printf, no deps) ----
+bhv5c14_xml_esc() { # escape & < > for XML text nodes
+  printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
+  return 0
+}
+
+build_svg() {
+  [ -n "${BH_SVG_OUT:-}" ] || return 0
+  case "${BH_SVG_OUT#-}" in "") return 0 ;; esac
+  local color grade="${BH_GRADE:-}" dash tmp bars="" _pair lbl val w y
+  case "$grade" in
+    S|A) color="#4c1" ;;    # shields brightgreen
+    B)   color="#a4a61d" ;; # yellowgreen
+    C)   color="#dfb317" ;; # yellow
+    D)   color="#fe7d37" ;; # orange
+    F)   color="#e05d44" ;; # red
+    *)   color="#9f9f9f" ;; # lightgrey
+  esac
+  # donut arc: circumference 2*pi*80, filled share = total/max (awk float math)
+  dash="$(awk -v t="$(num_or_0 "${BH_SCORE_TOTAL:-0}")" -v m="$(num_or_0 "${BH_SCORE_MAX:-700}")" 'BEGIN{
+    c = 2 * 3.14159265358979 * 80
+    p = (m + 0 > 0) ? t / m : 0
+    if (p < 0) p = 0
+    if (p > 1) p = 1
+    printf "%.2f %.2f", c * p, c - c * p
+  }')"
+  y=46
+  while IFS= read -r _pair; do
+    [ -n "$_pair" ] || continue
+    lbl="${_pair%%|*}"
+    val="${_pair#*|}"
+    case "$val" in ''|*[!0-9.]*) val=0 ;; esac
+    w="$(awk -v v="$val" 'BEGIN{ v=(v<0)?0:v; v=(v>100)?100:v; printf "%.1f", v*0.8 }')"
+    bars="${bars}  <text x=\"230\" y=\"$((y + 9))\" font-family=\"monospace\" font-size=\"11\" fill=\"#444444\">$(bhv5c14_xml_esc "${lbl} ${val}")</text>
+  <rect x=\"330\" y=\"${y}\" width=\"80\" height=\"10\" fill=\"#eeeeee\"/>
+  <rect x=\"330\" y=\"${y}\" width=\"${w}\" height=\"10\" fill=\"${color}\"/>
+"
+    y=$((y + 28))
+  done <<BHV5C14BARS
+CPU 1c|${BH_SCORE_CPU1C:-0}
+CPU mul|${BH_SCORE_CPUMC:-0}
+Memory|${BH_SCORE_MEM:-0}
+Disk seq|${BH_SCORE_DSEQ:-0}
+Disk 4k|${BH_SCORE_D4K:-0}
+Net down|${BH_SCORE_NDOWN:-0}
+Net up|${BH_SCORE_NUP:-0}
+BHV5C14BARS
+  tmp="${BH_SVG_OUT}.tmp"
+  {
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<svg xmlns="http://www.w3.org/2000/svg" width="420" height="260" viewBox="0 0 420 260">\n'
+    printf '  <rect width="420" height="260" fill="#ffffff"/>\n'
+    printf '  <text x="16" y="26" font-family="monospace" font-size="13" fill="#222222">%s</text>\n' \
+      "$(bhv5c14_xml_esc "${BH_TOOL:-blackhole-vps-bench} v${BH_VERSION:-5}")"
+    printf '  <circle cx="110" cy="150" r="80" fill="none" stroke="#e8e8e8" stroke-width="22"/>\n'
+    printf '  <circle cx="110" cy="150" r="80" fill="none" stroke="%s" stroke-width="22" stroke-dasharray="%s" transform="rotate(-90 110 150)" stroke-linecap="butt"/>\n' \
+      "$color" "$dash"
+    printf '  <text x="110" y="146" text-anchor="middle" font-family="monospace" font-size="32" fill="#222222">%s</text>\n' \
+      "$(bhv5c14_xml_esc "$(num_or_0 "${BH_SCORE_TOTAL:-0}")")"
+    printf '  <text x="110" y="170" text-anchor="middle" font-family="monospace" font-size="13" fill="#777777">/ %s · grade %s</text>\n' \
+      "$(bhv5c14_xml_esc "$(num_or_0 "${BH_SCORE_MAX:-700}")")" "$(bhv5c14_xml_esc "${BH_GRADE:-n/a}")"
+    printf '%s\n' "$bars"
+    printf '</svg>\n'
+  } > "$tmp" 2>/dev/null
+  if mv -f "$tmp" "${BH_SVG_OUT}" 2>/dev/null; then
+    log "SVG gauge written to ${BH_SVG_OUT}"
+  else
+    rm -f "$tmp" 2>/dev/null
+    warn "cannot write SVG output ${BH_SVG_OUT}"
+  fi
+  return 0
+}
+
+# ---- sinks: Markdown "## v5 extras" compact table ----------------------------
+bhv5c14_md_row() { # FIELD VALUE — one markdown table row, pipes escaped
+  printf '| %s | %s |\n' "$1" "$(printf '%s' "$2" | sed 's/|/\\|/g')"
+  return 0
+}
+
+bhv5c14_md_extras() {
+  local _any="${BH_QEMU_ACCEL:-}${BH_CI_CLOUD:-}${BH_SPEC_SUMMARY:-}${BH_UIDMAP_MODE:-}${BH_SECCOMP_MODE:-}${BH_RT_NAME:-}${BH_ORCH:-}${BH_MEM_LAT_NS:-}${BH_THROTTLE_PCT:-}${BH_SQLITE_RPS:-}${BH_FSYNC_P99_MS:-}${BH_CLOCK_SKEW_S:-}${BH_EGRESS_PROXY:-}${BH_K8S_CTX:-}${BH_TIPS:-}${BH_FINGERPRINT:-}${BH_TRUTH:-}"
+  [ -n "$_any" ] || return 0
+  printf '\n## v5 extras\n\n| Field | Value |\n|---|---|\n'
+  [ -n "${BH_QEMU_ACCEL:-}" ]   && bhv5c14_md_row "Accel" "${BH_QEMU_ACCEL:-}"
+  [ -n "${BH_CI_CLOUD:-}" ]     && bhv5c14_md_row "cloud-init" "${BH_CI_CLOUD:-} ${BH_CI_REGION:-} ${BH_CI_AZ:-}"
+  [ -n "${BH_SPEC_SUMMARY:-}" ] && bhv5c14_md_row "Plan check" "${BH_SPEC_SUMMARY:-} cpu=${BH_SPEC_CPU_V:-?} ram=${BH_SPEC_RAM_V:-?} burst=${BH_SPEC_BURST:-?}"
+  [ -n "${BH_UIDMAP_MODE:-}" ]  && bhv5c14_md_row "Uid map" "${BH_UIDMAP_MODE:-}"
+  [ -n "${BH_SECCOMP_MODE:-}" ] && bhv5c14_md_row "Seccomp" "${BH_SECCOMP_MODE:-}"
+  [ -n "${BH_RT_NAME:-}${BH_ORCH:-}" ] && bhv5c14_md_row "Runtime" "${BH_RT_NAME:-?} ${BH_ORCH:-}"
+  [ -n "${BH_K8S_CTX:-}" ]      && bhv5c14_md_row "K8s context" "${BH_K8S_CTX:-}"
+  [ -n "${BH_MEM_LAT_NS:-}" ]   && bhv5c14_md_row "Memory latency (ns)" "${BH_MEM_LAT_NS:-}"
+  [ -n "${BH_THROTTLE_PCT:-}" ] && bhv5c14_md_row "cgroup throttling" "${BH_THROTTLE_PCT:-}%${BH_THROTTLE_NR:+ / ${BH_THROTTLE_NR:-} windows}"
+  [ -n "${BH_SQLITE_RPS:-}" ]   && bhv5c14_md_row "SQLite (rps)" "${BH_SQLITE_RPS:-}"
+  [ -n "${BH_FSYNC_P99_MS:-}" ] && bhv5c14_md_row "fsync p50/p99 (ms)" "${BH_FSYNC_P50_MS:-?} / ${BH_FSYNC_P99_MS:-?}"
+  [ -n "${BH_CLOCK_SKEW_S:-}" ] && bhv5c14_md_row "Clock skew" "${BH_CLOCK_SKEW_S:-}"
+  [ -n "${BH_EGRESS_PROXY:-}" ] && bhv5c14_md_row "Egress" "${BH_EGRESS_PROXY:-}"
+  bhv5c14_truth_strip
+  [ -n "${BH_TRUTH:-}" ]        && bhv5c14_md_row "Truth strip" "${BH_TRUTH#truth: }"
+  bh_fingerprint
+  [ -n "${BH_FINGERPRINT:-}" ]  && bhv5c14_md_row "Fingerprint" "${BH_FINGERPRINT:-}"
+  if declare -F bh_tips_engine >/dev/null 2>&1; then
+    bh_tips_engine
+  fi
+  if [ -n "${BH_TIPS:-}" ]; then
+    local _top
+    _top="$(printf '%s\n' "${BH_TIPS:-}" | awk -F'|' 'NF { print $2 }' | head -n 3 | tr '\n' ';')"
+    bhv5c14_md_row "Tips (top 3)" "${_top%;}"
+  fi
+  return 0
+}
 
 # BH_GAUGE_OK — 1 when the bh_gauge helper (00-core, another owner) exists;
 # when it does not, the score section silently keeps its plain-number rows.
@@ -452,6 +1033,17 @@ build_prom() {
       '') : ;;
       *) printf '# HELP bh_net_up_mbps Upload throughput (Mbps).\n# TYPE bh_net_up_mbps gauge\nbh_net_up_mbps %s\n' "$BH_UP_MBPS" ;;
     esac
+    # ---- v5 numeric extras (C14) — only when the value is present ----
+    bhv5c14_prom_gauge bh_vps5_mem_latency_ns "Memory access latency (ns)."   "${BH_MEM_LAT_NS:-}"
+    bhv5c14_prom_gauge bh_vps5_pipe_us        "Pipe round-trip (microseconds)." "${BH_PIPE_US:-}"
+    bhv5c14_prom_gauge bh_vps5_stat_kps       "stat() syscall rate (k/s)."    "${BH_STAT_KPS:-}"
+    bhv5c14_prom_gauge bh_vps5_sqlite_rps     "SQLite insert rate (rows/s)."  "${BH_SQLITE_RPS:-}"
+    bhv5c14_prom_gauge bh_vps5_fsync_p50_ms   "fsync latency p50 (ms)."       "${BH_FSYNC_P50_MS:-}"
+    bhv5c14_prom_gauge bh_vps5_fsync_p99_ms   "fsync latency p99 (ms)."       "${BH_FSYNC_P99_MS:-}"
+    bhv5c14_prom_gauge bh_vps5_throttle_pct   "cgroup CPU throttling (pct)."  "${BH_THROTTLE_PCT:-}"
+    bhv5c14_prom_gauge bh_vps5_tls_ms         "TLS handshake time (ms)."      "${BH_TLS_MS:-}"
+    bhv5c14_prom_gauge bh_vps5_clock_skew_s   "Clock skew vs reference (s)."  "${BH_CLOCK_SKEW_S:-}"
+    bhv5c14_prom_gauge bh_vps5_pmtu           "Path MTU (bytes)."             "${BH_PMTU:-}"
   } > "$tmp" 2>/dev/null
   local _prom_rc=$?
   if [ "$_prom_rc" -eq 0 ] && mv -f "$tmp" "$BH_PROM_OUT" 2>/dev/null; then
@@ -497,6 +1089,10 @@ build_report() {
   rpt "  Verdict : $(verdict_text)"
   rpt "  Evidence:"
   print_evidence
+  # ---- v5 virt extras (accel / VMM tells / DMI spoof / Xen / ACPI OEM) ----
+  bhv5c14_render_virt_extras
+  # ---- v5 cloud-init / meta2 / hints / spec lie-check ----
+  bhv5c14_render_cloud_extras
 
   # ---- [GPU] — optional module 15-gpu.sh: every reference is ${BH_GPU_X:-}
   # guarded so the report renders identically when the module is absent.
@@ -575,6 +1171,8 @@ build_report() {
   [ -n "$tunline" ] && rpt "  Tunables: $tunline"
   rpt "  Devices : TUN/TAP $( [ "${BH_TUN:-0}" = "1" ] && echo yes || echo no )$( [ "${BH_TUN:-0}" = "1" ] && printf ' (VPN-capable)' ) | FUSE $( [ "${BH_FUSE:-0}" = "1" ] && echo yes || echo no ) | PPP $( [ "${BH_PPP:-0}" = "1" ] && echo yes || echo no ) | tz: ${BH_TZ:-n/a}"
   rpt "  Load    : ${BH_LOAD:-n/a} (1/5/15 min) | processes: ${BH_PROCS:-?}"
+  # ---- v5 info extras (cache / block queue / NUMA / freq / thermal / DIMM) ----
+  bhv5c14_render_info_extras
 
   rpt ""
   if [ "${BH_BENCH_SKIPPED:-0}" = "1" ]; then
@@ -643,6 +1241,8 @@ build_report() {
       rpt "  $netline"
       [ -n "${BH_NET_TRIES:-}" ] && rpt "            attempts: $BH_NET_TRIES"
     fi
+    # ---- v5 bench extras (throttle / noisy / memlat / micro-bench / fsync / trend) ----
+    bhv5c14_render_bench_extras
   fi
 
   # ---- [BENCH-EXTRA] — module 35 info-only micro-benchmarks (renders when
@@ -695,6 +1295,8 @@ build_report() {
     [ -n "${BH_NVME_INFO:-}" ]   && rpt "  NVMe    : $BH_NVME_INFO"
     [ -n "${BH_DISK_MODELS:-}" ] && rpt "  Models  : host disks: $BH_DISK_MODELS"
   fi
+  # ---- v5 storage extras (queue / mdraid / zfs / btrfs / lvm / smart / trim) ----
+  bhv5c14_render_storage_extras
 
   # ---- [ENV] — module 25 capabilities & limits (renders when it ran) ----
   if [ -n "${BH_CAPS_CLASS:-}${BH_DEV_MAP:-}${BH_PIDS_MAX:-}${BH_PID1_LSM:-}${BH_CG_CONTROLLERS:-}${BH_RL_NOFILE:-}${BH_OOM_ADJ:-}" ]; then
@@ -723,6 +1325,8 @@ build_report() {
     [ -n "${BH_OOM_ADJ:-}${BH_OOM_SCORE:-}" ] && rpt "  OOM     : adj ${BH_OOM_ADJ:-?} · score ${BH_OOM_SCORE:-?}"
     [ -n "${BH_CG_CONTROLLERS:-}" ] && rpt "  Cgroup  : controllers: $BH_CG_CONTROLLERS"
   fi
+  # ---- v5 container / runtime / pressure lines (module 25 + runtime extras) ----
+  bhv5c14_render_env_extras
 
   if [ -n "$BH_IPV4$BH_IPV6$BH_IP_GEO$BH_IP_ASN${BH_GEO_CLO:-}${BH_LAT_MATRIX:-}${BH_NAT_MODE:-}${BH_DNS_MS:-}${BH_PACKET_LOSS:-}${BH_IPV6_GRADE:-}" ]; then
     rpt ""
@@ -766,6 +1370,8 @@ build_report() {
     esac
     [ -n "${BH_IPV6_GRADE:-}" ] && rpt "  IPv6    : grade $BH_IPV6_GRADE"
   fi
+  # ---- v5 net extras (skew / egress / PTR / PMTU / DNS / jitter / TLS) ----
+  bhv5c14_render_net_extras
 
   rpt ""
   if [ "${BH_SEC_SKIPPED:-0}" = "1" ]; then
@@ -826,15 +1432,30 @@ build_report() {
   esac
   # ---- run-to-run compare — jq/python3, rendered right after the score section
   render_compare
+  # ---- v5 truth strip — machine-greppable one-liner right after the scores ----
+  bhv5c14_truth_strip
+  [ -n "${BH_TRUTH:-}" ] && rpt "  ${BH_TRUTH:-}"
+  # ---- v5 [T] TOP TIPS — top 3 actionable fixes (engine in 63-tips.sh) ----
+  bhv5c14_render_tips_section
 
   rpt ""
   rpt "generated $(date -u '+%Y-%m-%d %H:%M:%S UTC') by $BH_TOOL v$BH_VERSION"
   # ---- share card (wow#9) — one compact line at the very end of the report
   [ -n "${BH_SHARE_CARD:-}" ] && rpt "  share: $BH_SHARE_CARD"
+  # ---- v5 fingerprint tag — sanitized single-line machine tag ----
+  bh_fingerprint
+  [ -n "${BH_FINGERPRINT:-}" ] && rpt "  tag: ${BH_FINGERPRINT:-}"
 
   # ---- Prometheus textfile export (guarded; atomic tmp+mv inside build_prom)
   if [ -n "${BH_PROM_OUT:-}" ] && [ -n "${BH_PROM_OUT#-}" ]; then
     build_prom
+  fi
+  # ---- v5 sinks: shields.io badge JSON + static SVG gauge (atomic inside) ----
+  if [ -n "${BH_BADGE_OUT:-}" ] && [ -n "${BH_BADGE_OUT#-}" ]; then
+    build_badge
+  fi
+  if [ -n "${BH_SVG_OUT:-}" ] && [ -n "${BH_SVG_OUT#-}" ]; then
+    build_svg
   fi
 }
 
@@ -1020,11 +1641,60 @@ EOF2
     "$(json_val "${BH_CPU_UCODE:-}")" "$(json_val "${BH_CPU_STEPPING:-}")" \
     "$(json_val "${BH_BASH_OPS:-}")" "$(json_val "${BH_AWK_OPS:-}")" \
     "$(json_val "${BH_STEAL_UNDER_LOAD:-}")" "$(json_val "${BH_CPU_INPUT_SRC:-}")"
-  printf '"score":{"cpu_1c":%s,"cpu_multi":%s,"memory":%s,"disk_seq":%s,"disk_4k":%s,"net_down":%s,"net_up":%s,"total":%s,"max":%s,"grade":%s,"oversell":%s,"share_card":%s}}' \
+  printf '"score":{"cpu_1c":%s,"cpu_multi":%s,"memory":%s,"disk_seq":%s,"disk_4k":%s,"net_down":%s,"net_up":%s,"total":%s,"max":%s,"grade":%s,"oversell":%s,"share_card":%s},' \
     "$(json_val "$BH_SCORE_CPU1C")" "$(json_val "$BH_SCORE_CPUMC")" "$(json_val "$BH_SCORE_MEM")" \
     "$(json_val "$BH_SCORE_DSEQ")" "$(json_val "$BH_SCORE_D4K")" "$(json_val "$BH_SCORE_NDOWN")" \
     "$(json_val "$BH_SCORE_NUP")" "$(json_val "$BH_SCORE_TOTAL")" "$(json_val "$BH_SCORE_MAX")" "$(json_val "$BH_GRADE")" \
     "$(json_val "${BH_OVERSELL:-}")" "$(json_val "${BH_SHARE_CARD:-}")"
+  # ---- v5 extras (C14): speccheck / container / hardware objects ----
+  if [ -n "${BH_SPEC_SUMMARY:-}${BH_SPEC_CPU_V:-}${BH_SPEC_RAM_V:-}${BH_SPEC_BURST:-}" ]; then
+    printf '"speccheck":{"summary":%s,"cpu":%s,"ram":%s,"burst":%s},' \
+      "$(json_val "${BH_SPEC_SUMMARY:-}")" "$(json_val "${BH_SPEC_CPU_V:-}")" \
+      "$(json_val "${BH_SPEC_RAM_V:-}")" "$(json_val "${BH_SPEC_BURST:-}")"
+  fi
+  if [ -n "${BH_UIDMAP_MODE:-}${BH_SECCOMP_MODE:-}${BH_PSI_TXT:-}${BH_RT_NAME:-}${BH_ORCH:-}${BH_RT_CTR_ID:-}${BH_K8S_CTX:-}${BH_SA_TXT:-}${BH_POD_UID:-}${BH_PROJ_VOL:-}${BH_NS_FP:-}" ]; then
+    printf '"container":{"uidmap_mode":%s,"seccomp":%s,"psi":%s,"runtime":%s,"orchestrator":%s,"container_id":%s,"k8s_context":%s,"service_account":%s,"pod_uid":%s,"projected_volume":%s,"ns_fingerprint":%s},' \
+      "$(json_val "${BH_UIDMAP_MODE:-}")" "$(json_val "${BH_SECCOMP_MODE:-}")" "$(json_val "${BH_PSI_TXT:-}")" \
+      "$(json_val "${BH_RT_NAME:-}")" "$(json_val "${BH_ORCH:-}")" "$(json_val "${BH_RT_CTR_ID:-}")" \
+      "$(json_val "${BH_K8S_CTX:-}")" "$(json_val "${BH_SA_TXT:-}")" "$(json_val "${BH_POD_UID:-}")" \
+      "$(json_val "${BH_PROJ_VOL:-}")" "$(json_val "${BH_NS_FP:-}")"
+  fi
+  if [ -n "${BH_CACHE_TXT:-}${BH_BLOCKQ_TXT:-}${BH_NUMA_TXT:-}${BH_NUMA_OFFLINE:-}${BH_CPUFREQ_TXT:-}${BH_THERMAL_TXT:-}${BH_THROTTLE_CNT:-}${BH_HWERR_TXT:-}${BH_DIMM_TXT:-}" ]; then
+    printf '"hardware":{"cache":%s,"block_queue":%s,"numa":%s,"numa_offline":%s,"cpufreq":%s,"thermal":%s,"throttle_events":%s,"hw_errors":%s,"dimm":%s},' \
+      "$(json_val "${BH_CACHE_TXT:-}")" "$(json_val "${BH_BLOCKQ_TXT:-}")" "$(json_val "${BH_NUMA_TXT:-}")" \
+      "$(json_val "${BH_NUMA_OFFLINE:-}")" "$(json_val "${BH_CPUFREQ_TXT:-}")" "$(json_val "${BH_THERMAL_TXT:-}")" \
+      "$(json_val "${BH_THROTTLE_CNT:-}")" "$(json_val "${BH_HWERR_TXT:-}")" "$(json_val "${BH_DIMM_TXT:-}")"
+  fi
+  # ---- v5 numeric extras — flat keys, emitted only for clean numbers ----
+  bhv5c14_json_num mem_lat_ns   "${BH_MEM_LAT_NS:-}"
+  bhv5c14_json_num pipe_us      "${BH_PIPE_US:-}"
+  bhv5c14_json_num stat_kps     "${BH_STAT_KPS:-}"
+  bhv5c14_json_num sqlite_rps   "${BH_SQLITE_RPS:-}"
+  bhv5c14_json_num fsync_p50_ms "${BH_FSYNC_P50_MS:-}"
+  bhv5c14_json_num fsync_p99_ms "${BH_FSYNC_P99_MS:-}"
+  bhv5c14_json_num throttle_pct "${BH_THROTTLE_PCT:-}"
+  bhv5c14_json_num tls_ms       "${BH_TLS_MS:-}"
+  bhv5c14_json_num clock_skew_s "${BH_CLOCK_SKEW_S:-}"
+  bhv5c14_json_num pmtu         "${BH_PMTU:-}"
+  # ---- v5 tips array (full list) + fingerprint + truth (closing keys) ----
+  if declare -F bh_tips_engine >/dev/null 2>&1; then
+    bh_tips_engine
+  fi
+  local _tip _tips_json="" _tsep=""
+  if [ -n "${BH_TIPS:-}" ]; then
+    while IFS= read -r _tip; do
+      [ -n "$_tip" ] || continue
+      _tips_json="${_tips_json}${_tsep}\"$(json_esc "$_tip")\""
+      _tsep=","
+    done <<BHV5C14JSONTIPS
+${BH_TIPS:-}
+BHV5C14JSONTIPS
+  fi
+  printf '"tips":[%s],' "$_tips_json"
+  bh_fingerprint
+  bhv5c14_truth_strip
+  printf '"fingerprint":%s,"truth":%s}' \
+    "$(json_val "${BH_FINGERPRINT:-}")" "$(json_val "${BH_TRUTH:-}")"
 }
 
 # ---------------------------------------------------------------- Markdown
@@ -1106,6 +1776,8 @@ build_markdown() {
     printf '\n**Oversell verdict:** %s\n' "$BH_OVERSELL"
   fi
   [ -n "${BH_SHARE_CARD:-}" ] && printf '\n> Share: %s\n' "$BH_SHARE_CARD"
+  # ---- v5 extras (C14) — one compact table, skipped when nothing to show ----
+  bhv5c14_md_extras
   if [ -n "$BH_IPV4$BH_IP_GEO$BH_IP_ASN" ]; then
     printf '\n## Location\n\n| Field | Value |\n|---|---|\n'
     [ -n "$BH_IPV4" ] && printf '| IPv4 | `%s` |\n' "$BH_IPV4"
