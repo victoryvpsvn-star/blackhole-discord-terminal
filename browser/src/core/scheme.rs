@@ -52,6 +52,7 @@ pub fn route(path: &str) -> (u16, &'static str, String) {
     let (status, ctype, body) = match path {
         "" | "start" | "newtab" => (200u16, "text/html; charset=utf-8", crate::ui::dial::dial_html()),
         "about" | "version" => (200, "text/html; charset=utf-8", about_html()),
+        "bench" => (200, "text/html; charset=utf-8", crate::ui::bench::bench_html()),
         "blank" => (200, "text/html; charset=utf-8", "<!doctype html><html><body></body></html>".into()),
         _ => (404, "text/plain; charset=utf-8", format!("blackhole://{} không tồn tại", path)),
     };

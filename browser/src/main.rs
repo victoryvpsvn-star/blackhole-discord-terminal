@@ -42,6 +42,7 @@ fn main() {
         println!("Chạy:  blackhole-browser [tuỳ chọn]");
         println!("  (không gì cả)   mở Speed Dial");
         println!("  --url <link>    mở thẳng 1 trang");
+        println!("  --bench         chạy BH-Bench 3 lần, in điểm JS rồi thoát");
         println!("  --help          hướng dẫn này");
         println!("  --version       phiên bản core");
         println!();
@@ -60,6 +61,8 @@ fn main() {
         .position(|a| a == "--url")
         .and_then(|i| args.get(i + 1))
         .cloned();
+    // --bench: mở trang bench nội bộ, chạy 3 vòng BH-Bench, in điểm rồi thoát
+    let bench_mode = args.iter().any(|a| a == "--bench");
 
     let _ = std::fs::create_dir_all(data_dir());
 
@@ -79,6 +82,12 @@ fn main() {
     let inbox = Inbox::new();
     let mut tabs = TabManager::new(start_url);
     tabs.turbo = prefs.turbo;
+    if bench_mode {
+        // tab đầu = trang bench nội bộ (qua scheme blackhole://bench)
+        let bench_url = scheme::internal_url("bench");
+        tabs.set_url(0, &bench_url);
+        tabs.set_title(0, "BH-Bench");
+    }
     let dial_html = ui::dial::dial_html();
     let mut webctx = wry::WebContext::new(Some(data_dir()));
 
@@ -143,6 +152,8 @@ fn main() {
     // ---- vòng lặp sự kiện ----
     let win2 = window.clone();
     let mut ctrl_state = ModifiersState::empty();
+    let mut bench_count = 0usize;
+    let bench_total = if bench_mode { 3 } else { 0 };
 
     event_loop.run(move |event, _, control_flow| match event {
         Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
@@ -195,6 +206,17 @@ fn main() {
             // rút toàn bộ IPC -> Command -> exec
             for raw in inbox.drain() {
                 let Some(m) = Msg::parse(&raw) else { continue };
+                // chế độ --bench: nhận từng kết quả, in rồi thoát sau 3 lần
+                if m.cmd == "bench" {
+                    bench_count += 1;
+                    println!("BH-BENCH-RESULT {} {}", bench_count, m.value);
+                    if bench_count >= bench_total {
+                        println!("BH-BENCH-DONE (core {} / {})", CORE_VERSION, core::engine::engine_label());
+                        *control_flow = ControlFlow::Exit;
+                        return;
+                    }
+                    continue;
+                }
                 let active = tabs.active;
                 let cmd = match m.cmd.as_str() {
                     // nav từ url bar / speed dial: thông minh hoá (link hay GOOGLE search)

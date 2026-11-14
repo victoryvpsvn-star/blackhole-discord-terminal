@@ -245,7 +245,7 @@ foreach ($t in $targets) {
       $psi = New-Object System.Diagnostics.ProcessStartInfo
       $psi.FileName = $wv2exe
       $psi.UseShellExecute = $false
-      $psi.Arguments = "--user-data-dir=""$(Join-Path $tmp 'bh-proxy')"" --no-first-run --disable-sync --remote-debugging-port=$port2 --window-size=1280,820 about:blank"
+      $psi.Arguments = "--embedded-browser-webview=1 --user-data-dir=""$(Join-Path $tmp 'bh-proxy')"" --no-first-run --disable-sync --remote-debugging-port=$port2 --window-size=1280,820 about:blank"
       $sw = [System.Diagnostics.Stopwatch]::StartNew()
       $p = [System.Diagnostics.Process]::Start($psi)
       $ok = Cdp-Ready $port2 40
