@@ -78,7 +78,7 @@ impl Api {
             .timeout_connect(Duration::from_secs(10))
             .timeout_read(Duration::from_secs(30))
             .timeout_write(Duration::from_secs(15))
-            .user_agent("BlackholeTerminal/2.0")
+            .user_agent("BlackholeTerminal/2.1")
             .build();
         Api { agent, auth }
     }
