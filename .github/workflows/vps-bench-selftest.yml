@@ -56,17 +56,31 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-22.04]
+        # ubuntu-24.04-arm exercises the aarch64 code paths (Features-line
+        # flags, ARM hypervisor detection, no vmx/svm) — v4 requirement.
+        os: [ubuntu-24.04, ubuntu-22.04, ubuntu-24.04-arm]
     steps:
       - uses: actions/checkout@v4
       - name: Smoke tests
         run: vps-bench/tests/run-tests.sh
+      - name: Selftest mode (internal assertions)
+        run: vps-bench/bin/blackhole-vps-bench selftest
+      - name: Exit gates
+        run: |
+          # --min-score must exit 3 when the total is below the threshold
+          if vps-bench/bin/blackhole-vps-bench detect --min-score 999999 >/dev/null 2>&1; then
+            echo "::error::--min-score gate did not trigger exit 3"; exit 1
+          fi
       - name: Full bench (fast profile, with network)
         run: |
           vps-bench/bin/blackhole-vps-bench all --fast \
-            --json /tmp/report.json --markdown /tmp/report.md --output /tmp/report.txt
+            --json /tmp/report.json --markdown /tmp/report.md --output /tmp/report.txt \
+            --prom /tmp/report.prom
       - name: Show verdict
-        run: grep -A6 "VIRTUALIZATION VERDICT" /tmp/report.txt || true
+        run: |
+          grep -A10 "VIRTUALIZATION VERDICT" /tmp/report.txt || true
+          grep "share:" /tmp/report.txt || true
+          grep "Oversell" /tmp/report.txt || true
       - uses: actions/upload-artifact@v4
         with:
           name: report-${{ matrix.os }}
@@ -74,6 +88,7 @@ jobs:
             /tmp/report.json
             /tmp/report.md
             /tmp/report.txt
+            /tmp/report.prom
           if-no-files-found: error
 
   containers:
@@ -114,13 +129,18 @@ jobs:
             fi
             bash vps-bench/bin/blackhole-vps-bench detect
             if [ "${{ matrix.full }}" = "true" ]; then
+              bash vps-bench/bin/blackhole-vps-bench selftest
               bash vps-bench/bin/blackhole-vps-bench all --fast --no-net --output /tmp/report.txt
               grep -q "Kind    :" /tmp/report.txt
               grep -q "SSH & SECURITY AUDIT" /tmp/report.txt
+              grep -q "\[ENV\]" /tmp/report.txt   # v4: capabilities/rlimits section renders everywhere
+              grep -q "share:" /tmp/report.txt   # v4: share card present
               echo "--- verdict ---"
               grep "Verdict :" /tmp/report.txt
               echo "--- posture ---"
               grep "Posture:" /tmp/report.txt
+              echo "--- share card ---"
+              grep "share:" /tmp/report.txt
             fi
             if [ -n "${{ matrix.quota }}" ]; then
               grep -q "cgroup quota" /tmp/report.txt || { echo "ERROR: cgroup quota not detected/reported"; exit 1; }

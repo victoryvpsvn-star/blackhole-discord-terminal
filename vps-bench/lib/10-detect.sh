@@ -18,8 +18,16 @@ BH_EVIDENCE=""
 BH_DMI_VENDOR=""; BH_DMI_PRODUCT=""; BH_DMI_FAMILY=""; BH_DMI_BOARD=""; BH_DMI_BIOS=""
 BH_DMI_BIOS_VERSION=""; BH_DMI_ASSET_TAG=""
 BH_CHASSIS_TYPE=""; BH_CHASSIS_CLASS=""   # SMBIOS chassis type + vm|physical|"" class
+BH_CHASSIS_WEAK=0      # 1 when chassis is 1/Other or 2/Unknown (weak VM evidence only)
 BH_WSL_GEN=""          # WSL generation: 1 | 2 ("" when not WSL)
 BH_IS_CHROOT=0         # 1 when / differs from /proc/1/root/. (chroot jail)
+
+# ---- R3-approved deep-scan verdicts (optional: ""/0 when undetermined) ----
+BH_VIRT_NESTED=""      # C4: exposed | masked | native | ""  (nested-virt tri-state)
+BH_CONF_COMPUTING=""   # C1: amd-sev|amd-sev-es|amd-sev-snp|intel-tdx|arm-cca|""
+BH_IRQ_VMM=""          # C7: comma list of VMM handler names from /proc/interrupts
+BH_VIRTIO_DEVS=""      # C8: comma list of virtio driver names (virtio_blk,virtio_net)
+BH_IRQ_VMM_RE='kvm[a-z-]*|xen[a-z-]*|hv_[a-z]+|vmbus|dragonball[.a-z0-9]*|virtio[0-9]*|vfio|firecracker|cloud-hypervisor'
 
 dmi_read() {
   local f="/sys/class/dmi/id/$1" v=""
@@ -40,19 +48,43 @@ read_all_dmi() {
 append_ev() { BH_EVIDENCE="${BH_EVIDENCE:+$BH_EVIDENCE
 }• $1"; }
 
+# x86: "hypervisor" sits in the flags line; aarch64: the same token appears in
+# the "Features" line (Graviton/Ampere KVM guests) — whole-file grep covers
+# both. ARM has no vmx/svm; this is the only CPU-level hypervisor tell there.
 has_hv_flag() { grep -qw hypervisor /proc/cpuinfo 2>/dev/null; }
 
 cpu_brand() { awk -F': ' '/model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null; }
 
+# systemd-detect-virt guarded by command_exists + timeout 3 (contract).
 sdv_vmm() {
-  if command_exists systemd-detect-virt; then
+  command_exists systemd-detect-virt || return 0
+  if command_exists timeout; then
+    timeout 3 systemd-detect-virt --vm 2>/dev/null || true
+  else
     systemd-detect-virt --vm 2>/dev/null || true
   fi
 }
 sdv_any() {
-  if command_exists systemd-detect-virt; then
+  command_exists systemd-detect-virt || return 0
+  if command_exists timeout; then
+    timeout 3 systemd-detect-virt 2>/dev/null || true
+  else
     systemd-detect-virt 2>/dev/null || true
   fi
+}
+
+# grep with an optional 3s timeout — used for the larger /proc scans below;
+# plain greps on tiny files (cpuinfo, cgroups) follow the existing file style.
+bh_grep_to() {
+  if command_exists timeout; then timeout 3 grep "$@"; else grep "$@"; fi
+}
+
+# sort + dedupe whitespace-separated words into a comma list (bash-3.2 safe)
+bh_join_commas() {
+  [ -n "${1:-}" ] || return 0
+  local out
+  out="$(printf '%s\n' "$1" | sort -u | tr '\n' ',')"
+  printf '%s' "${out%,}"
 }
 
 # ---- chassis ----
@@ -66,7 +98,10 @@ detect_chassis() {
   esac
   BH_CHASSIS_TYPE="$v"
   case "$v" in
-    1|2) BH_CHASSIS_CLASS="vm" ;;
+    1|2)
+      BH_CHASSIS_CLASS="vm"
+      BH_CHASSIS_WEAK=1   # softened: 1/Other and 2/Unknown are also common on physical OEM boards
+      ;;
     *)
       if [ "$v" -ge 3 ] && [ "$v" -le 36 ]; then
         BH_CHASSIS_CLASS="physical"
@@ -76,7 +111,13 @@ detect_chassis() {
       ;;
   esac
   case "$BH_CHASSIS_CLASS" in
-    vm)       append_ev "DMI chassis_type=$v => VM-typical" ;;
+    vm)
+      if [ "$BH_CHASSIS_WEAK" = "1" ]; then
+        append_ev "DMI chassis_type=$v => VM-typical (weak: 1/Other also common on physical OEM boards)"
+      else
+        append_ev "DMI chassis_type=$v => VM-typical"
+      fi
+      ;;
     physical) append_ev "DMI chassis_type=$v => physical chassis" ;;
   esac
 }
@@ -277,33 +318,16 @@ detect_host_virt() {
   fi
 }
 
-detect_virt() {
+detect_virt_core() {
   read_all_dmi
   detect_chassis
   detect_chroot
   local ctype=""
 
-  # ---- WSL (1 = syscall translation layer, 2 = real VM with custom kernel) ----
-  if grep -qi microsoft /proc/version 2>/dev/null; then
-    local krel
-    krel="$(uname -r 2>/dev/null)"
-    BH_KIND="vm"; BH_TYPE="wsl"
-    case "$krel" in
-      *microsoft-standard*)
-        BH_WSL_GEN=2
-        BH_PRODUCT="WSL2 (Windows Subsystem for Linux 2, real Linux kernel)"
-        ;;
-      *)
-        BH_WSL_GEN=1
-        BH_PRODUCT="WSL1 (Windows Subsystem for Linux 1, syscall translation)"
-        ;;
-    esac
-    append_ev "/proc/version mentions Microsoft (kernel $krel -> WSL$BH_WSL_GEN)"
-    detect_host_virt
-    return
-  fi
-
   # ---- container signals ----
+  # G8 fix: evaluated BEFORE any WSL early-return — Docker can run inside WSL2,
+  # and that box must report kind=container/type=docker with the WSL1-vs-WSL2
+  # distinction kept as the HOST label (see the WSL block below).
   if [ -e /.dockerenv ]; then
     ctype="docker"
     append_ev "/.dockerenv present"
@@ -369,6 +393,39 @@ detect_virt() {
     append_ev "/proc/user_beancounters present"
   fi
 
+  # ---- WSL (1 = syscall translation layer, 2 = real VM with custom kernel) ----
+  # G8: runs AFTER the container signals so a container on WSL keeps its own
+  # verdict and the WSL generation becomes the host VM label instead.
+  if grep -qi microsoft /proc/version 2>/dev/null; then
+    local krel wslprod
+    krel="$(uname -r 2>/dev/null)"
+    case "$krel" in
+      *microsoft-standard*)
+        BH_WSL_GEN=2
+        wslprod="WSL2 (Windows Subsystem for Linux 2, real Linux kernel)"
+        ;;
+      *)
+        BH_WSL_GEN=1
+        wslprod="WSL1 (Windows Subsystem for Linux 1, syscall translation)"
+        ;;
+    esac
+    if [ -n "$ctype" ]; then
+      # container verdict wins; WSL1-vs-WSL2 distinction moves to the host label
+      BH_KIND="container"
+      BH_TYPE="$ctype"
+      BH_PRODUCT="$(map_container_product "$ctype")"
+      BH_HOST_TYPE="wsl$BH_WSL_GEN"
+      BH_HOST_PRODUCT="$wslprod"
+      append_ev "/proc/version mentions Microsoft (kernel $krel -> WSL$BH_WSL_GEN) => container on WSL$BH_WSL_GEN host"
+      return
+    fi
+    BH_KIND="vm"; BH_TYPE="wsl"
+    BH_PRODUCT="$wslprod"
+    append_ev "/proc/version mentions Microsoft (kernel $krel -> WSL$BH_WSL_GEN)"
+    detect_host_virt
+    return
+  fi
+
   if [ -n "$ctype" ]; then
     BH_KIND="container"
     BH_TYPE="$ctype"
@@ -431,7 +488,7 @@ detect_virt() {
     [ -n "$BH_DMI_VENDOR" ] && append_ev "DMI: vendor='$BH_DMI_VENDOR' product='$BH_DMI_PRODUCT'"
     case "$BH_CHASSIS_CLASS" in
       physical) append_ev "chassis_type=$BH_CHASSIS_TYPE corroborates bare metal" ;;
-      vm)       append_ev "chassis_type=$BH_CHASSIS_TYPE suggests VM" ;;
+      vm)       append_ev "chassis_type=$BH_CHASSIS_TYPE suggests VM (weak: chassis 1/Other is common on physical boards too)" ;;
     esac
     # chroot is the weakest container signal: only claim it when nothing else matched
     if [ "$BH_IS_CHROOT" = "1" ]; then
@@ -442,10 +499,8 @@ detect_virt() {
     fi
   fi
 
-  # nested virtualization note
-  if [ "$BH_KIND" = "vm" ] && grep -qwE '(vmx|svm)' /proc/cpuinfo 2>/dev/null; then
-    append_ev "nested virtualization exposed (vmx/svm in CPU flags)"
-  fi
+  # (nested-virtualization note moved to detect_nested_virt — C4 tri-state,
+  #  now runs for every kind: vm, container, bare-metal and WSL)
 
   # clocksource corroboration
   local cs
@@ -465,4 +520,144 @@ detect_virt() {
     append_ev "/var/run/scaleway marker present"
   fi
   [ -n "$BH_CLOUD" ] && BH_CLOUD_METHOD="dmi"
+}
+
+# =====================================================================
+# R3-approved deep-scan detectors — pure local reads, no network, no
+# stdout; each only SETs its global + appends evidence lines.
+# =====================================================================
+
+# ---- C4: nested virtualization tri-state ----
+# BH_VIRT_NESTED = "exposed" | "masked" | "native" | "" (no CPU signal)
+#   exposed: vmx/svm visible AND hypervisor flag -> guest may run its own VMs
+#   native : vmx/svm visible without hypervisor flag -> bare-metal CPU
+#   masked : hypervisor flag without vmx/svm -> CPUID-filtered by the host
+# ARM (aarch64) has no vmx/svm; the "hypervisor" token in the Features line
+# plays the hypervisor role (Graviton/Ampere), so ARM guests land on "masked".
+detect_nested_virt() {
+  BH_VIRT_NESTED=""
+  local vmx=0 hv=0 is_arm=0
+  bh_grep_to -qwE 'vmx|svm' /proc/cpuinfo 2>/dev/null && vmx=1
+  has_hv_flag && hv=1
+  bh_grep_to -q '^Features' /proc/cpuinfo 2>/dev/null && is_arm=1  # aarch64 cpuinfo format
+  if [ "$vmx" = "1" ] && [ "$hv" = "1" ]; then
+    BH_VIRT_NESTED="exposed"
+    append_ev "nested virtualization exposed (vmx/svm in CPU flags) => guest may run its own VMs"
+  elif [ "$vmx" = "1" ]; then
+    BH_VIRT_NESTED="native"
+    append_ev "vmx/svm in CPU flags without hypervisor flag => native (bare-metal CPU)"
+  elif [ "$hv" = "1" ]; then
+    BH_VIRT_NESTED="masked"
+    if [ "$is_arm" = "1" ]; then
+      append_ev "hypervisor bit in cpuinfo Features (no vmx/svm on ARM) => masked (virt features not exposed to guests)"
+    else
+      append_ev "hypervisor flag without vmx/svm => masked (CPUID-filtered by host)"
+    fi
+  fi
+  # A container shares the host kernel: /proc/cpuinfo is the host's view,
+  # never the container's own — never claim the guest owns the flags.
+  if [ -n "$BH_VIRT_NESTED" ] && [ "$BH_KIND" = "container" ]; then
+    append_ev "caveat: cpu flags are host cpu flags (container view)"
+  fi
+}
+
+# ---- C1: confidential computing ----
+# BH_CONF_COMPUTING = amd-sev | amd-sev-es | amd-sev-snp | intel-tdx | arm-cca | ""
+# Sources ONLY (no dmesg inference): (a) /proc/cpuinfo flags sev/sev_es/
+# sev_snp/tdx_guest, (b) existence of /dev/sev-guest, (c) directory
+# /sys/kernel/security/tdx_guest. Highest wins: snp > sev-es > sev; tdx
+# standalone. arm-cca is a reserved value — no (a)/(b)/(c) source exists for
+# it yet, so it stays unset until an approved marker is defined.
+detect_conf_computing() {
+  BH_CONF_COMPUTING=""
+  local src=""
+  if bh_grep_to -qw 'sev_snp' /proc/cpuinfo 2>/dev/null; then
+    BH_CONF_COMPUTING="amd-sev-snp"; src="cpuinfo flag sev_snp"
+  elif bh_grep_to -qw 'sev_es' /proc/cpuinfo 2>/dev/null; then
+    BH_CONF_COMPUTING="amd-sev-es"; src="cpuinfo flag sev_es"
+  elif bh_grep_to -qw 'sev' /proc/cpuinfo 2>/dev/null; then
+    BH_CONF_COMPUTING="amd-sev"; src="cpuinfo flag sev"
+  elif bh_grep_to -qw 'tdx_guest' /proc/cpuinfo 2>/dev/null; then
+    BH_CONF_COMPUTING="intel-tdx"; src="cpuinfo flag tdx_guest"
+  fi
+  if [ -z "$BH_CONF_COMPUTING" ] && [ -e /dev/sev-guest ]; then
+    BH_CONF_COMPUTING="amd-sev"; src="/dev/sev-guest present"
+  fi
+  if [ -z "$BH_CONF_COMPUTING" ] && [ -d /sys/kernel/security/tdx_guest ]; then
+    BH_CONF_COMPUTING="intel-tdx"; src="/sys/kernel/security/tdx_guest present"
+  fi
+  if [ -n "$BH_CONF_COMPUTING" ]; then
+    append_ev "confidential computing: $BH_CONF_COMPUTING ($src)"
+  else
+    append_ev "confidential computing: none detected"
+  fi
+}
+
+# ---- C7: VMM handler fingerprint from /proc/interrupts ----
+# Interrupt handler names leak the hosting VMM (regex in BH_IRQ_VMM_RE).
+# GUARD (R3): inside a container /proc/interrupts is the HOST's table, so the
+# scan only runs when the header CPU-column count matches our visible NCPU;
+# otherwise BH_IRQ_VMM stays "" (host view would be misattributed).
+detect_irq_vmm() {
+  BH_IRQ_VMM=""
+  if [ ! -r /proc/interrupts ]; then
+    append_ev "VMM fingerprint: /proc/interrupts unreadable"
+    return 0
+  fi
+  local cols
+  cols="$(awk 'NR==1{print NF; exit}' /proc/interrupts 2>/dev/null)"
+  if [ "$BH_KIND" = "container" ]; then
+    if [ -z "$cols" ] || [ "$cols" -ne "$NCPU" ] 2>/dev/null; then
+      append_ev "VMM fingerprint skipped: /proc/interrupts shows $cols CPU columns vs NCPU=$NCPU (container sees host table)"
+      return 0
+    fi
+  fi
+  local raw
+  raw="$(bh_grep_to -oE "$BH_IRQ_VMM_RE" /proc/interrupts 2>/dev/null | sort -u | tr '\n' ',')"
+  raw="${raw%,}"
+  BH_IRQ_VMM="$raw"
+  if [ -n "$BH_IRQ_VMM" ]; then
+    append_ev "VMM handlers in /proc/interrupts: $BH_IRQ_VMM"
+  else
+    append_ev "no VMM handler names in /proc/interrupts"
+  fi
+}
+
+# ---- C8: virtio device inventory ----
+# Driver basenames behind /sys/bus/virtio/devices/*/driver, e.g. virtio_blk.
+detect_virtio_devs() {
+  BH_VIRTIO_DEVS=""
+  if [ ! -d /sys/bus/virtio/devices ]; then
+    append_ev "virtio inventory: /sys/bus/virtio absent"
+    return 0
+  fi
+  local d name names="" n=0
+  for d in /sys/bus/virtio/devices/*; do
+    [ -e "$d" ] || continue          # glob unmatched -> literal pattern
+    [ -e "$d/driver" ] || continue   # virtio device not bound to a driver
+    name="$(readlink "$d/driver" 2>/dev/null)"
+    name="${name##*/}"               # basename without an external command
+    [ -n "$name" ] || continue
+    names="$names $name"
+    n=$((n + 1))
+  done
+  if [ -n "$names" ]; then
+    BH_VIRTIO_DEVS="$(bh_join_commas "$names")"
+    append_ev "virtio devices: $BH_VIRTIO_DEVS ($n device(s))"
+  else
+    append_ev "no virtio devices bound"
+  fi
+}
+
+# =====================================================================
+# Entry point — 99-main.sh calls detect_virt(). Classic verdict first,
+# then the cross-cutting deep-scan detectors (they need BH_KIND set for
+# the container guards, hence they run after the verdict is known).
+# =====================================================================
+detect_virt() {
+  detect_virt_core
+  detect_nested_virt      # C4
+  detect_conf_computing   # C1
+  detect_irq_vmm          # C7
+  detect_virtio_devs      # C8
 }

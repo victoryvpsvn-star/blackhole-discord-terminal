@@ -1,5 +1,5 @@
 # =====================================================================
-# blackhole-vps-bench · 80-ssh.sh — SSH & local security audit (v2)
+# blackhole-vps-bench · 80-ssh.sh — SSH & local security audit (v4)
 # Audits ONLY the local machine: sshd effective config (password auth,
 # pubkey auth, root login, empty passwords, login grace, X11, keyboard-
 # interactive, AllowUsers/AllowGroups), OpenSSH version, sshd runtime
@@ -7,6 +7,13 @@
 # login attempts, firewall, brute-force protection (fail2ban / sshguard /
 # crowdsec), UID-0 accounts, empty passwords, sudo NOPASSWD, ASLR, auto
 # updates, listening ports.
+# v4 additions (H1-H8): weak crypto algorithms in the effective
+# Ciphers/MACs/KexAlgorithms (with correct OpenSSH Include semantics —
+# first-match-wins, Include expands IN PLACE), MaxStartups/ClientAlive
+# connection hygiene, non-default AuthorizedKeysFile paths added to the key
+# inventory (%u/%h expanded), PAM password quality, password aging
+# (login.defs + root chage), auditd state, time-sync status and pre-login
+# banner OS-info leaks.
 # No root required — checks degrade gracefully and say so.
 # =====================================================================
 # shellcheck shell=bash
@@ -28,6 +35,20 @@ BH_SEC_PASS=0; BH_SEC_WARN=0; BH_SEC_BAD=0
 BH_SEC_POSTURE="n/a"
 BH_SEC_LINES=()
 BH_SSH_CFG_LINES=()
+# --- v4 deep-scan additions (H1-H8) ---------------------------------------
+BH_SEC_WEAK_CRYPTO=""    # weak tokens found in effective Ciphers/MACs/Kex
+                         # ("" = none found / distro defaults)
+BH_SEC_CIPHERS=""        # effective Ciphers, first 60 chars (INFO)
+BH_SEC_KEX=""            # effective KexAlgorithms, first 60 chars (INFO)
+BH_SEC_MAXSTARTUPS=""    # MaxStartups effective, or "10:30:100 default"
+BH_SEC_ALIVE=""          # ClientAliveInterval/CountMax or "disabled (default)"
+BH_SEC_AUTHKEYS_PATH=""  # effective AuthorizedKeysFile (or default); feeds key inventory
+BH_SEC_PAM_PW=""         # pwquality (minlen N) | pwquality | cracklib | passwdqc | none | unknown
+BH_SEC_PASS_MAX_DAYS=""  # login.defs PASS_MAX_DAYS ("no expiry" for 99999)
+BH_SEC_ROOT_EXPIRE=""    # root password expiry: never | YYYY-MM-DD | "" (unknown)
+BH_SEC_AUDITD="unknown"  # running | installed-not-running | not-installed | unknown
+BH_SEC_NTP="unknown"     # synced (chronyd) | synced (timesyncd) | not-synced | unknown
+BH_SEC_BANNER=""         # leaks OS info (...) | custom | none | "" (no sshd)
 
 # sec_line STATUS TEXT — record one audit line (plain, badged) and count it.
 # STATUS: ok | warn | bad | info (info is not counted in the posture score)
@@ -42,10 +63,66 @@ sec_line() {
   BH_SEC_LINES+=("  $tag  $txt")
 }
 
+# ---------------------------------------------------------------------------
+# sec_sshd_read FILE DEPTH — append FILE's directives to BH_SSH_CFG_LINES,
+# expanding Include directives IN PLACE (recursive; depth-capped; unreadable
+# files are skipped silently — "Permission denied" degrades to nothing).
+#
+# SEMANTICS NOTE — OpenSSH Include, first-match-wins (fixes bug G5):
+# sshd implements "first obtained value wins", and Include expands exactly
+# where it appears in the read stream. Given a two-line /etc/ssh/sshd_config:
+#
+#     Port 2222
+#     Include /etc/ssh/sshd_config.d/*.conf   (drop-in contains: Port 22)
+#
+# the effective Port is 2222 — a directive set BEFORE an Include line stays
+# authoritative over the included files. A directive that exists ONLY in a
+# drop-in still wins over a later (or absent) main-file directive, because
+# the drop-in's line enters the stream first. The old parser read the
+# drop-in dir ahead of the main file unconditionally, which wrongly let
+# drop-ins beat earlier main-file settings. The common distro layout (Include
+# as the very first line of sshd_config) behaves exactly as it did before.
+# ---------------------------------------------------------------------------
+sec_sshd_read() {
+  local f="$1" depth="${2:-0}" line key rest tok g
+  [ "$depth" -le 8 ] 2>/dev/null || return 0    # Include-cycle guard
+  [ -r "$f" ] || return 0                       # unreadable -> graceful skip
+  # shellcheck disable=SC2094  # config file is read-only here (recursion guarded)
+  while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"     # trim leading whitespace
+    case "$line" in ''|\#*) continue ;; esac
+    key="${line%%[[:space:]]*}"
+    rest="${line#"$key"}"
+    case "$key" in
+      [Ii][Nn][Cc][Ll][Uu][Dd][Ee])
+        # sshd: relative Include paths resolve against /etc/ssh; several
+        # whitespace-separated globs may be given; globs matching nothing are
+        # silently ignored (bash leaves the literal, the -f test rejects it).
+        for tok in $rest; do
+          case "$tok" in \"*\") tok="${tok#\"}"; tok="${tok%\"}" ;; esac
+          case "$tok" in
+            /*) : ;;
+            *)  tok="/etc/ssh/$tok" ;;
+          esac
+          for g in $tok; do
+            # shellcheck disable=SC2094  # read-only recursion; $g != $f guarded
+            if [ -f "$g" ] && [ "$g" != "$f" ]; then
+              sec_sshd_read "$g" $((depth + 1))
+            fi
+          done
+        done
+        ;;
+      *)
+        BH_SSH_CFG_LINES+=("$line")
+        ;;
+    esac
+  done < "$f"
+}
+
 sec_sshd_load() {
   # sshd usually lives OUTSIDE a normal user's PATH (/usr/sbin) — probe the
   # usual sbin homes first, then whatever 'command -v sshd' can find.
-  local b
+  local b g
   for b in /usr/sbin/sshd /usr/local/sbin/sshd; do
     [ -x "$b" ] && { BH_SSHD_BIN="$b"; break; }
   done
@@ -69,17 +146,23 @@ sec_sshd_load() {
     BH_SSH_FOUND=1
   fi
   if [ "$BH_SSH_T_OK" = "0" ]; then
-    # OpenSSH uses FIRST-MATCH semantics; Include is normally the first
-    # directive of sshd_config, so include-dir files win over the main file.
-    local f line
-    for f in /etc/ssh/sshd_config.d/*.conf /etc/ssh/sshd_config; do
-      [ -f "$f" ] || continue
-      while IFS= read -r line; do
-        case "$line" in ''|\#*) continue ;; esac
-        BH_SSH_CFG_LINES+=("$line")
-      done < "$f"
-    done
-    BH_SSH_CFG_SRC="config files, first-match (drop-in dir wins)"
+    # Build the logical directive stream with real OpenSSH Include semantics:
+    # read the main config top-to-bottom and expand Include IN PLACE, so
+    # first-match-wins holds across the expanded stream (see sec_sshd_read).
+    BH_SSH_CFG_LINES=()
+    [ -r /etc/ssh/sshd_config ] && sec_sshd_read /etc/ssh/sshd_config 0
+    # main config missing/unreadable but drop-in fragments exist? audit those
+    # too (sshd itself would ignore them, but auditing beats staying blind)
+    if [ ! -r /etc/ssh/sshd_config ] && [ -d /etc/ssh/sshd_config.d ]; then
+      for g in /etc/ssh/sshd_config.d/*.conf; do
+        [ -f "$g" ] && sec_sshd_read "$g" 0
+      done
+    fi
+    if [ "${#BH_SSH_CFG_LINES[@]}" -gt 0 ] 2>/dev/null; then
+      BH_SSH_CFG_SRC="config files, first-match (Include expanded in place)"
+    else
+      BH_SSH_CFG_SRC="config files (none readable)"
+    fi
   fi
 }
 
@@ -113,6 +196,35 @@ sec_sshd_all() { # KEY — every match joined by ',' (for multi-Port configs)
       tolower($1)==tolower(k){print $2}')"
   fi
   printf '%s' "$out" | paste -sd ',' -
+}
+
+# sec_trunc VALUE — first 60 chars of a (long) algorithm list, "..." when cut
+sec_trunc() {
+  local v="$1"
+  [ -n "$v" ] || return 0
+  if [ "${#v}" -gt 60 ]; then printf '%s...' "${v:0:57}"; else printf '%s' "$v"; fi
+}
+
+# sec_weak_tokens ALG_LIST — print the weak tokens found in a comma-separated
+# Ciphers/MACs/KexAlgorithms list (lowercased first; both sshd -T and raw
+# config use ',' as the separator). Weak families (H1): arcfour*, all *-cbc
+# ciphers, hmac-md5*/hmac-sha1* MACs, and the SHA-1 DH kex family plus the
+# legacy ssh-rsa/rsa-sha1 kex names. NOTE: group1 is matched as the exact
+# 'diffie-hellman-group1-sha1' name — a glob 'group1*' would also swallow
+# the MODERN diffie-hellman-group14-sha256, which must stay green.
+sec_weak_tokens() {
+  local v out="" tok
+  v="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  [ -n "$v" ] || return 0
+  local IFS=,
+  for tok in $v; do
+    case "$tok" in
+      arcfour*|*-cbc*|hmac-md5*|hmac-sha1*|diffie-hellman-group1-sha1|diffie-hellman-group14-sha1*|diffie-hellman-group-exchange-sha1*|ssh-rsa|rsa-sha1*)
+        out="${out:+$out,}$tok"
+        ;;
+    esac
+  done
+  printf '%s' "$out"
 }
 
 # sec_perm_go_writable PATH — exit 0 when group OR other holds the WRITE bit.
@@ -150,46 +262,60 @@ sec_grace_secs() {
 }
 
 sec_auth_keys() {
-  local d kf line kt homes="/root" owner ak_bad
+  local d kf line kt homes="/root" owner ak_bad tok path seen=""
   for d in /home/*; do [ -d "$d" ] && homes="$homes $d"; done
   for d in $homes; do
-    kf="$d/.ssh/authorized_keys"
-    [ -f "$kf" ] || continue
-    # --- StrictModes permission audit: sshd REFUSES auth when the key file,
-    #     ~/.ssh or the home directory are group/world-writable.
-    #     Count every finding, but emit at most one warn line per user.
     owner="$(stat -c %U "$d" 2>/dev/null)"
     [ -n "$owner" ] || owner="${d##*/}"
-    ak_bad=""
-    if sec_perm_go_writable "$kf"; then
-      BH_AK_PERM_BAD=$((BH_AK_PERM_BAD + 1))
-      ak_bad="authorized_keys of $owner is group/world-writable (StrictModes will REFUSE it)"
-    elif sec_perm_go_writable "$d/.ssh"; then
-      BH_AK_PERM_BAD=$((BH_AK_PERM_BAD + 1))
-      ak_bad=".ssh directory of $owner is group/world-writable (StrictModes will REFUSE its authorized_keys)"
-    elif sec_perm_go_writable "$d"; then
-      BH_AK_PERM_BAD=$((BH_AK_PERM_BAD + 1))
-      ak_bad="home directory of $owner is group/world-writable (StrictModes will REFUSE its authorized_keys)"
-    fi
-    [ -n "$ak_bad" ] && sec_line warn "$ak_bad"
-    while IFS= read -r line; do
-      case "$line" in ''|\#*) continue ;; esac
-      BH_AK_TOTAL=$((BH_AK_TOTAL + 1))
-      kt="${line%%[[:space:]]*}"
-      case "$kt" in
-        ssh-ed25519|sk-ssh-ed25519@openssh.com) kt="ed25519" ;;
-        ssh-rsa)                                kt="RSA" ;;
-        ecdsa-sha2-*)                           kt="ECDSA" ;;
-        *)                                      kt="${kt%%@*}" ;;
+    # scan every AuthorizedKeysFile path (H3): the default .ssh/authorized_keys
+    # plus any non-default path from the effective config, with sshd's
+    # %u (username) / %h (home directory) tokens expanded per user.
+    for tok in ${BH_SEC_AUTHKEYS_PATH:-".ssh/authorized_keys"}; do
+      path="$tok"
+      case "$path" in *%h*) path="${path//%h/$d}" ;; esac
+      case "$path" in *%u*) path="${path//%u/$owner}" ;; esac
+      case "$path" in
+        /*) : ;;                    # absolute (e.g. /etc/ssh/keys/%u)
+        *)  path="$d/$path" ;;      # relative -> per-user, under the home
       esac
-      BH_AK_TYPES="$BH_AK_TYPES $kt"
-    done < "$kf"
-    if command_exists ssh-keygen; then
-      while IFS= read -r bits; do
-        [ -n "$bits" ] || continue
-        if [ "$bits" -lt 2048 ] 2>/dev/null; then BH_AK_WEAK=$((BH_AK_WEAK + 1)); fi
-      done < <(ssh-keygen -lf "$kf" 2>/dev/null | awk '{print $1}')
-    fi
+      case ",$seen," in *",${path},"*) continue ;; esac  # dedup (absolute paths repeat per user)
+      seen="$seen,$path"
+      kf="$path"
+      [ -f "$kf" ] || continue
+      # --- StrictModes permission audit: sshd REFUSES auth when the key file,
+      #     ~/.ssh or the home directory are group/world-writable.
+      #     Count every finding, but emit at most one warn line per file.
+      ak_bad=""
+      if sec_perm_go_writable "$kf"; then
+        BH_AK_PERM_BAD=$((BH_AK_PERM_BAD + 1))
+        ak_bad="authorized_keys of $owner is group/world-writable (StrictModes will REFUSE it)"
+      elif [ "${path#"$d/.ssh"}" != "$path" ] && sec_perm_go_writable "$d/.ssh"; then
+        BH_AK_PERM_BAD=$((BH_AK_PERM_BAD + 1))
+        ak_bad=".ssh directory of $owner is group/world-writable (StrictModes will REFUSE its authorized_keys)"
+      elif sec_perm_go_writable "$d"; then
+        BH_AK_PERM_BAD=$((BH_AK_PERM_BAD + 1))
+        ak_bad="home directory of $owner is group/world-writable (StrictModes will REFUSE its authorized_keys)"
+      fi
+      [ -n "$ak_bad" ] && sec_line warn "$ak_bad"
+      while IFS= read -r line; do
+        case "$line" in ''|\#*) continue ;; esac
+        BH_AK_TOTAL=$((BH_AK_TOTAL + 1))
+        kt="${line%%[[:space:]]*}"
+        case "$kt" in
+          ssh-ed25519|sk-ssh-ed25519@openssh.com) kt="ed25519" ;;
+          ssh-rsa)                                kt="RSA" ;;
+          ecdsa-sha2-*)                           kt="ECDSA" ;;
+          *)                                      kt="${kt%%@*}" ;;
+        esac
+        BH_AK_TYPES="$BH_AK_TYPES $kt"
+      done < "$kf"
+      if command_exists ssh-keygen; then
+        while IFS= read -r bits; do
+          [ -n "$bits" ] || continue
+          if [ "$bits" -lt 2048 ] 2>/dev/null; then BH_AK_WEAK=$((BH_AK_WEAK + 1)); fi
+        done < <(ssh-keygen -lf "$kf" 2>/dev/null | awk '{print $1}')
+      fi
+    done
   done
   # BH_AK_TYPES accumulates as one space-separated line; split into one type
   # per line first or 'sort | uniq -c' counts the whole string as a single hit.
@@ -267,6 +393,172 @@ sec_sshd_runtime() {
     fi
     BH_SSH_LISTENING="$ports"
   fi
+}
+
+# sec_to SECS CMD ARGS... — run a local (no-network) command under `timeout`
+# when available, stderr silenced. Used for every potentially slow probe
+# below; callers treat a non-zero rc / empty output as "unknown".
+sec_to() {
+  local s="$1"
+  shift
+  if command_exists timeout; then
+    timeout "$s" "$@" 2>/dev/null
+  else
+    "$@" 2>/dev/null
+  fi
+}
+
+# sec_banner (H8) — pre-login banner leak check. Sources, in order of
+# authority: the effective 'Banner' directive, then /etc/issue.net, then
+# /etc/motd (first line each). A line "leaks" when it names the distro or
+# the kernel — exactly what a pre-auth probe wants for fingerprinting.
+sec_banner() {
+  BH_SEC_BANNER=""
+  local b first
+  local leak_re='debian|ubuntu|centos|rocky|alma|fedora|kernel|linux release'
+  b="$(sec_sshd_opt banner "")"
+  case "$b" in none|no) b="" ;; esac
+  if [ -n "$b" ]; then
+    first="$(head -n 1 "$b" 2>/dev/null)"
+    first="${first:0:80}"
+    if [ -n "$first" ]; then
+      if printf '%s\n' "$first" | grep -qiE "$leak_re"; then
+        BH_SEC_BANNER="leaks OS info (Banner $b: '$first')"
+      else
+        BH_SEC_BANNER="custom"
+      fi
+      return
+    fi
+    BH_SEC_BANNER="none"    # Banner set but the file is empty/unreadable
+    return
+  fi
+  first="$(head -n 1 /etc/issue.net 2>/dev/null)"
+  first="${first:0:80}"
+  if [ -n "$first" ] && printf '%s\n' "$first" | grep -qiE "$leak_re"; then
+    BH_SEC_BANNER="leaks OS info (/etc/issue.net: '$first')"
+    return
+  fi
+  first="$(head -n 1 /etc/motd 2>/dev/null)"
+  first="${first:0:80}"
+  if [ -n "$first" ] && printf '%s\n' "$first" | grep -qiE "$leak_re"; then
+    BH_SEC_BANNER="leaks OS info (/etc/motd: '$first')"
+    return
+  fi
+  BH_SEC_BANNER="none"
+}
+
+# sec_pam_pw (H4) — which password-quality module does the PAM password
+# stage use? Checked files: common-password (Debian) and system-auth /
+# password-auth (RHEL-style). minlen comes from /etc/security/pwquality.conf.
+# Result: "pwquality (minlen N)" | "pwquality" | "cracklib" | "passwdqc" |
+# "none" | "unknown" (no readable PAM password config at all).
+sec_pam_pw() {
+  BH_SEC_PAM_PW=""
+  local f all="" n=0 minlen
+  for f in /etc/pam.d/common-password /etc/pam.d/system-auth /etc/pam.d/password-auth; do
+    [ -r "$f" ] || continue
+    n=$((n + 1))
+    grep -qs 'pam_pwquality\.so' "$f" && all="$all pwquality"
+    grep -qs 'pam_cracklib\.so' "$f" && all="$all cracklib"
+    grep -qs 'pam_passwdqc\.so' "$f" && all="$all passwdqc"
+  done
+  case "$all" in
+    *pwquality*)
+      minlen="$(sed -n 's/^[[:space:]]*minlen[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' /etc/security/pwquality.conf 2>/dev/null | head -n 1)"
+      if [ -n "$minlen" ]; then BH_SEC_PAM_PW="pwquality (minlen $minlen)"; else BH_SEC_PAM_PW="pwquality"; fi
+      ;;
+    *cracklib*) BH_SEC_PAM_PW="cracklib" ;;
+    *passwdqc*) BH_SEC_PAM_PW="passwdqc" ;;
+  esac
+  if [ -z "$BH_SEC_PAM_PW" ]; then
+    if [ "$n" -gt 0 ]; then BH_SEC_PAM_PW="none"; else BH_SEC_PAM_PW="unknown"; fi
+  fi
+}
+
+# sec_aging (H5) — password aging: PASS_MAX_DAYS from /etc/login.defs, plus
+# the root account's password expiry via `chage -l root` — run directly when
+# root, else through passwordless `sudo -n` when that works.
+sec_aging() {
+  BH_SEC_PASS_MAX_DAYS=""
+  BH_SEC_ROOT_EXPIRE=""
+  local v out
+  v="$(awk '$1=="PASS_MAX_DAYS" && $2 ~ /^[0-9]+$/ {print $2; exit}' /etc/login.defs 2>/dev/null)"
+  case "$v" in
+    '')    : ;;
+    99999) BH_SEC_PASS_MAX_DAYS="no expiry" ;;
+    *)     BH_SEC_PASS_MAX_DAYS="$v" ;;
+  esac
+  if command_exists chage &&
+     { [ "$(id -u 2>/dev/null)" = "0" ] || { command_exists sudo && sudo -n true >/dev/null 2>&1; }; }; then
+    if [ "$(id -u 2>/dev/null)" = "0" ]; then
+      out="$(sec_to 3 chage -l root | sed -n 's/^[[:space:]]*Password expires[[:space:]]*:[[:space:]]*//p' | head -n 1)"
+    else
+      out="$(sec_to 3 sudo -n chage -l root | sed -n 's/^[[:space:]]*Password expires[[:space:]]*:[[:space:]]*//p' | head -n 1)"
+    fi
+    case "$out" in
+      never) BH_SEC_ROOT_EXPIRE="never" ;;
+      '')    : ;;
+      *)     BH_SEC_ROOT_EXPIRE="$(sec_to 2 date -d "$out" +%Y-%m-%d)"
+             [ -n "$BH_SEC_ROOT_EXPIRE" ] || BH_SEC_ROOT_EXPIRE="$out" ;;
+    esac
+  fi
+}
+
+# sec_auditd (H6) — is the kernel audit daemon installed / running?
+sec_auditd() {
+  BH_SEC_AUDITD="unknown"
+  if command_exists auditd || [ -x /usr/sbin/auditd ] || [ -x /sbin/auditd ] || [ -x /usr/local/sbin/auditd ]; then
+    if { command_exists pgrep && pgrep -x auditd >/dev/null 2>&1; } || \
+       sec_to 2 systemctl is-active auditd >/dev/null 2>&1; then
+      BH_SEC_AUDITD="running"
+    else
+      BH_SEC_AUDITD="installed-not-running"
+    fi
+  else
+    BH_SEC_AUDITD="not-installed"
+  fi
+}
+
+# sec_ntp (H7) — clock synchronisation status. Primary: timedatectl's
+# NTPSynchronized property (2s timeout). Fallbacks: chronyc tracking rc,
+# the systemd-timesyncd "synchronized" marker, then chrony/timesyncd
+# presence (installed but not tracking -> "not-synced").
+sec_ntp() {
+  BH_SEC_NTP="unknown"
+  local v=""
+  if command_exists timedatectl; then
+    v="$(sec_to 2 timedatectl show -p NTPSynchronized --value)"
+  fi
+  case "$v" in
+    yes)
+      if sec_to 2 chronyc tracking >/dev/null 2>&1; then
+        BH_SEC_NTP="synced (chronyd)"
+      elif { command_exists pgrep && pgrep -x chronyd >/dev/null 2>&1; } || \
+           [ -f /etc/chrony.conf ] || [ -f /etc/chrony/chrony.conf ]; then
+        BH_SEC_NTP="synced (chronyd)"
+      else
+        BH_SEC_NTP="synced (timesyncd)"
+      fi
+      ;;
+    no)
+      BH_SEC_NTP="not-synced"
+      ;;
+    *)
+      # timedatectl unusable (systemd absent / property unsupported)
+      if [ -f /run/systemd/timesync/synchronized ]; then
+        BH_SEC_NTP="synced (timesyncd)"
+      elif sec_to 2 chronyc tracking >/dev/null 2>&1; then
+        BH_SEC_NTP="synced (chronyd)"
+      elif sec_to 2 systemctl is-active systemd-timesyncd >/dev/null 2>&1; then
+        BH_SEC_NTP="synced (timesyncd)"
+      elif { command_exists pgrep && pgrep -x chronyd >/dev/null 2>&1; } || \
+           [ -f /etc/chrony.conf ] || [ -f /etc/chrony/chrony.conf ]; then
+        BH_SEC_NTP="not-synced"   # chrony installed but tracking failed
+      else
+        BH_SEC_NTP="unknown"
+      fi
+      ;;
+  esac
 }
 
 sec_misc() {
@@ -400,6 +692,58 @@ sec_audit() {
     else
       sec_line info "AllowUsers/AllowGroups: not set — every account may attempt SSH login"
     fi
+
+    # ---- AuthorizedKeysFile (H3): effective paths feed the key inventory ----
+    BH_SEC_AUTHKEYS_PATH="$(sec_sshd_opt authorizedkeysfile "")"
+    [ -n "$BH_SEC_AUTHKEYS_PATH" ] || BH_SEC_AUTHKEYS_PATH=".ssh/authorized_keys"
+    case "$BH_SEC_AUTHKEYS_PATH" in
+      ".ssh/authorized_keys")
+        sec_line info "AuthorizedKeysFile: .ssh/authorized_keys (default)" ;;
+      *)
+        sec_line info "AuthorizedKeysFile: $BH_SEC_AUTHKEYS_PATH (non-default — key inventory scans these paths too, %u/%h expanded)" ;;
+    esac
+
+    # ---- crypto hygiene (H1): weak Ciphers/MACs/KexAlgorithms ----
+    local eff_cs eff_ms eff_kx
+    eff_cs="$(sec_sshd_opt ciphers "")"
+    eff_ms="$(sec_sshd_opt macs "")"
+    eff_kx="$(sec_sshd_opt kexalgorithms "")"
+    BH_SEC_WEAK_CRYPTO="$(sec_weak_tokens "$eff_cs,$eff_ms,$eff_kx")"
+    BH_SEC_CIPHERS="$(sec_trunc "$eff_cs")"
+    BH_SEC_KEX="$(sec_trunc "$eff_kx")"
+    if [ -n "$BH_SEC_WEAK_CRYPTO" ]; then
+      sec_line warn "Weak crypto algorithms enabled: $BH_SEC_WEAK_CRYPTO"
+    elif [ -n "$eff_cs$eff_ms$eff_kx" ]; then
+      sec_line ok "Weak crypto: none — Ciphers/MACs/KexAlgorithms contain no known-weak algorithms"
+    else
+      sec_line info "Weak crypto: none detected — Ciphers/MACs/KexAlgorithms not set (distro defaults apply)"
+    fi
+    [ -n "$BH_SEC_CIPHERS" ] && sec_line info "Effective Ciphers: $BH_SEC_CIPHERS"
+    [ -n "$BH_SEC_KEX" ] && sec_line info "Effective KexAlgorithms: $BH_SEC_KEX"
+
+    # ---- connection hygiene (H2) ----
+    BH_SEC_MAXSTARTUPS="$(sec_sshd_opt maxstartups "")"
+    [ -n "$BH_SEC_MAXSTARTUPS" ] || BH_SEC_MAXSTARTUPS="10:30:100 default"
+    sec_line info "MaxStartups: $BH_SEC_MAXSTARTUPS (unauthenticated connection throttling)"
+    local cai cacm
+    cai="$(sec_sshd_opt clientaliveinterval "")"
+    cacm="$(sec_sshd_opt clientalivecountmax "")"
+    if [ -z "$cai" ] || [ "$cai" = "0" ]; then
+      BH_SEC_ALIVE="disabled (default)"
+    elif [ -n "$cacm" ]; then
+      BH_SEC_ALIVE="ClientAliveInterval ${cai}s x ClientAliveCountMax ${cacm}"
+    else
+      BH_SEC_ALIVE="ClientAliveInterval ${cai}s x ClientAliveCountMax 3 (default)"
+    fi
+    sec_line info "Client keepalive: $BH_SEC_ALIVE (dead-session reaping)"
+
+    # ---- pre-login banner leak (H8) ----
+    sec_banner
+    case "$BH_SEC_BANNER" in
+      leaks*) sec_line warn "Pre-login banner: $BH_SEC_BANNER — reveals OS details to anyone probing the SSH port; set 'Banner none'" ;;
+      custom) sec_line info "Pre-login banner: custom (no OS info detected)" ;;
+      *)      sec_line info "Pre-login banner: none" ;;
+    esac
   else
     BH_SSH_PORTS=""
     sec_line info "sshd: not found on this machine (no SSH server installed)"
@@ -514,6 +858,35 @@ sec_audit() {
     sec_line ok "Auto security updates: $BH_AUTO_UPD"
   fi
   sec_line info "Listening TCP ports: ${BH_LISTEN:-n/a (ss unavailable)}"
+
+  # ---- password/account hygiene (H4/H5) ----
+  sec_pam_pw
+  case "$BH_SEC_PAM_PW" in
+    pwquality*|cracklib|passwdqc) sec_line ok "PAM password quality: $BH_SEC_PAM_PW" ;;
+    none) sec_line info "PAM password quality: none — no pwquality/cracklib module in the PAM password stack" ;;
+    *)    sec_line info "PAM password quality: unknown (PAM password config not readable)" ;;
+  esac
+  sec_aging
+  if [ -n "$BH_SEC_PASS_MAX_DAYS" ]; then
+    sec_line info "Password aging: PASS_MAX_DAYS=$BH_SEC_PASS_MAX_DAYS${BH_SEC_ROOT_EXPIRE:+ | root password expires: $BH_SEC_ROOT_EXPIRE}"
+  else
+    sec_line info "Password aging: n/a (/etc/login.defs not readable)"
+  fi
+
+  # ---- auditd / time sync (H6/H7) ----
+  sec_auditd
+  case "$BH_SEC_AUDITD" in
+    running)               sec_line ok "auditd: running (kernel audit rules active)" ;;
+    installed-not-running) sec_line warn "auditd: installed but NOT running — 'systemctl enable --now auditd'" ;;
+    not-installed)         sec_line info "auditd: not installed (kernel audit framework)" ;;
+    *)                     sec_line info "auditd: unknown" ;;
+  esac
+  sec_ntp
+  case "$BH_SEC_NTP" in
+    synced*)    sec_line ok "Time sync: $BH_SEC_NTP" ;;
+    not-synced) sec_line warn "Time sync: not-synced — clock drift breaks TLS, logs and cron" ;;
+    *)          sec_line info "Time sync: unknown (no systemd/chrony time source detected)" ;;
+  esac
 
   # ---- hardening extras (lib/85-hardening.sh, optional module) ----
   # Guarded so this file still works when sourced standalone (tests do that).

@@ -1,6 +1,16 @@
 # =====================================================================
-# blackhole-vps-bench · 20-info.sh — system info + cgroup limits + IP/cloud
+# blackhole-vps-bench · 20-info.sh — system info + cgroup limits + offline extras
 # =====================================================================
+#
+# v4.0 (W3-C):
+#   - ZERO network calls from this module, ever. The egress-IP / geo / ASN
+#     lookups (ipify + ip-api) moved to the net module (60-net.sh); cloud
+#     metadata stays in 12-cloud.sh. BH_IPV4/BH_IPV6/BH_IP_GEO/BH_IP_ASN are
+#     declared here ("" default) and filled by the module that owns them.
+#   - CPU flags now work on x86_64 ("flags") AND aarch64 ("Features").
+#   - New offline extras: CPU vulnerability matrix (BH_VULN_*), ISA inventory
+#     (BH_CPU_AI_FEAT / BH_CPU_CRYPTO_FEAT), microcode + stepping (BH_CPU_UCODE
+#     / BH_CPU_STEPPING), KSM state (BH_KSM_STATE / BH_KSM_SHARING).
 # shellcheck shell=bash
 
 BH_HOSTNAME=""; BH_OS=""; BH_KERNEL=""; BH_ARCH=""; BH_UPTIME=""
@@ -17,12 +27,31 @@ BH_LOAD=""; BH_PROCS=0; BH_TZ=""
 BH_STEAL_PCT=""; BH_CPU_FREQ_MHZ=""; BH_CPUSET_N=0; BH_THP=""
 BH_HUGEPAGES_TOTAL=""; BH_DISK_SCHED=""; BH_DISK_ROTA=""; BH_DISK_CLASS=""
 BH_NET_MTU=""; BH_SWAP_DETAIL=""
+# offline security / CPU-identity extras (v4.0 — W3-C)
+# vuln matrix: /sys/devices/system/cpu/vulnerabilities/* (C2)
+BH_VULN_WORST=""; BH_VULN_TOTAL=0; BH_VULN_SCOPE=""
+# ISA inventory: AI/ML + crypto extensions, comma lists (C3)
+BH_CPU_AI_FEAT=""; BH_CPU_CRYPTO_FEAT=""
+# microcode + stepping, x86 only (C5)
+BH_CPU_UCODE=""; BH_CPU_STEPPING=""
+# kernel same-page merging (C6)
+BH_KSM_STATE=""; BH_KSM_SHARING=""
 
 # bh_bracketed FILE — print the value of the [bracketed] token in FILE ("" if none)
 bh_bracketed() {
   [ -r "$1" ] || return 0
   awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^\[.*\]$/) { gsub(/[\[\]]/, "", $i); print $i; exit } }' "$1" 2>/dev/null
   return 0
+}
+
+# bh_flag_has HAYSTACK WORD — true when WORD appears as a whole token in
+# HAYSTACK (a plain space-separated flag list). Pure bash, no subshell.
+bh_flag_has() {
+  # shellcheck disable=SC2254
+  case " $1 " in
+    *" $2 "*) return 0 ;;
+    *)        return 1 ;;
+  esac
 }
 
 # bh_cpu_steal_pct — noisy-neighbor detector: % of CPU time stolen by the host
@@ -67,9 +96,58 @@ gather_info() {
     BH_CPU_PHYS="$(lscpu -p=CPU,CORE,SOCKET 2>/dev/null | grep -v '^#' | awk -F, '$2!="" && $2!="-" {print $2","$3}' | sort -u | wc -l | tr -d ' ')"
   fi
   [ -n "$BH_CPU_PHYS" ] && [ "$BH_CPU_PHYS" -ge 1 ] 2>/dev/null || BH_CPU_PHYS="$BH_CPU_LOGICAL"
-  local fl
-  fl="$(awk '/^flags/{for(i=2;i<=NF;i++){f[$i]=1}} END{print (f["avx512f"]?"avx512 ":"") (f["avx2"]?"avx2 ":"") (f["aes"]?"aes ":"") (f["vmx"]?"vmx ":"") (f["svm"]?"svm ":"")}' /proc/cpuinfo 2>/dev/null)"
-  BH_CPU_FLAGS_HI="${fl% }"
+  # ---- CPU flags: work on x86_64 ("flags") AND aarch64 ("Features") ----
+  # Collect the raw flag word list once; every feature list below derives from
+  # it. ARM /proc/cpuinfo (armv7 + arm64) names the line "Features", x86
+  # "flags". Starting at field $2 keeps the ":" separator (harmless — no
+  # keyword contains a colon) and survives kernels that omit the space after
+  # the colon. Multiple lines are merged, like the pre-v4 behaviour.
+  local arch allfl kw aif crf
+  arch="$BH_ARCH"
+  [ -n "$arch" ] || arch="$(uname -m 2>/dev/null || echo unknown)"
+  case "$arch" in
+    aarch64*|arm64*|armv7*|armv8*|arm*)
+      allfl="$(awk '/^Features/{for(i=2;i<=NF;i++) printf "%s ", $i}' /proc/cpuinfo 2>/dev/null)"
+      ;;
+    *)
+      allfl="$(awk '/^flags/{for(i=2;i<=NF;i++) printf "%s ", $i}' /proc/cpuinfo 2>/dev/null)"
+      ;;
+  esac
+  # headline features — same values as v3: "avx512 avx2 aes vmx svm"
+  BH_CPU_FLAGS_HI=""
+  bh_flag_has "$allfl" avx512f && BH_CPU_FLAGS_HI="avx512"
+  bh_flag_has "$allfl" avx2    && BH_CPU_FLAGS_HI="${BH_CPU_FLAGS_HI:+$BH_CPU_FLAGS_HI }avx2"
+  bh_flag_has "$allfl" aes     && BH_CPU_FLAGS_HI="${BH_CPU_FLAGS_HI:+$BH_CPU_FLAGS_HI }aes"
+  bh_flag_has "$allfl" vmx     && BH_CPU_FLAGS_HI="${BH_CPU_FLAGS_HI:+$BH_CPU_FLAGS_HI }vmx"
+  bh_flag_has "$allfl" svm     && BH_CPU_FLAGS_HI="${BH_CPU_FLAGS_HI:+$BH_CPU_FLAGS_HI }svm"
+
+  # ---- ISA inventory (C3): AI/ML + crypto extensions, comma lists ----
+  # On ARM the Features list has no avx*/amx* words (so BH_CPU_AI_FEAT stays
+  # "" there) but does carry "aes" and sometimes "bf16" — both are matched.
+  aif=""; crf=""
+  for kw in avx512f avx512_vnni avx512_fp16 amx_tile amx_int8 amx_bf16 bf16; do
+    bh_flag_has "$allfl" "$kw" && aif="${aif:+$aif,}$kw"
+  done
+  BH_CPU_AI_FEAT="$aif"
+  for kw in vaes sha_ni gfni aes vpclmulqdq; do
+    bh_flag_has "$allfl" "$kw" && crf="${crf:+$crf,}$kw"
+  done
+  BH_CPU_CRYPTO_FEAT="$crf"
+
+  # ---- microcode / stepping (C5, x86 only — "" on ARM) ----
+  BH_CPU_UCODE=""; BH_CPU_STEPPING=""
+  case "$arch" in
+    aarch64*|arm64*|armv7*|armv8*|arm*) : ;;
+    *)
+      # field order is "stepping\t: 1" — the value is the LAST field
+      BH_CPU_UCODE="$(awk '/^microcode/{print $NF; exit}' /proc/cpuinfo 2>/dev/null)"
+      # fallback: x2APIC-less kernels sometimes drop the cpuinfo line
+      if [ -z "$BH_CPU_UCODE" ] && [ -r /sys/devices/system/cpu/cpu0/microcode/revision ]; then
+        BH_CPU_UCODE="$(tr -d ' \t\n\r' < /sys/devices/system/cpu/cpu0/microcode/revision 2>/dev/null)"
+      fi
+      BH_CPU_STEPPING="$(awk '/^stepping/{print $NF; exit}' /proc/cpuinfo 2>/dev/null)"
+      ;;
+  esac
 
   # ---- CPU extras: steal %, current frequency, cpuset size ----
   BH_STEAL_PCT="$(bh_cpu_steal_pct)"
@@ -93,6 +171,32 @@ gather_info() {
     print n
   }' 2>/dev/null)"
   case "$BH_CPUSET_N" in ''|*[!0-9]*) BH_CPUSET_N=0 ;; esac
+
+  # ---- CPU vulnerability matrix (C2) ----
+  # Worst list = every entry whose content contains "Vulnerable";
+  # "Mitigation: ..." and "Not affected" are fine and NOT counted.
+  # Scope says whose kernel the results describe: inside a container the
+  # sysfs entries belong to the HOST kernel (BH_KIND comes from 10-detect).
+  BH_VULN_WORST=""; BH_VULN_TOTAL=0; BH_VULN_SCOPE="unknown"
+  local vdir vf vname vtxt
+  vdir="/sys/devices/system/cpu/vulnerabilities"
+  if [ -d "$vdir" ] && [ -r "$vdir" ]; then
+    case "${BH_KIND:-}" in
+      container) BH_VULN_SCOPE="host-kernel" ;;
+      *)         BH_VULN_SCOPE="kernel" ;;
+    esac
+    for vf in "$vdir"/*; do
+      [ -f "$vf" ] && [ -r "$vf" ] || continue
+      vname="${vf##*/}"
+      vtxt="$(tr -d '\n\r\t' < "$vf" 2>/dev/null)"
+      case "$vtxt" in
+        *Vulnerable*)
+          BH_VULN_WORST="${BH_VULN_WORST:+$BH_VULN_WORST,}$vname"
+          BH_VULN_TOTAL=$(( BH_VULN_TOTAL + 1 ))
+          ;;
+      esac
+    done
+  fi
 
   # ---- cgroup limits (report the REAL config, not the host's) ----
   BH_MEM_LIMIT_MB="$MEM_LIMIT_KB"
@@ -135,6 +239,27 @@ gather_info() {
     BH_SWAP_DETAIL="$(( sw / 1024 )) MB total / $(( ${swf:-0} / 1024 )) MB free"
   else
     BH_SWAP_DETAIL="none"
+  fi
+
+  # ---- KSM: kernel same-page merging (C6) ----
+  # /sys/kernel/mm/ksm/run: 1 = enabled; 0 = disabled; missing -> unknown.
+  # pages_sharing > 0 means dedup is actually saving memory right now.
+  BH_KSM_STATE="unknown"; BH_KSM_SHARING=""
+  if [ -r /sys/kernel/mm/ksm/run ]; then
+    local krun ksh
+    krun="$(tr -d ' \t\n\r' < /sys/kernel/mm/ksm/run 2>/dev/null)"
+    case "$krun" in
+      1) BH_KSM_STATE="on" ;;
+      0) BH_KSM_STATE="off" ;;
+      *) BH_KSM_STATE="unknown" ;;
+    esac
+    if [ -r /sys/kernel/mm/ksm/pages_sharing ]; then
+      ksh="$(tr -d ' \t\n\r' < /sys/kernel/mm/ksm/pages_sharing 2>/dev/null)"
+      case "$ksh" in
+        ''|*[!0-9]*) : ;;
+        *) [ "$ksh" -gt 0 ] 2>/dev/null && BH_KSM_SHARING="$ksh" ;;
+      esac
+    fi
   fi
 
   # ---- disk (target dir) ----
@@ -218,17 +343,11 @@ gather_info() {
     [ -n "$BH_NET_MTU" ] && break
   done
 
-  # ---- network identity (optional) ----
-  if [ "$BH_NO_NET" != "1" ] && command_exists curl; then
-    BH_IPV4="$(curl -4 -fsS --max-time 6 https://api.ipify.org 2>/dev/null | head -c 64)"
-    local geo
-    geo="$(curl -fsS --max-time 8 'http://ip-api.com/line/?fields=country,regionName,city,isp' 2>/dev/null | tr '\n' '|' )"
-    BH_IP_GEO="${geo%|}"
-    BH_IP_ASN="$(curl -fsS --max-time 8 'http://ip-api.com/line/?fields=as' 2>/dev/null | head -c 128)"
-    BH_IPV6="$(curl -6 -fsS --max-time 6 https://api64.ipify.org 2>/dev/null | head -c 64)"
-    # cloud metadata probing moved to 12-cloud.sh (cloud_metadata_probe)
-    if command_exists cloud_metadata_probe; then
-      cloud_metadata_probe
-    fi
-  fi
+  # ---- network identity — MOVED OUT (v4.0, bug G4) ----
+  # The egress-IP / geo / ASN lookups (ipify + ip-api) now live in the net
+  # module (60-net.sh); cloud metadata stays in 12-cloud.sh (cloud_metadata_probe).
+  # This module therefore makes ZERO network calls ever: `sec` mode and
+  # BH_NO_NET=1 stay fully offline. BH_IPV4 / BH_IPV6 / BH_IP_GEO / BH_IP_ASN
+  # are declared above ("" default) and are filled by the module that owns them.
+  return 0
 }

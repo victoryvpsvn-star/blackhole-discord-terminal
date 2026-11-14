@@ -7,6 +7,7 @@ cd "$(dirname "$0")/.." || exit 1
 fail=0
 pass() { echo "PASS: $1"; }
 flunk() { echo "FAIL: $1"; fail=1; }
+skip() { echo "SKIP: $1"; }   # v4 feature not merged yet — never counts as failure
 
 # unit-test assertion helpers, used INSIDE a ( ) subshell that sources only the
 # libs under test; each subshell exits non-zero when any assertion failed:
@@ -20,7 +21,10 @@ echo "== 1. help =="
 
 echo "== 2. version =="
 v="$(./bin/blackhole-vps-bench --version 2>/dev/null)"
-case "$v" in *"blackhole-vps-bench v3."*) pass "version ($v)" ;; *) flunk "version ($v)" ;; esac
+# v3/v4: the version line must carry the tool name + major version (v4.0
+# bumped BH_VERSION in lib/00-core.sh; accept both so the suite is green at
+# every merge state)
+case "$v" in *"blackhole-vps-bench v3."*|*"blackhole-vps-bench v4."*) pass "version ($v)" ;; *) flunk "version ($v)" ;; esac
 
 echo "== 3. detect mode =="
 out="$(./bin/blackhole-vps-bench detect 2>/dev/null)"
@@ -109,6 +113,7 @@ echo "== 6. unit: tier_* label boundaries =="
 ) && pass "tier_* label boundaries" || flunk "tier_* label boundaries"
 
 echo "== 7. unit: grade thresholds =="
+# shellcheck disable=SC2030  # intentional: score sentinels scoped to this subshell
 (
   # shellcheck disable=SC1091
   . ./lib/00-core.sh
@@ -130,7 +135,9 @@ echo "== 7. unit: grade thresholds =="
   u "grade_letter 209/700 -> F"      "F" "$(grade_letter 209 700)" || U=1
   u "grade_letter max 0 -> ''"       ""  "$(grade_letter 350 0)"   || U=1
   # compute_scores integration: grade must follow the computed ratio
+  # shellcheck disable=SC2030  # intentional: sentinels scoped to this subshell
   BH_SHA1C=800; BH_SHANC=4000; BH_MEM_GBS=16; BH_SEQW=400; BH_SEQR=500
+  # shellcheck disable=SC2030  # intentional: sentinels scoped to this subshell
   BH_4KW=40; BH_4KR=60; BH_DOWN_MBPS=400; BH_UP_MBPS=200
   compute_scores
   u "compute_scores -> grade matches ratio" "$(grade_letter "$BH_SCORE_TOTAL" "$BH_SCORE_MAX")" "$BH_GRADE" || U=1
@@ -229,6 +236,212 @@ echo "== 10. unit: cloud_from_dmi / map_vm_cloud =="
   u "classify_aws: EC2 'HVM domU' product -> aws_gen xen" "xen" "${BH_AWS_GEN:-}" || U=1
   exit "$U"
 ) && pass "cloud_from_dmi / map_vm_cloud" || flunk "cloud_from_dmi / map_vm_cloud"
+
+echo "== 11. json schema v4 (--json - emits JSON on stdout) =="
+jout="$(./bin/blackhole-vps-bench all --fast --no-net --json - 2>/dev/null)"
+# stdout = human report body + the JSON object as its last '{'-leading line
+jline="$(printf '%s\n' "$jout" | awk '/^\{/{j=$0} END{print j}')"
+[ -n "$jline" ] && pass "json object emitted on stdout (--json -)" || flunk "json object emitted on stdout (--json -)"
+if [ -n "$jline" ] && command -v jq >/dev/null 2>&1; then
+  printf '%s' "$jline" | jq -e '.virtualization.evidence | type == "array"' >/dev/null 2>&1 \
+    && pass "json: virtualization.evidence is array" || flunk "json: virtualization.evidence is array"
+  printf '%s' "$jline" | jq -e '.security | type == "object"' >/dev/null 2>&1 \
+    && pass "json: security is object" || flunk "json: security is object"
+  # v4 soft keys — assert ONLY when the producer is actually wired into lib/,
+  # otherwise the whole suite would be red mid-merge:
+  #   .cpu.ai_features  <- BH_CPU_AI_FEAT (20-info.sh) + build_json key
+  #   .security.ntp     <- BH_SEC_NTP + build_json key
+  #   .score.grade      <- BH_GRADE + build_json key (v3, always present)
+  if grep -qs 'BH_CPU_AI_FEAT' lib/*.sh && grep -qs '"ai_features"' lib/70-report.sh; then
+    printf '%s' "$jline" | jq -e '.cpu | has("ai_features")' >/dev/null 2>&1 \
+      && pass "json: cpu.ai_features present" || flunk "json: cpu.ai_features present"
+  else
+    skip "json: cpu.ai_features (feature not present)"
+  fi
+  if grep -qs 'BH_SEC_NTP' lib/*.sh && grep -qs '"ntp"' lib/70-report.sh; then
+    printf '%s' "$jline" | jq -e '.security | has("ntp")' >/dev/null 2>&1 \
+      && pass "json: security.ntp present" || flunk "json: security.ntp present"
+  else
+    skip "json: security.ntp (feature not present)"
+  fi
+  if grep -qs '"grade"' lib/70-report.sh; then
+    printf '%s' "$jline" | jq -e '.score | has("grade")' >/dev/null 2>&1 \
+      && pass "json: score.grade present" || flunk "json: score.grade present"
+  else
+    skip "json: score.grade (feature not present)"
+  fi
+elif [ -n "$jline" ] && command -v python3 >/dev/null 2>&1; then
+  printf '%s' "$jline" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert isinstance(d["virtualization"]["evidence"], list); assert isinstance(d["security"], dict); assert "grade" in d["score"]' \
+    && pass "json schema v4 (python3 fallback)" || flunk "json schema v4 (python3 fallback)"
+else
+  skip "json schema v4 deep keys (no jq/python3 or no json line)"
+fi
+
+echo "== 12. sec mode zero-network guarantee (curl shim, bug G4) =="
+shimdir="$(mktemp -d "${TMPDIR:-/tmp}/bhvps_shim.XXXXXX")"
+curllog="$shimdir/curl.log"
+cat > "$shimdir/curl" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "$curllog"
+exit 1
+EOF
+chmod +x "$shimdir/curl"
+secrc=0
+PATH="$shimdir:$PATH" ./bin/blackhole-vps-bench sec --json - >/dev/null 2>&1 || secrc=$?
+[ "$secrc" -eq 0 ] && pass "sec exit 0 with failing curl shim" || flunk "sec exit 0 with failing curl shim (rc=$secrc)"
+if [ ! -s "$curllog" ]; then
+  pass "sec zero-network: curl never invoked (G4)"
+else
+  # fallback: local metadata probes are tolerable, egress lookups are not
+  if grep -qiE 'ipify|ip-api|cloudflare' "$curllog"; then
+    flunk "sec made egress curl calls (G4 regression): $(head -n 2 "$curllog")"
+  else
+    pass "sec no egress lookups (curl only for local metadata: $(wc -l < "$curllog") call(s))"
+  fi
+fi
+rm -rf "$shimdir"
+
+echo "== 13. selftest mode (soft) =="
+selfout="$(./bin/blackhole-vps-bench selftest 2>&1)"; selfrc=$?
+if [ "$selfrc" -eq 0 ]; then
+  pass "selftest mode exits 0"
+elif [ "$selfrc" -eq 2 ] && printf '%s\n' "$selfout" | grep -qi 'unknown argument'; then
+  skip "selftest mode (feature not present)"
+else
+  flunk "selftest mode (rc=$selfrc)"
+fi
+
+echo "== 14. exit gate --min-score (soft) =="
+msout="$(./bin/blackhole-vps-bench detect --min-score 999999 2>&1)"; msrc=$?
+if [ "$msrc" -eq 3 ]; then
+  pass "detect --min-score 999999 exits 3 (gate fires on score 0)"
+elif [ "$msrc" -eq 2 ] && printf '%s\n' "$msout" | grep -qi 'unknown argument'; then
+  skip "--min-score exit gate (feature not present)"
+elif [ "$msrc" -eq 0 ]; then
+  flunk "detect --min-score 999999 rc=0, want 3 (gate did not fire)"
+else
+  flunk "detect --min-score 999999 unexpected rc=$msrc"
+fi
+if [ "$msrc" -eq 3 ] || { [ "$msrc" -ne 2 ] && ! printf '%s\n' "$msout" | grep -qi 'unknown argument'; }; then
+  ms0rc=0
+  ./bin/blackhole-vps-bench detect --min-score 0 >/dev/null 2>&1 || ms0rc=$?
+  [ "$ms0rc" -eq 0 ] && pass "detect --min-score 0 passes (rc=0)" || flunk "detect --min-score 0 rc=$ms0rc, want 0"
+fi
+
+echo "== 15. unit: cpuset / BH_PAR_JOBS math =="
+(
+  # shellcheck disable=SC1091
+  . ./lib/00-core.sh
+  # shellcheck disable=SC1091
+  . ./lib/10-detect.sh
+  # shellcheck disable=SC1091
+  . ./lib/20-info.sh
+  BH_FAST=1
+  U=0
+  gather_info >/dev/null 2>&1 || { echo "SKIP: cpuset math (gather_info failed)"; exit 0; }
+  u "BH_PAR_JOBS <= NCPU" "yes" \
+    "$([ "${BH_PAR_JOBS:-1}" -le "${NCPU:-1}" ] 2>/dev/null && echo yes || echo no)" || U=1
+  if [ -n "${CPUSET:-}" ] && [ "${BH_CPUSET_N:-0}" -gt 0 ] 2>/dev/null; then
+    u "BH_EFF_CORES <= cpuset cores (cpuset '$CPUSET' = $BH_CPUSET_N cores)" "yes" \
+      "$([ "${BH_EFF_CORES:-0}" -le "$BH_CPUSET_N" ] 2>/dev/null && echo yes || echo no)" || U=1
+  else
+    echo "SKIP: cpuset constraint (CPUSET empty on this host)"
+  fi
+  exit "$U"
+) && pass "cpuset / BH_PAR_JOBS math" || flunk "cpuset / BH_PAR_JOBS math"
+
+echo "== 16. unit: gauge/render helper (soft) =="
+(
+  # shellcheck disable=SC1091
+  . ./lib/00-core.sh
+  # shellcheck disable=SC1091
+  . ./lib/70-report.sh
+  G=""
+  declare -f gauge    >/dev/null 2>&1 && G="gauge"
+  [ -z "$G" ] && declare -f bh_gauge >/dev/null 2>&1 && G="bh_gauge"
+  if [ -n "$G" ]; then
+    U=0
+    g0="$($G 0)"; g50="$($G 50)"; g100="$($G 100)"
+    u "gauge 0 non-empty"   "yes" "$([ -n "$g0" ]   && echo yes || echo no)" || U=1
+    u "gauge 50 non-empty"  "yes" "$([ -n "$g50" ]  && echo yes || echo no)" || U=1
+    u "gauge 100 non-empty" "yes" "$([ -n "$g100" ] && echo yes || echo no)" || U=1
+    u "gauge 0 != 50"   "yes" "$([ "$g0" != "$g50" ]   && echo yes || echo no)" || U=1
+    u "gauge 50 != 100" "yes" "$([ "$g50" != "$g100" ] && echo yes || echo no)" || U=1
+    u "gauge fixed width (0/50/100 same length)" "yes" \
+      "$([ "${#g0}" -eq "${#g50}" ] && [ "${#g50}" -eq "${#g100}" ] && echo yes || echo no)" || U=1
+    exit "$U"
+  else
+    echo "SKIP: gauge/bh_gauge helper (feature not present)"
+    exit 0
+  fi
+) && pass "gauge helper shape (0/50/100)" || flunk "gauge helper shape (0/50/100)"
+
+echo "== 17. bench-extra smoke (soft) =="
+(
+  # shellcheck disable=SC1091
+  . ./lib/00-core.sh
+  U=0
+  if [ ! -f ./lib/35-bench-extra.sh ]; then
+    echo "SKIP: lib/35-bench-extra.sh (feature not present)"
+    exit 0
+  fi
+  # shellcheck disable=SC1091
+  . ./lib/35-bench-extra.sh
+  BH_FAST=1
+  # the module is INFO-ONLY: score inputs must come out untouched
+  BH_SHA1C=4321; BH_MEM_GBS=12.5
+  if ! bench_extra >/dev/null 2>&1; then
+    echo "FAIL: bench_extra rc!=0 with BH_FAST=1"; U=1
+  fi
+  u "BH_FORK_RATE non-empty after bench_extra" "yes" \
+    "$([ -n "${BH_FORK_RATE:-}" ] && echo yes || echo no)" || U=1
+  u "bench_extra leaves BH_SHA1C untouched"   "4321" "${BH_SHA1C:-}"   || U=1
+  u "bench_extra leaves BH_MEM_GBS untouched" "12.5" "${BH_MEM_GBS:-}" || U=1
+  exit "$U"
+) && pass "bench_extra smoke (BH_FAST=1)" || flunk "bench_extra smoke (BH_FAST=1)"
+
+echo "== 18. new module smoke: gather_env / gather_storage_map (soft) =="
+(
+  # shellcheck disable=SC1091
+  . ./lib/00-core.sh
+  U=0
+  if [ -f ./lib/25-env.sh ]; then
+    # shellcheck disable=SC1091
+    . ./lib/25-env.sh
+    if declare -f gather_env >/dev/null 2>&1; then
+      # stdout -> file (NOT $( ): the globals-only contract must be checked in
+      # THIS shell — a command substitution would run gather_env in a child
+      # and hide every BH_CAPS_* / BH_PIDS_* global it sets)
+      gather_env > "$BH_RUNDIR/gather_env.out" 2>/dev/null; envrc=$?
+      envout="$(cat "$BH_RUNDIR/gather_env.out" 2>/dev/null)"
+      u "gather_env exit 0" "0" "$envrc" || U=1
+      u "gather_env stdout empty (globals-only contract)" "" "$envout" || U=1
+      u "gather_env sets BH_CAPS_CLASS" "yes" \
+        "$([ -n "${BH_CAPS_CLASS:-}" ] && echo yes || echo no)" || U=1
+      u "gather_env sets BH_DEV_MAP" "yes" \
+        "$([ -n "${BH_DEV_MAP:-}" ] && echo yes || echo no)" || U=1
+    else
+      echo "SKIP: gather_env (function not present)"
+    fi
+  else
+    echo "SKIP: lib/25-env.sh (feature not present)"
+  fi
+  if [ -f ./lib/55-storage-map.sh ]; then
+    # shellcheck disable=SC1091
+    . ./lib/55-storage-map.sh
+    if declare -f gather_storage_map >/dev/null 2>&1; then
+      gather_storage_map > "$BH_RUNDIR/gather_storage_map.out" 2>/dev/null; smrc=$?
+      smout="$(cat "$BH_RUNDIR/gather_storage_map.out" 2>/dev/null)"
+      u "gather_storage_map exit 0" "0" "$smrc" || U=1
+      u "gather_storage_map stdout empty" "" "${smout:-}" || U=1
+    else
+      echo "SKIP: gather_storage_map (function not present)"
+    fi
+  else
+    echo "SKIP: lib/55-storage-map.sh (feature not present)"
+  fi
+  exit "$U"
+) && pass "new module smoke (25-env / 55-storage-map)" || flunk "new module smoke (25-env / 55-storage-map)"
 
 echo
 if [ "$fail" -eq 0 ]; then
