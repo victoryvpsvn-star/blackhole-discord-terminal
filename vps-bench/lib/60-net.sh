@@ -309,7 +309,7 @@ bench_net() {
           who_asn="" who_isp="" who_org="" short="" g=""
   # cat(1) with 2>/dev/null (NOT a bare '<' redirect): a missing file must
   # stay silent — bash would print a redirect error to stderr otherwise.
-  tr="$(cat "$BH_RUNDIR/net_trace" 2>/dev/null | tr -d '\r')"
+  tr="$(tr -d '\r' < "$BH_RUNDIR/net_trace" 2>/dev/null)"
   while IFS= read -r tline; do
     case "$tline" in
       ip=*)   tr_ip="${tline#ip=}" ;;
@@ -338,13 +338,13 @@ EOF
 
   # BH_IPV4: ipify primary, CF-trace ip as fallback (shared fetch)
   local v4 v6
-  v4="$(cat "$BH_RUNDIR/net_geo4" 2>/dev/null | tr -d ' \t\n\r')"
+  v4="$(tr -d ' \t\n\r' < "$BH_RUNDIR/net_geo4" 2>/dev/null)"
   case "$v4" in *[!0-9.]*) v4="" ;; esac
   [ -z "$v4" ] && v4="$tr_ip"
   [ -n "$v4" ] && BH_IPV4="$v4"
 
   # BH_IPV6: ipify over -6 only; empty when the box has no v6 egress
-  v6="$(cat "$BH_RUNDIR/net_geo6" 2>/dev/null | tr -d ' \t\n\r')"
+  v6="$(tr -d ' \t\n\r' < "$BH_RUNDIR/net_geo6" 2>/dev/null)"
   case "$v6" in *:*) case "$v6" in *[!0-9a-fA-F:.]*) v6="" ;; esac ;; *) v6="" ;; esac
   [ -n "$v6" ] && BH_IPV6="$v6"
 
@@ -483,7 +483,7 @@ EOF
     pf="${pfile#*:}"
     pval=""
     [ -r "$BH_RUNDIR/$pf" ] && \
-      pval="$(cat "$BH_RUNDIR/$pf" 2>/dev/null | tr -d ' \t\n\r')"
+      pval="$(tr -d ' \t\n\r' < "$BH_RUNDIR/$pf" 2>/dev/null)"
     case "$pval" in
       open|filtered|untestable) : ;;
       *) pval="" ;;

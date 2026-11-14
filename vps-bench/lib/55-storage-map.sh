@@ -432,7 +432,7 @@ gather_storage_map() {
   BH_DISK_MODELS=""
   local mf m mcnt=0
   for mf in /sys/block/*/device/model; do
-    [ -f "$mf" ] && [ -r "$mf" ] || continue
+    [ -r "$mf" ] || continue  # -r implies readable+existing
     m="$(tr -d '\r\n\t' < "$mf" 2>/dev/null)"
     m="${m//[[:cntrl:]]/}"          # DMI/model strings can contain garbage bytes
     m="$(bh_trim "$m")"

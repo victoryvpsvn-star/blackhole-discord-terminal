@@ -186,7 +186,7 @@ gather_info() {
       *)         BH_VULN_SCOPE="kernel" ;;
     esac
     for vf in "$vdir"/*; do
-      [ -f "$vf" ] && [ -r "$vf" ] || continue
+      [ -r "$vf" ] || continue  # -r implies readable+existing
       vname="${vf##*/}"
       vtxt="$(tr -d '\n\r\t' < "$vf" 2>/dev/null)"
       case "$vtxt" in
