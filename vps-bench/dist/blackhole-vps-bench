@@ -65,11 +65,21 @@ bh_cleanup() { rm -rf "$BH_RUNDIR"; }
 trap bh_cleanup EXIT
 
 # ------- time helpers -------
+# now_ms: milliseconds since epoch, pure bash (no awk!) because mawk's
+# printf "%d" saturates at INT32_MAX and would return a constant 2147483647
+# on Debian/Ubuntu containers — that bug made every benchmark report 0 ms.
 now_ms() {
   if [ -n "${EPOCHREALTIME:-}" ]; then
-    awk -v t="$EPOCHREALTIME" 'BEGIN{n=split(t,a,"."); printf "%d", a[1]*1000 + int(substr((a[2] "000"),1,3))}'
+    local secs frac
+    secs=${EPOCHREALTIME%%.*}
+    frac=${EPOCHREALTIME#*.}
+    case "$frac" in ''|*[!0-9]*) frac=0 ;; esac
+    printf '%s%03d' "$secs" $(( 10#$frac / 1000 ))
   elif [ -r /proc/uptime ]; then
-    awk '{printf "%d", $1*1000}' /proc/uptime
+    local up
+    IFS=. read -r up _ < /proc/uptime 2>/dev/null || up=""
+    case "$up" in ''|*[!0-9]*) printf '0'; return ;; esac
+    printf '%s000' "$up"
   else
     date +%s000
   fi
