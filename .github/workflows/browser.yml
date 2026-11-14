@@ -177,30 +177,46 @@ jobs:
         shell: pwsh
         run: |
           $res = "browser/bench/result"
-          if (Test-Path "$res/bench.json") {
-            $j = Get-Content "$res/bench.json" -Raw | ConvertFrom-Json
-            $desc = ($j.tableLines -join "`n")
-            $payload = @{
-              username = 'BLACKHOLE BenchBot'
-              content  = ("KẾT QUẢ BENCH — thắng cold start: " + $j.winStart +
-                          " | thắng RAM 5 tabs: " + $j.winRam +
-                          " | thắng Speedometer 3: " + $j.winSpeed)
-              embeds   = @(@{
-                title       = "🏆 BENCH ĐỐI ĐẦU: BLACKHOLE Browser vs Edge vs Chrome vs Opera GX"
-                description = $desc
-                color       = 3066993
-                fields      = @(
-                  @{ name = "Kết luận";     value = $j.verdict },
-                  @{ name = "Máy bench";    value = $j.machine }
-                )
-                footer      = @{ text = "BLACKHOLE Browser 1.0 • bench THẬT trên GitHub Actions runner" }
-              })
-            } | ConvertTo-Json -Depth 8
-            curl.exe -sS -o wr.json -w "WEBHOOK_HTTP=%{http_code}`n" "$env:DISCORD_WEBHOOK_URL?wait=true" `
-              -F "payload_json=$payload" `
-              -F "files[0]=@$res/bench.md" -F "files[1]=@$res/bench.json"
-            Get-Content wr.json -ErrorAction SilentlyContinue | Select-Object -First 1
-          } else {
-            $payload = @{ username = 'BLACKHOLE BenchBot'; content = '❌ BENCH có lỗi — xem log Actions' } | ConvertTo-Json
-            curl.exe -sS -o wr.json -w "WEBHOOK_HTTP=%{http_code}`n" "$env:DISCORD_WEBHOOK_URL?wait=true" -F "payload_json=$payload"
+          try {
+            Add-Type -AssemblyName System.Net.Http
+            $client = [System.Net.Http.HttpClient]::new()
+            $form = [System.Net.Http.MultipartFormDataContent]::new()
+            if (Test-Path "$res/bench.json") {
+              $j = Get-Content "$res/bench.json" -Raw | ConvertFrom-Json
+              $desc = ($j.tableLines -join "`n")
+              $payload = @{
+                username = 'BLACKHOLE BenchBot'
+                content  = ("KẾT QUẢ BENCH — thắng cold start: " + $j.winStart +
+                            " | thắng RAM 5 tabs: " + $j.winRam +
+                            " | thắng BH-Bench JS: " + $j.winBh)
+                embeds   = @(@{
+                  title       = "🏆 BENCH ĐỐI ĐẦU: BLACKHOLE Browser vs Edge vs Chrome vs Opera GX"
+                  description = $desc
+                  color       = 3066993
+                  fields      = @(
+                    @{ name = "Kết luận";  value = $j.verdict },
+                    @{ name = "Máy bench"; value = $j.machine }
+                  )
+                  footer      = @{ text = "BLACKHOLE Browser • BlackholeCore • bench THẬT trên GitHub Actions runner" }
+                })
+              } | ConvertTo-Json -Depth 8
+              $form.Add([System.Net.Http.StringContent]::new($payload), 'payload_json')
+              if (Test-Path "$res/bench.md") {
+                $form.Add([System.Net.Http.ByteArrayContent]::new([IO.File]::ReadAllBytes("$res/bench.md")), 'files[0]', 'bench.md')
+              }
+              if (Test-Path "$res/bench.json") {
+                $form.Add([System.Net.Http.ByteArrayContent]::new([IO.File]::ReadAllBytes("$res/bench.json")), 'files[1]', 'bench.json')
+              }
+              $resp = $client.PostAsync("$($env:DISCORD_WEBHOOK_URL)?wait=true", $form).Result
+              Write-Host ("WEBHOOK HTTP: {0}" -f [int]$resp.StatusCode)
+              Write-Host ($resp.Content.ReadAsStringAsync().Result.Substring(0, [Math]::Min(200, $resp.Content.ReadAsStringAsync().Result.Length)))
+            } else {
+              $payload = @{ username = 'BLACKHOLE BenchBot'; content = '❌ BENCH có lỗi — xem log Actions' } | ConvertTo-Json
+              $form.Add([System.Net.Http.StringContent]::new($payload), 'payload_json')
+              $resp = $client.PostAsync("$($env:DISCORD_WEBHOOK_URL)?wait=true", $form).Result
+              Write-Host ("WEBHOOK HTTP: {0}" -f [int]$resp.StatusCode)
+            }
+          } catch {
+            Write-Host "Gửi Discord lỗi: $_"
           }
+          exit 0

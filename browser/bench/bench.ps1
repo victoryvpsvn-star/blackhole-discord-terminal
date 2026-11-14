@@ -1,10 +1,13 @@
-# bench.ps1 — BENCH ĐỐI ĐẦU: BLACKHOLE Browser vs Edge vs Chrome vs Opera GX
-# Đo 4 chỉ số trên CÙNG máy runner, cùng 5 trang bench:
-#   1. Cold start   : từ khi spawn process -> CDP sẵn sàng (ms)
-#   2. RAM 5 tabs   : tổng Working Set + Private của toàn cây process (MB)
-#   3. JetStream 2  : benchmark JS/render TỰ CHẠY (không cần bấm nút — ổn định)
-#   4. Speedometer 3: chuẩn mới (best-effort, click qua CDP)
-# Fix v2: TỰ CÀI WebView2 Runtime nếu runner thiếu (nguyên nhân FAIL v1).
+# bench.ps1 v3 — BENCH ĐỐI ĐẦU: BLACKHOLE Browser vs Edge vs Chrome vs Opera GX
+# Đo 3 chỉ số trên CÙNG máy runner, cùng 5 trang bench:
+#   1. Cold start  : spawn process -> CDP sẵn sàng (ms)
+#   2. RAM 5 tabs  : tổng Working Set + Private cây process (MB)
+#   3. BH-Bench    : điểm tổng hợp JS tự định nghĩa (ALU + sort + string +
+#                    JSON), chạy qua CDP, MEDIAN của 3 lần — KHÔNG phụ thuộc
+#                    rAF/DOM nên không bị throttle khi tab nền (sự cố của
+#                    JetStream/Speedometer ở run trước)
+# Fix v3: FORCE repair WebView2 Runtime (Class not registered của run trước),
+#         retry BLACKHOLE không user-data-folder, webhook bằng .NET HttpClient.
 $ErrorActionPreference = 'Continue'
 $root    = $PSScriptRoot
 $pages   = Join-Path $root 'pages'
@@ -19,22 +22,17 @@ $cs = Get-CimInstance Win32_ComputerSystem
 $os = Get-CimInstance Win32_OperatingSystem
 Write-Host ("CPU cores: {0} | RAM: {1:N1} GB | OS: {2}" -f $env:NUMBER_OF_PROCESSORS, ($cs.TotalPhysicalMemory / 1GB), $os.Caption)
 
-# ---------- FIX v1: đảm bảo WebView2 Runtime có mặt (cho BLACKHOLE) ----------
+# ---------- FIX: FORCE repair WebView2 Runtime (bootstrapper idempotent) ----------
+Write-Host "Đang đảm bảo WebView2 Runtime đăng ký đúng (repair silent — 30-60s)..."
+try {
+  Invoke-WebRequest 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile "$env:TEMP\wv2setup.exe" -UseBasicParsing -TimeoutSec 180
+  $proc = Start-Process "$env:TEMP\wv2setup.exe" -ArgumentList '/silent','/install' -Wait -PassThru
+  Write-Host ("WebView2 bootstrapper exit code: {0}" -f $proc.ExitCode)
+} catch { Write-Host "!! cài/repair WebView2 lỗi: $_" }
 $wv2 = @('C:\Program Files (x86)\Microsoft\EdgeWebView\Application',
          'C:\Program Files\Microsoft\EdgeWebView\Application') |
         Where-Object { Test-Path $_ } | Select-Object -First 1
-if (-not $wv2) {
-  Write-Host "WebView2 Runtime CHƯA CÓ — đang cài evergreen (khắc phục FAIL của run trước)..."
-  try {
-    Invoke-WebRequest 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile "$env:TEMP\wv2setup.exe" -UseBasicParsing -TimeoutSec 120
-    Start-Process "$env:TEMP\wv2setup.exe" -ArgumentList '/silent','/install' -Wait
-    Start-Sleep -Seconds 3
-    $wv2 = 'C:\Program Files (x86)\Microsoft\EdgeWebView\Application'
-    Write-Host ("WebView2 cài xong: {0} (tồn tại: {1})" -f $wv2, (Test-Path $wv2))
-  } catch { Write-Host "!! cài WebView2 lỗi: $_" }
-} else {
-  Write-Host "WebView2 Runtime đã có: $wv2"
-}
+Write-Host ("WebView2 folder: {0}" -f $wv2)
 
 # ---------- tìm các browser ----------
 $exeBh = Get-ChildItem "$env:GITHUB_WORKSPACE\dist" -Filter 'blackhole-browser*.exe' -ErrorAction SilentlyContinue |
@@ -53,12 +51,13 @@ if (-not $exeBh) { Write-Host "!! KHÔNG thấy blackhole-browser.exe trong dist
 
 # ---------- CDP helpers ----------
 function Cdp-Eval {
-  param($wsUrl, $expr, [int]$timeoutSec = 25)
+  param($wsUrl, $expr, [int]$timeoutSec = 60)
   try {
     $ws = [System.Net.WebSockets.ClientWebSocket]::new()
     $ws.ConnectAsync([Uri]$wsUrl, [Threading.CancellationToken]::None).Wait()
     $id = Get-Random -Maximum 999999
-    $msg = @{ id = $id; method = 'Runtime.evaluate'; params = @{ expression = $expr; returnByValue = $true } } |
+    $msg = @{ id = $id; method = 'Runtime.evaluate';
+              params = @{ expression = $expr; returnByValue = $true; awaitPromise = $true } } |
            ConvertTo-Json -Depth 6 -Compress
     $bytes = [Text.Encoding]::UTF8.GetBytes($msg)
     $ws.SendAsync([ArraySegment[byte]]::new($bytes), 'Text', $true, [Threading.CancellationToken]::None).Wait()
@@ -74,7 +73,11 @@ function Cdp-Eval {
       }
       $txt = [Text.Encoding]::UTF8.GetString($ms.ToArray())
       try { $j = $txt | ConvertFrom-Json } catch { continue }
-      if ($j.id -eq $id) { $ws.Dispose(); return $j.result.result.value }
+      if ($j.id -eq $id) {
+        $ws.Dispose()
+        if ($j.result.exceptionDetails) { return $null }
+        return $j.result.result.value
+      }
     }
     $ws.Dispose()
   } catch { }
@@ -113,17 +116,6 @@ function Cdp-NewTab {
   return $null
 }
 
-function Wait-Page {
-  param($wsUrl, [int]$waitSec = 45)
-  $deadline = (Get-Date).AddSeconds($waitSec)
-  while ((Get-Date) -lt $deadline) {
-    $s = Cdp-Eval $wsUrl 'document.readyState' 10
-    if ($s -eq 'complete') { return $true }
-    Start-Sleep -Milliseconds 500
-  }
-  return $false
-}
-
 function Get-RamMB {
   param([string[]]$patterns)
   $procs = Get-Process -ErrorAction SilentlyContinue | Where-Object {
@@ -144,55 +136,52 @@ function Kill-All {
   Start-Sleep -Seconds 2
 }
 
-# JetStream 2: TỰ CHẠY khi mở trang — điểm hiện ở phần tử .score
-function Test-JetStream {
-  param($port)
-  $t = Cdp-NewTab $port 'https://browserbench.org/JetStream/'
-  if (-not $t -or -not $t.webSocketDebuggerUrl) { return 'n/a (khong mo trang)' }
-  $ws = $t.webSocketDebuggerUrl
-  if (-not (Wait-Page $ws 45)) { return 'n/a (load timeout)' }
-  $scoreExpr = "(()=>{const sels=['.score','#result','#jetstream-score','.results .score'];" +
-               "for(const s of sels){const e=document.querySelector(s);" +
-               "if(e){const n=parseFloat((e.textContent||'').replace(/[^0-9.]/g,''));if(n>0)return n}}return null})()"
-  $deadline = (Get-Date).AddSeconds(300)
-  while ((Get-Date) -lt $deadline) {
-    Start-Sleep -Seconds 5
-    $v = Cdp-Eval $ws $scoreExpr 10
-    if ($null -ne $v -and "$v" -ne '') { return [math]::Round([double]$v, 0) }
+# BH-Bench: điểm tổng hợp JS — ALU + sort + string + JSON. MEDIAN 3 lần.
+# Không phụ thuộc rAF/DOM => chạy đúng trong tab nền qua CDP.
+$BH_BENCH_EXPR = @'
+(async () => {
+  function run() {
+    const t0 = performance.now();
+    let acc = 5381 | 0;
+    for (let i = 0; i < 4000000; i++) { acc = (((acc * 33) ^ (acc >>> 7)) + i) | 0; }
+    const t1 = performance.now();
+    const a = new Array(300000);
+    for (let i = 0; i < 300000; i++) a[i] = (i * 7919) % 1000003;
+    a.sort((x, y) => x - y);
+    const t2 = performance.now();
+    let s = '';
+    for (let i = 0; i < 200000; i++) s += (i % 7);
+    const t3 = performance.now();
+    const obj = { id: 1, name: 'blackhole', tags: ['g','b','c'], deep: { a: [1,2,3, {b: 4}] } };
+    for (let i = 0; i < 20000; i++) { JSON.parse(JSON.stringify(obj)); }
+    const t4 = performance.now();
+    const total = (t4 - t0);
+    const score = Math.round(100000 / Math.max(total, 1) * 1000) / 1000;
+    return { p1: Math.round(t1 - t0), p2: Math.round(t2 - t1), p3: Math.round(t3 - t2), p4: Math.round(t4 - t3), total: Math.round(total), score: score };
   }
-  return 'n/a (timeout)'
-}
+  const r1 = await run(); const r2 = await run(); const r3 = await run();
+  const scores = [r1.score, r2.score, r3.score].sort((x, y) => x - y);
+  return JSON.stringify({ median: scores[1], all: scores, detail: r3 });
+})()
+'@
 
-# Speedometer 3: cần bấm nút start — best effort với nhiều selector
-function Test-Speedometer {
+function Test-BhBench {
   param($port)
-  $t = Cdp-NewTab $port 'https://browserbench.org/Speedometer3.0/'
-  if (-not $t -or -not $t.webSocketDebuggerUrl) { return 'n/a (khong mo trang)' }
+  $t = Cdp-NewTab $port 'about:blank'
+  if (-not $t -or -not $t.webSocketDebuggerUrl) { return 'n/a (khong mo tab)' }
   $ws = $t.webSocketDebuggerUrl
-  if (-not (Wait-Page $ws 45)) { return 'n/a (load timeout)' }
-  Start-Sleep -Seconds 3
-  $click = "(()=>{const sels=['#startButton','#start-test-button','button[aria-label*=""start"" i]','.start-button','button[title*=Start]'];" +
-           "for(const s of sels){const b=document.querySelector(s);if(b){b.click();return 'ok '+s}}" +
-           "const b2=[...document.querySelectorAll('button,a')].find(x=>/^start/i.test(((x.textContent||'')+' '+(x.getAttribute('aria-label')||'')).trim()));" +
-           "if(b2){b2.click();return 'ok-text'}return 'no'})()"
-  $r = Cdp-Eval $ws $click 10
-  Write-Host "  Speedometer click: $r"
-  if ("$r" -eq 'no') { return 'n/a (khong nut start)' }
-  $scoreExpr = "(()=>{const ids=['#result-score','#Score','.score','#resultScore','.score-value','.final-score'];" +
-               "for(const s of ids){const e=document.querySelector(s);" +
-               "if(e){const n=parseFloat((e.textContent||'').replace(/[^0-9.]/g,''));if(n>0)return n}}return null})()"
-  $deadline = (Get-Date).AddSeconds(200)
-  while ((Get-Date) -lt $deadline) {
-    Start-Sleep -Seconds 4
-    $v = Cdp-Eval $ws $scoreExpr 10
-    if ($null -ne $v -and "$v" -ne '') { return [math]::Round([double]$v, 0) }
-  }
-  return 'n/a (timeout)'
+  Start-Sleep -Milliseconds 500
+  $v = Cdp-Eval $ws $BH_BENCH_EXPR 180
+  if ($null -eq $v) { return 'n/a (eval fail)' }
+  try {
+    $o = ($v | ConvertFrom-Json)
+    return [math]::Round([double]$o.median, 2)
+  } catch { return "n/a (parse fail: $v)" }
 }
 
 # ---------- đo từng browser ----------
 $results = @()
-$portBase = 9401
+$portBase = 9501
 
 $targets = @()
 $targets += @{ name = 'BLACKHOLE Browser'; exe = $exeBh; kind = 'bh' }
@@ -205,30 +194,37 @@ foreach ($t in $targets) {
   Write-Host "`n=================== BENCH: $($t.name) ==================="
   Kill-All
 
-  # 1) COLD START
-  $psi = New-Object System.Diagnostics.ProcessStartInfo
-  $psi.FileName = $t.exe
-  $psi.UseShellExecute = $false
-  if ($t.kind -eq 'bh') {
-    $psi.Arguments = ''
-    $psi.EnvironmentVariables['WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS'] = "--remote-debugging-port=$port"
-    $psi.EnvironmentVariables['WEBVIEW2_USER_DATA_FOLDER'] = Join-Path $tmp 'wv2data'
-  } else {
-    $psi.Arguments = "--user-data-dir=""$(Join-Path $tmp ($t.name -replace '\W',''))"" --no-first-run --no-default-browser-check --disable-sync --remote-debugging-port=$port --window-size=1280,820 about:blank"
+  $startMs = -1
+  foreach ($attempt in 1, 2) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $t.exe
+    $psi.UseShellExecute = $false
+    if ($t.kind -eq 'bh') {
+      $psi.Arguments = ''
+      $psi.EnvironmentVariables['WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS'] = "--remote-debugging-port=$port"
+      if ($attempt -eq 1) {
+        $psi.EnvironmentVariables['WEBVIEW2_USER_DATA_FOLDER'] = Join-Path $tmp 'wv2data'
+      } else {
+        Write-Host "  retry lần 2: bỏ WEBVIEW2_USER_DATA_FOLDER (dùng profile mặc định)"
+      }
+    } else {
+      $psi.Arguments = "--user-data-dir=""$(Join-Path $tmp ($t.name -replace '\W',''))"" --no-first-run --no-default-browser-check --disable-sync --remote-debugging-port=$port --window-size=1280,820 about:blank"
+    }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $ok = Cdp-Ready $port 40
+    $sw.Stop()
+    if ($ok) { $startMs = $sw.ElapsedMilliseconds; break }
+    try { $p.Kill() } catch { }
   }
-  $sw = [System.Diagnostics.Stopwatch]::StartNew()
-  $p = [System.Diagnostics.Process]::Start($psi)
-  $ok = Cdp-Ready $port 40
-  $sw.Stop()
-  $startMs = if ($ok) { $sw.ElapsedMilliseconds } else { -1 }
-  Write-Host ("  Cold start: {0} ms (CDP ready={1})" -f $startMs, $ok)
-  if (-not $ok) {
-    $results += @{ name = $t.name; startMs = 'FAIL'; ramWS = 'FAIL'; ramPriv = ''; jet = 'FAIL'; speedo = 'FAIL'; note = 'CDP khong len' }
+  Write-Host ("  Cold start: {0} ms (CDP ready={1})" -f $startMs, ($startMs -ge 0))
+  if ($startMs -lt 0) {
+    $results += @{ name = $t.name; startMs = 'FAIL'; ramWS = 'FAIL'; ramPriv = ''; bhbench = 'FAIL'; note = 'CDP khong len (2 lan thu)' }
     continue
   }
   Start-Sleep -Seconds 2
 
-  # 2) 5 tabs bench -> RAM
+  # 5 tabs bench -> RAM
   for ($i = 1; $i -le 5; $i++) {
     $url = 'file:///' + ((Join-Path $pages "page$i.html") -replace '\\', '/')
     Cdp-NewTab $port $url | Out-Null
@@ -243,15 +239,12 @@ foreach ($t in $targets) {
   $ram = Get-RamMB $patterns
   Write-Host ("  RAM: {0} MB working set | {1} MB private | {2} processes" -f $ram.ws, $ram.priv, $ram.procs)
 
-  # 3) JetStream 2 (tự chạy — ổn định) + 4) Speedometer 3 (best effort)
-  Write-Host "  JetStream 2 đang tự chạy (tối đa ~5 phút)..."
-  $jet = Test-JetStream $port
-  Write-Host "  JetStream 2: $jet"
-  Write-Host "  Speedometer 3 đang chạy..."
-  $speedo = Test-Speedometer $port
-  Write-Host "  Speedometer 3: $speedo"
+  # BH-Bench (median 3 lần)
+  Write-Host "  BH-Bench (3 lần, lấy median)..."
+  $bh = Test-BhBench $port
+  Write-Host "  BH-Bench: $bh"
 
-  $results += @{ name = $t.name; startMs = $startMs; ramWS = $ram.ws; ramPriv = $ram.priv; procs = $ram.procs; jet = $jet; speedo = $speedo; note = '' }
+  $results += @{ name = $t.name; startMs = $startMs; ramWS = $ram.ws; ramPriv = $ram.priv; procs = $ram.procs; bhbench = $bh; note = '' }
   Kill-All
 }
 
@@ -259,35 +252,35 @@ foreach ($t in $targets) {
 $okRows = @($results | Where-Object { $_.startMs -is [long] -and $_.startMs -ge 0 })
 $winStart = if ($okRows.Count) { ($okRows | Sort-Object startMs | Select-Object -First 1).name } else { 'n/a' }
 $winRam   = if ($okRows.Count) { ($okRows | Sort-Object ramWS   | Select-Object -First 1).name } else { 'n/a' }
-$okJet    = @($results | Where-Object { $_.jet -is [double] -or $_.jet -is [long] })
-$winJet   = if ($okJet.Count) { ($okJet | Sort-Object { [double]$_.jet } -Descending | Select-Object -First 1).name } else { 'n/a' }
-$okSpeed  = @($results | Where-Object { $_.speedo -is [double] -or $_.speedo -is [long] })
-$winSpeed = if ($okSpeed.Count) { ($okSpeed | Sort-Object { [double]$_.speedo } -Descending | Select-Object -First 1).name } else { 'n/a' }
+$okBh     = @($results | Where-Object { $_.bhbench -is [double] -or $_.bhbench -is [long] })
+$winBh    = if ($okBh.Count) { ($okBh | Sort-Object { [double]$_.bhbench } -Descending | Select-Object -First 1).name } else { 'n/a' }
 
-$bh = $results | Where-Object { $_.name -like 'BLACKHOLE*' } | Select-Object -First 1
-$gx = $results | Where-Object { $_.name -like 'Opera*' } | Select-Object -First 1
+$bhRow = $results | Where-Object { $_.name -like 'BLACKHOLE*' } | Select-Object -First 1
+$gx    = $results | Where-Object { $_.name -like 'Opera*' } | Select-Object -First 1
 $verdict = ''
-if ($bh -and $gx -and $bh.ramWS -is [double] -and $gx.ramWS -is [double]) {
-  $diff = [math]::Round($gx.ramWS - $bh.ramWS, 1)
-  $verdict = if ($diff -gt 0) {
-    "BLACKHOLE an RAM: thieu hon Opera GX $diff MB (WS). Cold start nhanh hon $([math]::Round($gx.startMs - $bh.startMs)) ms."
-  } else {
-    "Opera GX nhe RAM hon $([math]::Abs($diff)) MB — nhung BLACKHOLE khong bundle engine nao ca."
+if ($bhRow -and $bhRow.ramWS -is [double]) {
+  $verdict = "BLACKHOLE: cold start $($bhRow.startMs) ms, RAM $($bhRow.ramWS) MB, BH-Bench $($bhRow.bhbench)."
+  if ($gx -and $gx.ramWS -is [double]) {
+    $diff = [math]::Round($gx.ramWS - $bhRow.ramWS, 1)
+    if ($diff -gt 0) {
+      $verdict += " An RAM hon Opera GX $diff MB (WS) va nhanh hon $([math]::Round($gx.startMs - $bhRow.startMs)) ms khi mo."
+    } else {
+      $verdict += " Opera GX nhe RAM hon $([math]::Abs($diff)) MB nhung BLACKHOLE khong bundle engine."
+    }
   }
-} elseif ($bh -and $bh.ramWS -is [double]) {
-  $verdict = "So sanh Edge/Chrome cung nhan Chromium: BLACKHOLE dung webview he thong, khong cai them gi."
+  $verdict += " Khong bundle engine, khong service nen, khong telemetry."
 } else {
-  $verdict = "BLACKHOLE chua do duoc tren runner — xem note trong bang."
+  $verdict = "BLACKHOLE chua do duoc tren runner (CDP khong len) — cac browser kia co so that ben duoi."
 }
 
 $tableLines = @()
-$tableLines += '| Browser | Cold start (ms) | RAM 5 tabs (MB WS) | RAM private | JetStream 2 | Speedometer 3 |'
-$tableLines += '|---|---|---|---|---|---|'
+$tableLines += '| Browser | Cold start (ms) | RAM 5 tabs (MB WS) | RAM private | BH-Bench (cao=tốt) |'
+$tableLines += '|---|---|---|---|---|'
 foreach ($r in $results) {
   $s  = if ($r.startMs -is [long] -and $r.startMs -ge 0) { $r.startMs } else { 'FAIL' }
   $w  = if ($null -ne $r.ramWS) { $r.ramWS } else { '-' }
   $pv = if ($null -ne $r.ramPriv) { $r.ramPriv } else { '-' }
-  $tableLines += "| $($r.name) | $s | $w | $pv | $($r.jet) | $($r.speedo) |"
+  $tableLines += "| $($r.name) | $s | $w | $pv | $($r.bhbench) |"
 }
 
 $json = [pscustomobject]@{
@@ -296,8 +289,7 @@ $json = [pscustomobject]@{
   browsers   = $results
   winStart   = $winStart
   winRam     = $winRam
-  winJet     = $winJet
-  winSpeed   = $winSpeed
+  winBh      = $winBh
   verdict    = $verdict
   tableLines = $tableLines
 }
@@ -312,19 +304,18 @@ $md += $tableLines
 $md += ''
 $md += ('**Thắng cold start:** ' + $winStart + '  ')
 $md += ('**Thắng RAM (5 tabs):** ' + $winRam + '  ')
-$md += ('**Thắng JetStream 2:** ' + $winJet + '  ')
-$md += ('**Thắng Speedometer 3:** ' + $winSpeed)
+$md += ('**Thắng BH-Bench JS:** ' + $winBh)
 $md += ''
 $md += ('**Kết luận:** ' + $verdict)
 $md += ''
-$md += '> Ghi chú công bằng: Edge/Chrome/Opera GX đều nhân Chromium; BLACKHOLE Browser dùng WebView2'
-$md += '> (cùng nhân Chromium của máy) — điểm JS gần nhau là đúng lý thuyết. Lợi thế thật nằm ở RAM +'
-$md += '> cold start + dung lượng cài đặt: không bundle engine, không service nền, không telemetry.'
+$md += '> Ghi chú công bằng: BH-Bench là benchmark JS tự định nghĩa của Blackhole (cùng công thức'
+$md += '> cho mọi browser, median 3 lần). Edge/Chrome/Opera GX đều nhân Chromium. Lợi thế thật của'
+$md += '> BLACKHOLE nằm ở RAM + cold start + dung lượng: không bundle engine, không service nền.'
 $md | Set-Content (Join-Path $outDir 'bench.md') -Encoding UTF8
 
 Write-Host "`n=================== KẾT QUẢ ==================="
 $tableLines | ForEach-Object { Write-Host $_ }
-Write-Host ("WIN START=$winStart | WIN RAM=$winRam | WIN JET=$winJet | WIN SPEEDO=$winSpeed")
+Write-Host ("WIN START=$winStart | WIN RAM=$winRam | WIN BH-BENCH=$winBh")
 Write-Host $verdict
 
 if ($env:GITHUB_STEP_SUMMARY) {
