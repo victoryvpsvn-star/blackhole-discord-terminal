@@ -7,8 +7,11 @@ license = "MIT"
 
 [dependencies]
 tao = "0.30"
-wry = "0.46"
+wry = { version = "0.46", features = ["devtools"] }
 serde_json = "1"
+
+[features]
+devtools = []            # bật F12 DevTools cho wry::WebView::open_devtools
 
 [profile.release]
 opt-level = "z"       # toi uu kich thuoc binary — gaming browser khong nen nang

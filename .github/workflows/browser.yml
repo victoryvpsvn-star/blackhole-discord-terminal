@@ -47,6 +47,11 @@ jobs:
         working-directory: browser
         run: cargo build --release
 
+      - name: Chạy unit test BlackholeCore (chỉ Linux có webkit để build)
+        if: runner.os == 'Linux'
+        working-directory: browser
+        run: cargo test --release 2>&1 | tail -30
+
       - name: Đóng gói + checksum
         shell: pwsh
         run: |

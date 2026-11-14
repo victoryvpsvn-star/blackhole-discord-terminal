@@ -6,6 +6,24 @@
 > GitHub Actions runner** — đo Cold start, RAM 5 tabs, Speedometer 3 đối đầu
 > **Microsoft Edge / Google Chrome / Opera GX**, tự gửi file + bảng điểm về Discord webhook.
 >
+> ### BlackholeCore — nhân vận hành RIÊNG (v2.0 core)
+>
+> Nhân render/JS là nhân webview có sẵn trong máy (WebView2/WebKitGTK) — như Edge/Brave/
+> Opera cũng đi trên nhân Chromium. Khác biệt nằm ở **tầng core vận hành do Blackhole tự
+> viết** (`browser/src/core/`, tách module kỹ):
+>
+> | Module | Vai trò |
+> |---|---|
+> | `engine.rs` | UA riêng `BlackholeBrowser/3.0`, browser args riêng (tắt UI overlay Edge, **không throttle tab nền**), profile data riêng `~/.blackhole-browser/data` |
+> | `tabs.rs` | **Tab keep-alive đa webview** — chuyển tab trong 1 khung hình, KHÔNG tải lại (fix delay của v1.0); LRU Memory Saver: >8 tab sống thì tab cũ nhất "ngủ" trả RAM |
+> | `scheme.rs` | trang nội bộ `blackhole://start`, `blackhole://about` — scheme riêng như chrome:// |
+> | `ipc.rs` + `commands.rs` | giao thức JSON 1 đường + Command enum — chống deadlock (không lock qua webview call) |
+> | `prefs.rs` | cấu hình: **Search mặc định GOOGLE**, zoom, turbo — lưu `prefs.json` |
+> | `hotkeys.rs` | bảng phím tắt gaming (pure fn, có unit test) |
+>
+> Phím tắt: `Ctrl+T/W/Tab/1..8` tab · `Ctrl+L` địa chỉ · `F9` TURBO (dọn cache trả RAM) ·
+> `F12` DevTools · `F11` fullscreen · `Ctrl+=/-/0` zoom.
+>
 > Vì sao BLACKHOLE Browser nhẹ hơn: **KHÔNG bundle engine**. Opera GX cài 300-500MB, bật
 > lên chiếm ~500MB+ RAM vì nó NHÚNG cả Chromium. BLACKHOLE dùng **webview hệ thống** máy
 > bạn đã có sẵn (Windows = WebView2, Linux = WebKitGTK) — binary chỉ vài MB, không service
