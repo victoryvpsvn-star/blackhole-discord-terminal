@@ -9,6 +9,10 @@ BH_MEM_TOTAL_MB=""; BH_MEM_AVAIL_MB=""; BH_MEM_SWAP_MB=""
 BH_MEM_LIMIT_MB="0"; BH_MEM_EFF_MB=""; BH_CPU_QUOTA_TXT=""
 BH_DISK_DEV=""; BH_DISK_FS=""; BH_DISK_TOTAL_MB=""; BH_DISK_AVAIL_MB=""
 BH_IPV4=""; BH_IPV6=""; BH_IP_GEO=""; BH_IP_ASN=""
+# deep-scan extras (v2)
+BH_DNS=""; BH_TCPCC=""; BH_TCPCC_AVAIL=""; BH_ENTROPY=""
+BH_TUN=0; BH_FUSE=0; BH_PPP=0
+BH_LOAD=""; BH_PROCS=0; BH_TZ=""
 
 gather_info() {
   BH_HOSTNAME="$(hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
@@ -74,6 +78,20 @@ gather_info() {
     BH_DISK_FS=""
   fi
   [ -n "$BH_DISK_FS" ] || BH_DISK_FS="unknown"
+
+  # ---- deep-scan extras (v2: dò thêm nhiều thứ) ----
+  BH_DNS="$(awk '/^nameserver/{print $2}' /etc/resolv.conf 2>/dev/null | head -n 3 | paste -sd ',' -)"
+  BH_TCPCC="$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)"
+  BH_TCPCC_AVAIL="$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null)"
+  BH_ENTROPY="$(cat /proc/sys/kernel/random/entropy_avail 2>/dev/null)"
+  [ -c /dev/net/tun ] && BH_TUN=1
+  [ -c /dev/fuse ]    && BH_FUSE=1
+  [ -c /dev/ppp ]     && BH_PPP=1
+  BH_LOAD="$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)"
+  # count PIDs; guard against the unmatched-glob literal ("/proc/[0-9]*")
+  # when /proc is not mounted, which would otherwise report 1 "process"
+  BH_PROCS="$(set -- /proc/[0-9]*; if [ -d "$1" ]; then echo $#; else echo 0; fi)"
+  BH_TZ="$(cat /etc/timezone 2>/dev/null || date +%Z 2>/dev/null)"
 
   # ---- network identity (optional) ----
   if [ "$BH_NO_NET" != "1" ] && command_exists curl; then

@@ -1,10 +1,12 @@
 # blackhole-vps-bench
 
-Tool kiểm tra VPS của bạn thực chất đang chạy trên gì — KVM, QEMU, Docker, Podman, Kubernetes, LXC/LXD, OpenVZ, Xen, Hyper-V, VMware, VirtualBox, bhyve, WSL hay máy chủ dedicated — rồi benchmark đúng **cấu hình thực** (đọc cgroup limit chứ không báo nhầm RAM/CPU của host). Thuần bash, một file duy nhất, chạy được cả trong container Alpine, có GitHub Actions selftest và gửi báo cáo về Discord.
+Tool kiểm tra VPS của bạn thực chất đang chạy trên gì — KVM, QEMU, Docker, Podman, Kubernetes, LXC/LXD, OpenVZ, Xen, Hyper-V, VMware, VirtualBox, bhyve, WSL hay máy chủ dedicated — rồi benchmark đúng **cấu hình thực** (đọc cgroup limit chứ không báo nhầm RAM/CPU của host), **audit SSH & bảo mật ngay trên máy** (password hay key auth, root login, firewall, fail2ban, brute-force log...), đo **tốc độ mạng down/up + latency/jitter**. Thuần bash, một file duy nhất, chạy được cả trong container Alpine, có GitHub Actions selftest, và **kết quả in thẳng ra terminal** — Discord chỉ là tuỳ chọn.
 
-- Phiên bản: v1.0.0
+- Phiên bản: **v2.0.0**
 - Repo: `victoryvpsvn-star/blackhole-discord-terminal`
-- Yêu cầu: Linux + bash, `curl` (bắt buộc cho phần network), còn lại mọi thứ đều tự động hóa qua `dd`/`sha256sum`/`openssl`/`fio` nếu có. Không cần root.
+- Yêu cầu: Linux + bash, `curl` (bắt buộc cho phần network), còn lại mọi thứ đều tự động hóa qua `dd`/`sha256sum`/`openssl`/`fio`/`ss` nếu có. Không cần root (có root thì audit sâu hơn).
+
+> **Có gì mới ở v2?** Mode `sec` audit SSH/bảo mật độc lập · badge màu [OK]/[WARN]/[BAD] ngay terminal · ICMP latency + jitter · deep-scan (DNS, TCP congestion control, entropy, TUN/FUSE/PPP, load, tiến trình, timezone) · JSON/Markdown có thêm `security` + `net_env` · container job trong CI bị giới hạn cứng 2 CPU / 2 GB để chứng minh bench tự scale theo quota.
 
 ---
 
@@ -29,13 +31,16 @@ Hoặc chạy từ bản checkout của repo:
 ./vps-bench/bin/blackhole-vps-bench all
 ```
 
-Ba lệnh hay dùng nhất:
+Bốn lệnh hay dùng nhất:
 
 ```sh
 blackhole-vps-bench detect                # KVM hay Docker? (offline, vài giây)
-blackhole-vps-bench all --fast            # detect + bench nhanh
-blackhole-vps-bench all --webhook 'https://discord.com/api/webhooks/ID/TOKEN'
+blackhole-vps-bench all --fast            # detect + bench nhanh + audit bảo mật
+blackhole-vps-bench sec                   # chỉ audit SSH & bảo mật (không bench)
+blackhole-vps-bench all --webhook 'https://discord.com/api/webhooks/ID/TOKEN'   # nếu MUỐN đẩy Discord
 ```
+
+Kết quả luôn in ngay terminal: verdict có bằng chứng (evidence), benchmark có màu, audit SSH có badge `[OK]`/`[WARN]`/`[BAD]`, cuối là BH-SCORE. Không cần webhook gì hết.
 
 ---
 
@@ -45,17 +50,19 @@ blackhole-vps-bench all --webhook 'https://discord.com/api/webhooks/ID/TOKEN'
 
 | Chế độ | Ý nghĩa |
 |---|---|
-| `all` | detect + info + benchmark đầy đủ (mặc định) |
+| `all` | detect + info + benchmark đầy đủ + security audit (mặc định) |
 | `detect` | chỉ nhận diện ảo hóa, nhanh, chạy được offline |
-| `info` | chỉ in thông tin hệ thống, không benchmark |
+| `info` | system info + security audit, không benchmark |
 | `bench` | chỉ benchmark (vẫn in verdict để biết ngữ cảnh) |
+| `sec` | chỉ audit SSH & bảo mật — không benchmark, không tạo traffic |
 | `help` | in trợ giúp |
 
 | Tuỳ chọn | Ý nghĩa |
 |---|---|
 | `--fast` | profile nhanh (payload nhỏ hơn) |
 | `--no-net` | bỏ qua test mạng (không tạo traffic ra ngoài) |
-| `--webhook URL` | gửi báo cáo Discord embed (env: `BH_WEBHOOK`) |
+| `--no-sec` | bỏ qua audit SSH/bảo mật |
+| `--webhook URL` | gửi báo cáo Discord embed (env: `BH_WEBHOOK`) — **tuỳ chọn** |
 | `--json PATH` | ghi báo cáo JSON ra PATH (`-` = stdout) |
 | `--markdown PATH` | ghi báo cáo Markdown ra PATH (`-` = stdout) |
 | `--output PATH` | ghi báo cáo plain-text ra PATH |
@@ -64,18 +71,9 @@ blackhole-vps-bench all --webhook 'https://discord.com/api/webhooks/ID/TOKEN'
 | `--version` | in phiên bản |
 | `-h`, `help` | in trợ giúp |
 
-Biến môi trường: `BH_WEBHOOK`, `BH_FAST=1`, `BH_NO_NET=1`, `BH_DISK_DIR`, `BH_NO_COLOR=1`.
+Biến môi trường: `BH_WEBHOOK`, `BH_FAST=1`, `BH_NO_NET=1`, `BH_NO_SEC=1`, `BH_DISK_DIR`, `BH_NO_COLOR=1`.
 
 Exit codes: `0` ok | `1` benchmark không sinh được dữ liệu | `2` sai cú pháp lệnh.
-
-Ví dụ chuẩn:
-
-```sh
-blackhole-vps-bench
-blackhole-vps-bench detect
-blackhole-vps-bench all --fast --webhook https://discord.com/api/webhooks/xxx/yyy
-blackhole-vps-bench all --json report.json --markdown report.md
-```
 
 ---
 
@@ -102,8 +100,6 @@ Mọi kết luận đều kèm **Evidence**: các dòng bằng chứng in ngay d
 | bhyve | DMI vendor "FreeBSD bhyve" |
 | Bare metal | không có hypervisor flag, không container marker, không DMI của VM |
 
-Thêm nữa: cờ `hypervisor` trong `/proc/cpuinfo` làm bằng chứng dự phòng; ghi chú nested virtualization khi thấy `vmx`/`svm`; và nếu mọi nhận diện đều trống mới kết luận dedicated.
-
 Ví dụ output (rút gọn):
 
 ```
@@ -111,17 +107,51 @@ Ví dụ output (rút gọn):
   Kind    : container
   Type    : docker
   Product : Docker
-  Host VM : KVM/QEMU
-  Verdict : Container (Docker) on host: KVM/QEMU
+  Host VM : KVM
+  Verdict : Container (Docker) on host: KVM
   Evidence:
   • /.dockerenv present
-  • /proc/1/cgroup references docker
-  • host DMI: vendor='QEMU' product='Standard PC (Q35 + ICH9, 2009)'
+  • systemd-detect-virt --vm = kvm
 ```
 
 ---
 
-## 4. Cách đo benchmark
+## 4. Audit SSH & bảo mật (v2) — "hacker checklist" cho chính máy bạn
+
+Section `[5] SSH & SECURITY AUDIT` chỉ đọc cấu hình **trên chính máy này** — không scan/đánh máy ai. Mỗi dòng có badge màu khi in ra terminal:
+
+| Badge | Ý nghĩa |
+|---|---|
+| `[OK]` (xanh lá) | cấu hình tốt |
+| `[WARN]` (vàng) | nên sửa (ví dụ bật password auth, firewall inactive) |
+| `[BAD]` (đỏ) | rủi ro nghiêm trọng (PermitRootLogin yes, mật khẩu trống, tài khoản UID-0 lạ) |
+| `[INFO]` | thông tin tham khảo |
+
+Các check thực hiện:
+
+- **sshd effective config**: `sshd -T` khi có quyền; không thì parse `/etc/ssh/sshd_config` + drop-in `/etc/ssh/sshd_config.d/*.conf` đúng semantics *first-match-wins* của OpenSSH (drop-in thường thắng vì Include nằm đầu file). In rõ nguồn cấu hình đã dùng.
+- **PasswordAuthentication** — `no` = chỉ cho đăng nhập bằng key (khuyến nghị); `yes`/mặc định = cảnh báo brute-force surface.
+- **PubkeyAuthentication** — tắt sẽ bị cảnh báo.
+- **PermitRootLogin** — `yes` là `[BAD]`; `prohibit-password` (mặc định) kèm gợi ý.
+- **SSH port(s)** + `MaxAuthTries` (hỗ trợ multi-Port).
+- **authorized_keys**: đếm key của `root` + mọi `/home/*`, phân loại `ed25519`/`RSA`/`ECDSA`, và dùng `ssh-keygen -lf` (nếu có) để bắt key yếu < 2048 bit.
+- **Failed SSH logins**: đếm qua `journalctl` (24h gần nhất) hoặc `/var/log/auth.log`; ≥ 50 lần/24h → cảnh báo đang bị brute-force.
+- **Firewall**: ufw active / nftables / iptables rules / firewalld; không thấy gì → `[WARN]`.
+- **fail2ban**, **sudo NOPASSWD**, **tài khoản UID-0** (ngoài root là `[BAD]`), **mật khẩu trống** trong `/etc/shadow` (cần root), **ASLR**, **auto security updates** (unattended-upgrades / dnf-automatic), **listening TCP ports**.
+- Kết: **Posture** `GOOD` / `FAIR` / `WEAK` kèm đếm pass/warn/bad.
+
+Chạy riêng nhanh:
+
+```sh
+blackhole-vps-bench sec            # chỉ audit, vài giây
+blackhole-vps-bench sec --json sec.json
+```
+
+> Tool này là audit **một chiều trên máy mình** (kiểu Lynis thu nhỏ). Nó không brute-force, không scan mạng ai cả.
+
+---
+
+## 5. Cách đo benchmark
 
 | Hạng mục | Cách đo |
 |---|---|
@@ -132,7 +162,10 @@ Ví dụ output (rút gọn):
 | Memory fallback | không có compiler thì dùng proxy `dd` — kết quả luôn ghi kèm `[method]` để bạn biết số nào thật |
 | Disk seq/4K | `dd` ghi rồi đọc: seq block 1M, 4K block 4k; ghi có fsync; có `fio` thì thêm 4K random IOPS (randrw 8s, direct, bỏ qua khi `--fast`) |
 | Network | download từ `speed.cloudflare.com/__down` (100 MB, fast: 25 MB; fallback cachefly), upload POST lên `speed.cloudflare.com/__up` (25 MB, fast: 10 MB), latency = TCP connect time |
+| ICMP latency + jitter (v2) | `ping -c 4` tới 1.1.1.1 (fallback 8.8.8.8): avg + mdev (jitter). Container không có CAP_NET_RAW thì tự bỏ qua, giữ số TCP connect |
 | Địa lý | IPv4/IPv6 qua ipify; geo/ISP/ASN qua ip-api.com |
+
+Deep-scan (v2, in trong section `[2] SYSTEM / REAL CONFIG`): TCP congestion control đang dùng + các thuật toán available (thấy `bbr` là VPS tốt cho proxy/VPN), entropy pool, DNS resolvers, TUN/TAP + FUSE + PPP (đủ để chạy VPN hay không), load average, số tiến trình, timezone.
 
 Vì sao số có thể khác các tool/label khác:
 
@@ -143,7 +176,7 @@ Vì sao số có thể khác các tool/label khác:
 
 ---
 
-## 5. BH-SCORE
+## 6. BH-SCORE
 
 7 thành phần, mỗi thành phần chặn tối đa 100 điểm, tổng tối đa **700**:
 
@@ -161,7 +194,7 @@ Ví dụ đọc điểm: 1 core đạt ~500 MB/s sha256 → 500/5 = 100 điểm;
 
 ---
 
-## 6. Cgroup limits — vì sao tool này báo đúng RAM/CPU của container
+## 7. Cgroup limits — vì sao tool này báo đúng RAM/CPU của container
 
 Vào một Docker container, nhiều tool "system info" báo RAM 256 GB và 128 core — đó là của **host**, không phải của bạn. Tool này đọc trực tiếp cấu hình cgroup:
 
@@ -174,10 +207,10 @@ Từ đó tính ra:
 - **Container limit** cho RAM (lấy min giữa limit cgroup và MemTotal)
 - **cpuset** nếu bị giới hạn ràng buộc vào core cụ thể
 
-Số job benchmark multi-core cũng chạy theo effective cores, nên điểm multi phản ánh đúng phần CPU được cấp, không phải toàn host. Báo cáo in rõ:
+Số job benchmark multi-core cũng chạy theo effective cores, nên điểm multi phản ánh đúng phần CPU được cấp, không phải toàn host. CI còn có job chạy container bị giới hạn cứng `--cpus 2 --memory 2g` và assert báo cáo phải nhắc "cgroup quota" — chứng minh tính năng này thật, không phải lời nói.
 
 ```
-  CPU     : Intel(R) Xeon(R) ... 
+  CPU     : Intel(R) Xeon(R) ...
             8 logical / 4 physical cores
             effective: 2 core(s), cgroup quota 2.00 cores, cpuset [0-7]
   RAM     : total 1024 MB, avail 512 MB, swap 0 MB | container limit 1024 MB
@@ -185,41 +218,33 @@ Số job benchmark multi-core cũng chạy theo effective cores, nên điểm mu
 
 ---
 
-## 7. Gửi báo cáo Discord
+## 8. Gửi báo cáo Discord (tuỳ chọn — không bắt buộc)
+
+Mặc định mọi thứ in ngay terminal. Chỉ khi bạn **muốn** đẩy kết quả đi đâu đó:
 
 ```sh
 blackhole-vps-bench all --webhook 'https://discord.com/api/webhooks/ID/TOKEN'
 # hoặc: export BH_WEBHOOK='https://discord.com/api/webhooks/ID/TOKEN'
 ```
 
-Tool POST một embed (màu theo verdict: container xanh dương, VM tím, bare metal xanh lá) gồm:
-
-- **Verdict** (VD: `Container (Docker) on host: KVM/QEMU`)
-- **BH-SCORE** tổng / 700
-- **CPU sha256** 1 core / multi (kèm số threads)
-- **Memory** (GB/s)
-- **Disk** seq và 4K
-- **Network** down/up (bỏ qua khi `--no-net`)
-- **Location** (geo/ISP)
-
-Phần mô tả embed là đoạn cuối của báo cáo text (tối đa 1900 ký tự). Gửi thành công khi Discord trả HTTP 204/200; thất bại chỉ cảnh báo, không làm tool thoát lỗi.
+Tool POST một embed (màu theo verdict: container xanh dương, VM tím, bare metal xanh lá) gồm: Verdict, BH-SCORE, CPU, Memory, Disk, Network, **SSH auth + Security posture (v2)**, Location. Gửi thành công khi Discord trả HTTP 204/200; thất bại chỉ cảnh báo, không làm tool thoát lỗi.
 
 ---
 
-## 8. GitHub Actions
+## 9. GitHub Actions
 
 Hai workflow có sẵn trong `.github/workflows/`.
 
-### 8.1. `vps-bench selftest` — tool tự test bản thân
+### 9.1. `vps-bench selftest` — tool tự test bản thân
 
 Chạy khi push lên `main` (thư mục `vps-bench/**`), khi pull_request thay đổi `vps-bench/**`, chạy tay qua `workflow_dispatch`, và định kỳ cron `0 3 * * 1` (mỗi thứ Hai 03:00 UTC). Bốn job:
 
-1. **shellcheck** — build bundle rồi lint `dist/blackhole-vps-bench`, `install.sh`, `run-tests.sh` (`shellcheck -x -e SC2034,SC2016,SC2317`), kèm kiểm tra bundle trong `dist/` không bị stale so với source.
-2. **smoke** — `tests/run-tests.sh` + chạy full bench `all --fast` trên matrix `ubuntu-24.04` và `ubuntu-22.04`, upload artifact `report-<os>` (JSON/Markdown/text).
-3. **containers** — chạy trong Docker image `alpine:3.20`, `debian:12` (full bench `--no-net`) và `rockylinux:9`, `fedora:41` (chỉ `detect`).
+1. **shellcheck** — build bundle rồi lint `dist/blackhole-vps-bench`, `install.sh`, `run-tests.sh` (`shellcheck -x -e SC2034,SC2016,SC2317,SC2329`), kèm kiểm tra bundle trong `dist/` không bị stale so với source.
+2. **smoke** — `tests/run-tests.sh` (bao gồm test mode `sec` + `--no-sec` + schema JSON có `security`) + chạy full bench `all --fast` trên matrix `ubuntu-24.04` và `ubuntu-22.04`, upload artifact `report-<os>` (JSON/Markdown/text).
+3. **containers** — chạy trong Docker image `alpine:3.20`, `debian:12` (full bench `--no-net`), **`ubuntu:24.04` bị giới hạn `--cpus 2 --memory 2g --shm-size 1g` (full bench + assert "cgroup quota" xuất hiện trong báo cáo — chứng minh bench tự scale theo quota)**, và `rockylinux:9`, `fedora:41` (chỉ `detect`).
 4. **discord notify** — tổng hợp kết quả 3 job trên, gửi embed PASS/FAIL tới secret `DISCORD_WEBHOOK` (nếu chưa set thì bỏ qua, không fail).
 
-### 8.2. `vps-bench remote` — bench VPS thật qua SSH
+### 9.2. `vps-bench remote` — bench VPS thật qua SSH
 
 Chỉ chạy tay qua `workflow_dispatch` với 2 input: `fast` (mặc định bật) và `extra_args` (VD `--disk-dir /data`). Workflow đóng gói `bin/` + `lib/` thành tarball, scp lên VPS, chạy `blackhole-vps-bench all` ngay trên VPS, scp báo cáo về làm artifact `vps-report` và append `report.md` vào job summary.
 
@@ -235,17 +260,15 @@ Chỉ chạy tay qua `workflow_dispatch` với 2 input: `fast` (mặc định b�
 3. Vào tab **Actions → vps-bench remote → Run workflow**, chọn `fast`, điền `extra_args` nếu cần, chạy.
 4. Nếu thiếu secrets bắt buộc, workflow không lỗi — nó in notice "Remote bench disabled" và bỏ qua.
 
-Lưu ý: `ssh-keyscan` được dùng để thêm host key của VPS vào known_hosts lúc chạy. Nếu muốn chặt hơn, pin host key trước khi chạy.
-
 ---
 
-## 9. Output JSON
+## 10. Output JSON
 
-`--json report.json` sinh một object với các nhóm key chính:
+`--json report.json` sinh một object với các nhóm key chính (v2 thêm `net_env` và `security`):
 
 ```json
 {
-  "tool": "blackhole-vps-bench", "version": "1.0.0", "mode": "all",
+  "tool": "blackhole-vps-bench", "version": "2.0.0", "mode": "all",
   "virtualization": { "kind": "container", "type": "docker", "product": "Docker",
                       "host_type": "kvm", "host_product": "KVM/QEMU",
                       "cloud": "", "evidence": ["..."] },
@@ -254,12 +277,24 @@ Lưu ý: `ssh-keyscan` được dùng để thêm host key của VPS vào known_
               "memory": { "total_mb": 1024, "available_mb": 512, "swap_mb": 0 } },
   "limits": { "cgroup_version": 2, "cpu_quota_cores": "2.00",
               "memory_limit_mb": 1024, "cpuset": "0-7" },
+  "net_env": { "tcp_cc": "bbr", "dns": "1.1.1.1,8.8.8.8", "entropy": 256,
+               "tun": 0, "fuse": 0, "ppp": 0, "load": "0.10 0.08 0.09", "processes": 87 },
   "bench": { "cpu": { "sha256_1c_mbps": 498.2, "sha256_mc_mbps": 995.4, "threads": 2 },
              "memory": { "gbps": 11.4, "method": "c-loop" },
              "disk": { "mode": "direct+fsync +direct-read", "seq_write_mbps": 210.5,
                        "k4_write_mbps": 55.1, "k4_read_mbps": 260.0,
                        "fio_randread_iops": "", "fio_randwrite_iops": "" },
-             "network": { "download_mbps": 940.1, "upload_mbps": 380.2, "connect_ms": 1.9 } },
+             "network": { "download_mbps": 940.1, "upload_mbps": 380.2, "connect_ms": 1.9,
+                          "icmp_latency_ms": "", "icmp_jitter_ms": "" } },
+  "security": { "sshd_found": 1, "password_auth": "no", "pubkey_auth": "yes",
+                "root_login": "prohibit-password", "ports": "22",
+                "authorized_keys": 2, "key_types": "ed25519x2", "weak_keys": 0,
+                "failed_logins": "0 in last 24h (journalctl)",
+                "firewall": "ufw active", "fail2ban": 1, "uid0_accounts": "root",
+                "empty_passwords": "0", "sudo_nopasswd": "no", "aslr": "2",
+                "auto_updates": "enabled (unattended-upgrades)",
+                "listening_ports": "22,80,443", "pass": 7, "warn": 1, "bad": 0,
+                "posture": "GOOD" },
   "score": { "cpu_1c": 100, "cpu_multi": 50, "memory": 91, "disk_seq": 21,
              "disk_4k": 79, "net_down": 47, "net_up": 19, "total": 407, "max": 700 }
 }
@@ -269,13 +304,15 @@ Các hạng mục chưa đo được (ví dụ chạy `detect`/`info`, hoặc `f
 
 ---
 
-## 10. FAQ
+## 11. FAQ
 
-**Multi-core thấp hơn core × single?** Bình thường. Hyper-Threading/SMT chia sẻ Execution unit, cache và băng thông bộ nhớ; container còn bị chặn bởi CPU quota. Điểm multi phản ánh throughput thật khi chạy đồng thời, không phải phép nhân lý thuyết.
+**Multi-core thấp hơn core × single?** Bình thường. Hyper-Threading/SMT chia sẻ execution unit, cache và băng thông bộ nhớ; container còn bị chặn bởi CPU quota. Điểm multi phản ánh throughput thật khi chạy đồng thời, không phải phép nhân lý thuyết.
 
 **Disk read cao bất thường?** Page cache. Khi filesystem không cho `O_DIRECT` (khá phổ biến trong container/overlayfs), phần đọc được tính nhanh vì dữ liệu còn trong RAM. Kiểm tra dòng mode trong báo cáo: không thấy `+direct-read` nghĩa là số read có thể bị "tốt ảo".
 
-**Có cần root không?** Không. Tool chỉ đọc `/proc`, `/sys`, ghi một file test tạm vào `--disk-dir` (mặc định `/tmp`) rồi xoá. Có `fio` thì thêm số IOPS, có `openssl` thì thêm cross-check — thiếu tự giản lược.
+**Có cần root không?** Không. Tool chỉ đọc `/proc`, `/sys`, ghi một file test tạm vào `--disk-dir` (mặc định `/tmp`) rồi xoá. Có root thì audit sâu hơn (`sshd -T`, `/etc/shadow`, `journalctl`, đếm failed logins chính xác). Thiếu gì tự giản lược và ghi rõ `n/a`.
+
+**Audit SSH có đụng tới máy khác không?** Không. Toàn bộ section `[5]` chỉ đọc cấu hình và log của chính máy đang chạy tool — giống Lynis thu nhỏ. Không brute-force, không scan mạng.
 
 **Chạy trong Alpine/busybox được không?** Được — pipeline CI chính là chạy trong `alpine:3.20`. Cần `bash` và `curl` (cài `coreutils`/`openssl` cho đủ tính năng).
 
@@ -283,14 +320,15 @@ Các hạng mục chưa đo được (ví dụ chạy `detect`/`info`, hoặc `f
 
 ## English quick reference
 
-`blackhole-vps-bench` is a single-file pure-bash Linux tool that (1) detects the virtualization environment — KVM/QEMU, Docker, Podman, Kubernetes, LXC/LXD, systemd-nspawn, OpenVZ/Virtuozzo, Xen PV/HVM, Hyper-V, VMware, VirtualBox, bhyve, WSL, or bare metal — printing verifiable evidence lines for every verdict, and (2) benchmarks the real cgroup-limited configuration: CPU sha256 throughput (single and effective-core parallel), memory bandwidth (compiled C memcpy loop with a labeled dd fallback), disk sequential and 4K dd throughput with automatic O_DIRECT detection plus optional fio random IOPS, and network download/upload via Cloudflare speed endpoints with TCP connect latency, plus IP geo/ASN from ip-api.com. Each of 7 score components (cpu1c = sha1c/5, cpumc = shanc/20, mem = GBps*8, dseq = seqw/10, d4k = (4kw+4kr)/4, ndown = down/20, nup = up/20) is capped at 100 for a BH-SCORE of at most 700. Reports go to pretty terminal text, JSON, Markdown, and optionally a Discord embed webhook.
+`blackhole-vps-bench` is a single-file pure-bash Linux tool that (1) detects the virtualization environment — KVM/QEMU, Docker, Podman, Kubernetes, LXC/LXD, systemd-nspawn, OpenVZ/Virtuozzo, Xen PV/HVM, Hyper-V, VMware, VirtualBox, bhyve, WSL, or bare metal — printing verifiable evidence lines for every verdict; (2) benchmarks the real cgroup-limited configuration: CPU sha256 throughput (single and effective-core parallel), memory bandwidth (compiled C memcpy loop with a labeled dd fallback), disk sequential and 4K dd throughput with automatic O_DIRECT detection plus optional fio random IOPS, and network download/upload via Cloudflare speed endpoints with TCP connect latency plus ICMP latency/jitter when ping is permitted; (3) audits the local SSH & security posture (password vs pubkey auth, root login, authorized_keys inventory with weak-key detection, failed login counts, firewall, fail2ban, UID-0 accounts, empty passwords, sudo NOPASSWD, ASLR, auto updates, listening ports) summarized as GOOD/FAIR/WEAK — local machine only, no remote scanning; and (4) reports everything to the terminal with colored OK/WARN/BAD badges, plus optional JSON, Markdown, and Discord webhook outputs. Each of 7 score components (cpu1c = sha1c/5, cpumc = shanc/20, mem = GBps*8, dseq = seqw/10, d4k = (4kw+4kr)/4, ndown = down/20, nup = up/20) is capped at 100 for a BH-SCORE of at most 700.
 
 | Flag | Effect |
 |---|---|
-| `all` / `detect` / `info` / `bench` / `help` | modes (default `all`) |
+| `all` / `detect` / `info` / `bench` / `sec` / `help` | modes (default `all`) |
 | `--fast` | smaller test payloads |
 | `--no-net` | skip network tests |
-| `--webhook URL` | POST Discord embed (env `BH_WEBHOOK`) |
+| `--no-sec` | skip the SSH/security audit |
+| `--webhook URL` | POST Discord embed (env `BH_WEBHOOK`) — optional |
 | `--json PATH` | JSON report (`-` = stdout) |
 | `--markdown PATH` | Markdown report (`-` = stdout) |
 | `--output PATH` | plain-text report |
@@ -300,7 +338,8 @@ Các hạng mục chưa đo được (ví dụ chạy `detect`/`info`, hoặc `f
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/victoryvpsvn-star/blackhole-discord-terminal/main/vps-bench/install.sh | sh
-blackhole-vps-bench all --fast --webhook https://discord.com/api/webhooks/xxx/yyy
+blackhole-vps-bench all --fast
+blackhole-vps-bench sec
 ```
 
 Exit codes: 0 ok, 1 no benchmark data, 2 usage error. No root required.

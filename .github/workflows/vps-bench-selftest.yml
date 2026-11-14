@@ -30,10 +30,12 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Install shellcheck
+      - name: Install shellcheck (pinned v0.10.0)
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq shellcheck
+          curl -fsSL -o /tmp/sc.tar.xz https://github.com/koalaman/shellcheck/releases/download/v0.10.0/shellcheck-v0.10.0.linux.x86_64.tar.xz
+          tar -xJf /tmp/sc.tar.xz -C /tmp
+          sudo install -m 0755 /tmp/shellcheck-v0.10.0/shellcheck /usr/local/bin/shellcheck
+          shellcheck --version | sed -n 2p
       - name: Build bundle
         run: vps-bench/build.sh
       - name: shellcheck
@@ -84,6 +86,9 @@ jobs:
         include:
           - { image: alpine:3.20,   full: true  }
           - { image: debian:12,     full: true  }
+          # ubuntu:24.04 runs with a hard 2-CPU / 2-GB quota to prove the
+          # cgroup-adaptive sizing (report must mention the cgroup quota)
+          - { image: ubuntu:24.04,  full: true, quota: '--cpus 2 --memory 2g --shm-size 1g' }
           - { image: rockylinux:9,  full: false }
           - { image: fedora:41,     full: false }
     steps:
@@ -92,7 +97,7 @@ jobs:
         run: vps-bench/build.sh
       - name: Run inside ${{ matrix.image }}
         run: |
-          docker run --rm -v "$PWD:/work" -w /work "${{ matrix.image }}" /bin/sh -c '
+          docker run --rm ${{ matrix.quota }} -v "$PWD:/work" -w /work "${{ matrix.image }}" /bin/sh -c '
             set -e
             if grep -qi alpine /etc/os-release; then
               apk add --no-cache bash curl coreutils openssl >/dev/null
@@ -103,14 +108,22 @@ jobs:
               # installing full curl/coreutils would conflict with them
               dnf -y install openssl >/dev/null
             else
-              dnf -y install bash curl openssl coreutils >/dev/null
+              # fedora: image ships bash + coreutils-single + curl-minimal; a full
+              # coreutils install would conflict with coreutils-single
+              dnf -y install openssl >/dev/null
             fi
             bash vps-bench/bin/blackhole-vps-bench detect
             if [ "${{ matrix.full }}" = "true" ]; then
               bash vps-bench/bin/blackhole-vps-bench all --fast --no-net --output /tmp/report.txt
               grep -q "Kind    :" /tmp/report.txt
+              grep -q "SSH & SECURITY AUDIT" /tmp/report.txt
               echo "--- verdict ---"
               grep "Verdict :" /tmp/report.txt
+              echo "--- posture ---"
+              grep "Posture:" /tmp/report.txt
+            fi
+            if [ -n "${{ matrix.quota }}" ]; then
+              grep -q "cgroup quota" /tmp/report.txt || { echo "ERROR: cgroup quota not detected/reported"; exit 1; }
             fi
           '
 

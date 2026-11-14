@@ -67,11 +67,14 @@ jobs:
           PORT="${VPS_PORT:-22}"
           FLAGS="--fast"
           [ "${{ inputs.fast }}" != "true" ] && FLAGS=""
+          # optional webhook: only pass --webhook when the secret is set,
+          # otherwise an empty argument would make the tool exit 2
+          [ -n "$DISCORD_WEBHOOK" ] && FLAGS="$FLAGS --webhook '$DISCORD_WEBHOOK'"
           tar -C vps-bench -czf /tmp/bh.tgz bin lib
           scp -q -i ~/.ssh/bh_key -P "$PORT" /tmp/bh.tgz "$VPS_USER@$VPS_HOST:/tmp/bh.tgz"
           # shellcheck disable=SC2029
           ssh -q -i ~/.ssh/bh_key -p "$PORT" "$VPS_USER@$VPS_HOST" \
-            "rm -rf /tmp/bhvps && mkdir -p /tmp/bhvps && tar -xzf /tmp/bh.tgz -C /tmp/bhvps && cd /tmp/bhvps && bash bin/blackhole-vps-bench all $FLAGS ${{ inputs.extra_args }} --webhook '$DISCORD_WEBHOOK' --json /tmp/bhvps/report.json --markdown /tmp/bhvps/report.md --output /tmp/bhvps/report.txt"
+            "rm -rf /tmp/bhvps && mkdir -p /tmp/bhvps && tar -xzf /tmp/bh.tgz -C /tmp/bhvps && cd /tmp/bhvps && bash bin/blackhole-vps-bench all $FLAGS ${{ inputs.extra_args }} --json /tmp/bhvps/report.json --markdown /tmp/bhvps/report.md --output /tmp/bhvps/report.txt"
           mkdir -p report
           scp -q -i ~/.ssh/bh_key -P "$PORT" "$VPS_USER@$VPS_HOST:/tmp/bhvps/report.json" \
             "$VPS_USER@$VPS_HOST:/tmp/bhvps/report.md" \

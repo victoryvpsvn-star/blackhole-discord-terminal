@@ -5,6 +5,8 @@
 # shellcheck shell=bash
 
 BH_DOWN_MBPS=""; BH_UP_MBPS=""; BH_LAT_MS=""; BH_NET_METHOD=""
+# ICMP latency + jitter (v2) — empty when ping is unavailable/blocked
+BH_LAT_ICMP=""; BH_LAT_JITTER=""; BH_LAT_TARGET=""
 
 bench_net() {
   if [ "$BH_NO_NET" = "1" ]; then
@@ -23,6 +25,24 @@ bench_net() {
     lat="$(curl -s -o /dev/null --max-time 8 -w '%{time_starttransfer}' 'https://speed.cloudflare.com/__down?bytes=1' 2>/dev/null)"
   fi
   [ -n "$lat" ] && BH_LAT_MS="$(awk -v t="$lat" 'BEGIN{ if (t+0>0) printf "%.1f", t*1000; else print 0 }')"
+
+  # ICMP latency + jitter (v2): ping needs CAP_NET_RAW — often absent in
+  # containers, so this stays optional and the TCP number above remains.
+  if command_exists ping; then
+    local tgt out
+    for tgt in 1.1.1.1 8.8.8.8; do
+      if out="$(ping -c 4 -W 2 -q "$tgt" 2>/dev/null)" && printf '%s\n' "$out" | grep -qE 'rtt|round-trip'; then
+        # stats line is "rtt min/avg/max/mdev = a/b/c/d ms" (iputils, 4 values)
+        # or "round-trip min/avg/max = a/b/c ms" (busybox, 3 values, no mdev).
+        # Parse positionally AFTER '=' — with -F'/' the fixed fields $5/$6 are
+        # avg/max on iputils but avg lands in $4 on busybox, and mdev is $7.
+        BH_LAT_ICMP="$(printf '%s\n' "$out" | awk '/rtt|round-trip/{ if (match($0, /[0-9.]+\/[0-9.]+\/[0-9.]+/)) { split(substr($0, RSTART, RLENGTH), a, "/"); printf "%.1f", a[2] } exit }')"
+        BH_LAT_JITTER="$(printf '%s\n' "$out" | awk '/rtt|round-trip/{ if (match($0, /[0-9.]+\/[0-9.]+\/[0-9.]+\/[0-9.]+/)) { split(substr($0, RSTART, RLENGTH), a, "/"); printf "%.1f", a[4] } exit }')"
+        BH_LAT_TARGET="$tgt"
+        break
+      fi
+    done
+  fi
 
   # download
   local dbytes=104857600 dmethod="cloudflare"

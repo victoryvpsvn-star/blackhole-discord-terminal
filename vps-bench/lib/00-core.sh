@@ -3,7 +3,7 @@
 # =====================================================================
 # shellcheck shell=bash
 
-BH_VERSION="1.0.0"
+BH_VERSION="2.0.0"
 BH_TOOL="blackhole-vps-bench"
 BH_REPO="victoryvpsvn-star/blackhole-discord-terminal"
 
@@ -13,6 +13,7 @@ umask 077
 # ------- configuration (env overridable, CLI wins later) -------
 BH_FAST="${BH_FAST:-0}"
 BH_NO_NET="${BH_NO_NET:-0}"
+BH_NO_SEC="${BH_NO_SEC:-0}"
 BH_WEBHOOK="${BH_WEBHOOK:-}"
 BH_JSON_OUT="${BH_JSON_OUT:-}"
 BH_MD_OUT="${BH_MD_OUT:-}"

@@ -39,6 +39,21 @@ verdict_text() {
 bh_lines=()
 rpt() { bh_lines+=("$1"); }
 
+# print lines with ANSI colors on a TTY (files always get the plain body):
+# section headers bold+cyan, [OK] green, [WARN] yellow, [BAD] red.
+print_line_color() {
+  local l="$1"
+  if [ -z "$C_CYN" ]; then printf '%s\n' "$l"; return; fi
+  case "$l" in
+    \[[0-9]\]\ *)  printf '%s%s%s\n' "$C_B$C_CYN" "$l" "$C_RST" ;;
+    "  [OK]"*)     printf '%s%s%s\n' "$C_GRN" "$l" "$C_RST" ;;
+    "  [WARN]"*)   printf '%s%s%s\n' "$C_YLW" "$l" "$C_RST" ;;
+    "  [BAD]"*)    printf '%s%s%s\n' "$C_RED" "$l" "$C_RST" ;;
+    "  [POST]"*)   printf '%s%s%s\n' "$C_B$C_MAG" "$l" "$C_RST" ;;
+    *)             printf '%s\n' "$l" ;;
+  esac
+}
+
 print_evidence() {
   if [ -n "$BH_EVIDENCE" ]; then
     while IFS= read -r ev; do
@@ -90,6 +105,9 @@ build_report() {
   fi
   rpt "$memline"
   rpt "  Disk    : $BH_DISK_DEV ($BH_DISK_FS) on $BH_DISK_DIR — total $(fmt_mbint "$BH_DISK_TOTAL_MB"), avail $(fmt_mbint "$BH_DISK_AVAIL_MB")"
+  rpt "  NetEnv  : TCP cc ${BH_TCPCC:-n/a}${BH_TCPCC_AVAIL:+ (avail: $BH_TCPCC_AVAIL)} | entropy ${BH_ENTROPY:-n/a} | DNS: ${BH_DNS:-n/a}"
+  rpt "  Devices : TUN/TAP $( [ "${BH_TUN:-0}" = "1" ] && echo yes || echo no )$( [ "${BH_TUN:-0}" = "1" ] && printf ' (VPN-capable)' ) | FUSE $( [ "${BH_FUSE:-0}" = "1" ] && echo yes || echo no ) | PPP $( [ "${BH_PPP:-0}" = "1" ] && echo yes || echo no ) | tz: ${BH_TZ:-n/a}"
+  rpt "  Load    : ${BH_LOAD:-n/a} (1/5/15 min) | processes: ${BH_PROCS:-?}"
 
   rpt ""
   if [ "${BH_BENCH_SKIPPED:-0}" = "1" ]; then
@@ -106,7 +124,10 @@ build_report() {
     if [ "$BH_NO_NET" = "1" ]; then
       rpt "  Network : skipped (--no-net)"
     else
-      rpt "  Network : down $(fmt_mbps "$BH_DOWN_MBPS") | up $(fmt_mbps "$BH_UP_MBPS") | connect $(fmt_ms "$BH_LAT_MS")  [$BH_NET_METHOD]"
+      local netline
+      netline="Network : down $(fmt_mbps "$BH_DOWN_MBPS") | up $(fmt_mbps "$BH_UP_MBPS") | connect $(fmt_ms "$BH_LAT_MS")  [$BH_NET_METHOD]"
+      [ -n "$BH_LAT_ICMP" ] && netline="$netline | icmp ${BH_LAT_ICMP} ms${BH_LAT_JITTER:+ ± $BH_LAT_JITTER jitter} (${BH_LAT_TARGET})"
+      rpt "  $netline"
     fi
   fi
 
@@ -120,10 +141,23 @@ build_report() {
   fi
 
   rpt ""
-  if [ "${BH_BENCH_SKIPPED:-0}" = "1" ]; then
-    rpt "[5] BH-SCORE — n/a (no benchmark in $BH_MODE mode)"
+  if [ "${BH_SEC_SKIPPED:-0}" = "1" ]; then
+    rpt "[5] SSH & SECURITY AUDIT — skipped (--no-sec or detect mode)"
   else
-    rpt "[5] BH-SCORE"
+    rpt "[5] SSH & SECURITY AUDIT (scope: this machine only)"
+    if [ "${#BH_SEC_LINES[@]}" -gt 0 ] 2>/dev/null; then
+      local secl
+      for secl in "${BH_SEC_LINES[@]}"; do rpt "$secl"; done
+    else
+      rpt "  [INFO]  no audit data"
+    fi
+  fi
+
+  rpt ""
+  if [ "${BH_BENCH_SKIPPED:-0}" = "1" ]; then
+    rpt "[6] BH-SCORE — n/a (no benchmark in $BH_MODE mode)"
+  else
+    rpt "[6] BH-SCORE"
     rpt "  CPU 1-core ${BH_SCORE_CPU1C}/100 | CPU multi ${BH_SCORE_CPUMC}/100 | Memory ${BH_SCORE_MEM}/100"
     rpt "  Disk seq ${BH_SCORE_DSEQ}/100 | Disk 4k ${BH_SCORE_D4K}/100 | Net down ${BH_SCORE_NDOWN}/100 | Net up ${BH_SCORE_NUP}/100"
     rpt "  TOTAL: $BH_SCORE_TOTAL / $BH_SCORE_MAX"
@@ -137,13 +171,14 @@ print_report() {
     printf '%s\n' "${bh_lines[@]}" > "$BH_TXT_OUT"
     log "text report written to $BH_TXT_OUT"
   fi
-  # banner in color on TTY, then the plain body
+  # banner in color on TTY, then the body (badges/headers colorized on TTY)
   if [ -n "$C_CYN" ]; then
     printf '%s%s%s\n' "$C_B$C_CYN" "${bh_lines[0]}" "$C_RST"
   else
     printf '%s\n' "${bh_lines[0]}"
   fi
-  printf '%s\n' "${bh_lines[@]:1}"
+  local _pl
+  for _pl in "${bh_lines[@]:1}"; do print_line_color "$_pl"; done
 }
 
 # ---------------------------------------------------------------- JSON
@@ -178,6 +213,9 @@ EOF2
     "$(json_val "$BH_MEM_TOTAL_MB")" "$(json_val "$BH_MEM_AVAIL_MB")" "$(json_val "$BH_MEM_SWAP_MB")"
   printf '"limits":{"cgroup_version":%s,"cpu_quota_cores":%s,"memory_limit_mb":%s,"cpuset":%s},' \
     "$(json_val "$CG_VER")" "$(json_val "$BH_CPU_QUOTA_TXT")" "$(json_val "$BH_MEM_LIMIT_MB")" "$(json_val "$CPUSET")"
+  printf '"net_env":{"tcp_cc":%s,"tcp_cc_available":%s,"dns":%s,"entropy":%s,"tun":%s,"fuse":%s,"ppp":%s,"load":%s,"processes":%s},' \
+    "$(json_val "$BH_TCPCC")" "$(json_val "$BH_TCPCC_AVAIL")" "$(json_val "$BH_DNS")" "$(json_val "$BH_ENTROPY")" \
+    "$(json_val "$BH_TUN")" "$(json_val "$BH_FUSE")" "$(json_val "$BH_PPP")" "$(json_val "$BH_LOAD")" "$(json_val "$BH_PROCS")"
   printf '"disk":{"dir":%s,"device":%s,"fs":%s,"total_mb":%s,"available_mb":%s},' \
     "$(json_val "$BH_DISK_DIR")" "$(json_val "$BH_DISK_DEV")" "$(json_val "$BH_DISK_FS")" "$(json_val "$BH_DISK_TOTAL_MB")" "$(json_val "$BH_DISK_AVAIL_MB")"
   printf '"bench":{"skipped":%s,' "$skipped"
@@ -188,11 +226,27 @@ EOF2
     "$(json_val "$BH_DISK_MODE")" "$(json_val "$(num_or_0 "$BH_SEQW")")" "$(json_val "$(num_or_0 "$BH_SEQR")")" \
     "$(json_val "$(num_or_0 "$BH_4KW")")" "$(json_val "$(num_or_0 "$BH_4KR")")" \
     "$(json_val "$(num_or_0 "$BH_FIO_RIOPS")")" "$(json_val "$(num_or_0 "$BH_FIO_WIOPS")")"
-  printf '"network":{"skipped":%s,"method":%s,"download_mbps":%s,"upload_mbps":%s,"connect_ms":%s,' \
+  printf '"network":{"skipped":%s,"method":%s,"download_mbps":%s,"upload_mbps":%s,"connect_ms":%s,"icmp_latency_ms":%s,"icmp_jitter_ms":%s,' \
     "$netskipped" "$(json_val "$BH_NET_METHOD")" "$(json_val "$(num_or_0 "$BH_DOWN_MBPS")")" \
-    "$(json_val "$(num_or_0 "$BH_UP_MBPS")")" "$(json_val "$(num_or_0 "$BH_LAT_MS")")"
+    "$(json_val "$(num_or_0 "$BH_UP_MBPS")")" "$(json_val "$(num_or_0 "$BH_LAT_MS")")" \
+    "$(json_val "$(num_or_0 "$BH_LAT_ICMP")")" "$(json_val "$(num_or_0 "$BH_LAT_JITTER")")"
   printf '"ipv4":%s,"ipv6":%s,"geo":%s,"asn":%s}},' \
     "$(json_val "$BH_IPV4")" "$(json_val "$BH_IPV6")" "$(json_val "$BH_IP_GEO")" "$(json_val "$BH_IP_ASN")"
+  if [ "${BH_SEC_SKIPPED:-0}" = "1" ]; then
+    printf '"security":{"skipped":true},'
+  else
+    printf '"security":{"sshd_found":%s,"password_auth":%s,"pubkey_auth":%s,"root_login":%s,"ports":%s,' \
+      "$(json_val "$BH_SSH_FOUND")" "$(json_val "${BH_SSH_PWDAUTH:-unset}")" "$(json_val "${BH_SSH_PUBKEY:-unset}")" \
+      "$(json_val "${BH_SSH_ROOTLOGIN:-default}")" "$(json_val "$BH_SSH_PORTS")"
+    printf '"authorized_keys":%s,"key_types":%s,"weak_keys":%s,"failed_logins":%s,' \
+      "$(json_val "$BH_AK_TOTAL")" "$(json_val "$BH_AK_TYPES")" "$(json_val "$BH_AK_WEAK")" "$(json_val "$BH_SSH_FAILS")"
+    printf '"firewall":%s,"fail2ban":%s,"uid0_accounts":%s,"empty_passwords":%s,"sudo_nopasswd":%s,' \
+      "$(json_val "$BH_FW")" "$(json_val "$BH_F2B")" "$(json_val "${BH_UID0:-unknown}")" "$(json_val "$BH_EMPTY_PW")" "$(json_val "$BH_SUDO_NOPASS")"
+    printf '"aslr":%s,"auto_updates":%s,"listening_ports":%s,' \
+      "$(json_val "$BH_ASLR")" "$(json_val "$BH_AUTO_UPD")" "$(json_val "$BH_LISTEN")"
+    printf '"pass":%s,"warn":%s,"bad":%s,"posture":%s},' \
+      "$(json_val "$BH_SEC_PASS")" "$(json_val "$BH_SEC_WARN")" "$(json_val "$BH_SEC_BAD")" "$(json_val "$BH_SEC_POSTURE")"
+  fi
   printf '"score":{"cpu_1c":%s,"cpu_multi":%s,"memory":%s,"disk_seq":%s,"disk_4k":%s,"net_down":%s,"net_up":%s,"total":%s,"max":%s}}' \
     "$(json_val "$BH_SCORE_CPU1C")" "$(json_val "$BH_SCORE_CPUMC")" "$(json_val "$BH_SCORE_MEM")" \
     "$(json_val "$BH_SCORE_DSEQ")" "$(json_val "$BH_SCORE_D4K")" "$(json_val "$BH_SCORE_NDOWN")" \
@@ -231,7 +285,19 @@ build_markdown() {
       printf '| Network download | %s |\n' "$(fmt_mbps "$BH_DOWN_MBPS")"
       printf '| Network upload | %s |\n' "$(fmt_mbps "$BH_UP_MBPS")"
       printf '| TCP connect | %s |\n' "$(fmt_ms "$BH_LAT_MS")"
+      [ -n "$BH_LAT_ICMP" ] && printf '| ICMP latency / jitter | %s ms%s (%s) |\n' "$BH_LAT_ICMP" "${BH_LAT_JITTER:+ ± $BH_LAT_JITTER}" "$BH_LAT_TARGET"
     fi
+  fi
+  if [ "${BH_SEC_SKIPPED:-0}" != "1" ] && [ "${#BH_SEC_LINES[@]}" -gt 0 ] 2>/dev/null; then
+    printf '\n## SSH & Security\n\n| Status | Check |\n|---|---|\n'
+    local ml badge txt
+    for ml in "${BH_SEC_LINES[@]}"; do
+      txt="${ml##*]  }"
+      badge="${ml#*\[}"; badge="${badge%%\]*}"
+      printf '| %s | %s |\n' "$badge" "$(printf '%s' "$txt" | sed 's/|/\\|/g')"
+    done
+  fi
+  if [ "${BH_BENCH_SKIPPED:-0}" != "1" ]; then
     printf '\n## BH-SCORE\n\n**%s / %s**\n\n' "$BH_SCORE_TOTAL" "$BH_SCORE_MAX"
     printf 'cpu1c %s · cpumc %s · mem %s · disk-seq %s · disk-4k %s · net-down %s · net-up %s\n' \
       "$BH_SCORE_CPU1C" "$BH_SCORE_CPUMC" "$BH_SCORE_MEM" "$BH_SCORE_DSEQ" "$BH_SCORE_D4K" "$BH_SCORE_NDOWN" "$BH_SCORE_NUP"
@@ -283,6 +349,10 @@ discord_send() {
     fi
   fi
   [ -n "$BH_IP_GEO" ] && add_field "Location" "$BH_IP_GEO"
+  if [ "${BH_SEC_SKIPPED:-0}" != "1" ]; then
+    add_field "SSH auth" "password=${BH_SSH_PWDAUTH:-unset} · root=${BH_SSH_ROOTLOGIN:-default} · keys=$BH_AK_TOTAL"
+    add_field "Security posture" "$BH_SEC_POSTURE — $BH_SEC_PASS pass / $BH_SEC_WARN warn / $BH_SEC_BAD bad"
+  fi
   fields="$fields]"
 
   local payload="$BH_RUNDIR/dh_payload.json"

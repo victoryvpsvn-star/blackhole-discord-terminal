@@ -29,7 +29,7 @@ fi
 # =====================================================================
 # shellcheck shell=bash
 
-BH_VERSION="1.0.0"
+BH_VERSION="2.0.0"
 BH_TOOL="blackhole-vps-bench"
 BH_REPO="victoryvpsvn-star/blackhole-discord-terminal"
 
@@ -39,6 +39,7 @@ umask 077
 # ------- configuration (env overridable, CLI wins later) -------
 BH_FAST="${BH_FAST:-0}"
 BH_NO_NET="${BH_NO_NET:-0}"
+BH_NO_SEC="${BH_NO_SEC:-0}"
 BH_WEBHOOK="${BH_WEBHOOK:-}"
 BH_JSON_OUT="${BH_JSON_OUT:-}"
 BH_MD_OUT="${BH_MD_OUT:-}"
@@ -476,6 +477,10 @@ BH_MEM_TOTAL_MB=""; BH_MEM_AVAIL_MB=""; BH_MEM_SWAP_MB=""
 BH_MEM_LIMIT_MB="0"; BH_MEM_EFF_MB=""; BH_CPU_QUOTA_TXT=""
 BH_DISK_DEV=""; BH_DISK_FS=""; BH_DISK_TOTAL_MB=""; BH_DISK_AVAIL_MB=""
 BH_IPV4=""; BH_IPV6=""; BH_IP_GEO=""; BH_IP_ASN=""
+# deep-scan extras (v2)
+BH_DNS=""; BH_TCPCC=""; BH_TCPCC_AVAIL=""; BH_ENTROPY=""
+BH_TUN=0; BH_FUSE=0; BH_PPP=0
+BH_LOAD=""; BH_PROCS=0; BH_TZ=""
 
 gather_info() {
   BH_HOSTNAME="$(hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
@@ -541,6 +546,20 @@ gather_info() {
     BH_DISK_FS=""
   fi
   [ -n "$BH_DISK_FS" ] || BH_DISK_FS="unknown"
+
+  # ---- deep-scan extras (v2: dò thêm nhiều thứ) ----
+  BH_DNS="$(awk '/^nameserver/{print $2}' /etc/resolv.conf 2>/dev/null | head -n 3 | paste -sd ',' -)"
+  BH_TCPCC="$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)"
+  BH_TCPCC_AVAIL="$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null)"
+  BH_ENTROPY="$(cat /proc/sys/kernel/random/entropy_avail 2>/dev/null)"
+  [ -c /dev/net/tun ] && BH_TUN=1
+  [ -c /dev/fuse ]    && BH_FUSE=1
+  [ -c /dev/ppp ]     && BH_PPP=1
+  BH_LOAD="$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)"
+  # count PIDs; guard against the unmatched-glob literal ("/proc/[0-9]*")
+  # when /proc is not mounted, which would otherwise report 1 "process"
+  BH_PROCS="$(set -- /proc/[0-9]*; if [ -d "$1" ]; then echo $#; else echo 0; fi)"
+  BH_TZ="$(cat /etc/timezone 2>/dev/null || date +%Z 2>/dev/null)"
 
   # ---- network identity (optional) ----
   if [ "$BH_NO_NET" != "1" ] && command_exists curl; then
@@ -853,6 +872,8 @@ bench_disk() {
 # shellcheck shell=bash
 
 BH_DOWN_MBPS=""; BH_UP_MBPS=""; BH_LAT_MS=""; BH_NET_METHOD=""
+# ICMP latency + jitter (v2) — empty when ping is unavailable/blocked
+BH_LAT_ICMP=""; BH_LAT_JITTER=""; BH_LAT_TARGET=""
 
 bench_net() {
   if [ "$BH_NO_NET" = "1" ]; then
@@ -871,6 +892,24 @@ bench_net() {
     lat="$(curl -s -o /dev/null --max-time 8 -w '%{time_starttransfer}' 'https://speed.cloudflare.com/__down?bytes=1' 2>/dev/null)"
   fi
   [ -n "$lat" ] && BH_LAT_MS="$(awk -v t="$lat" 'BEGIN{ if (t+0>0) printf "%.1f", t*1000; else print 0 }')"
+
+  # ICMP latency + jitter (v2): ping needs CAP_NET_RAW — often absent in
+  # containers, so this stays optional and the TCP number above remains.
+  if command_exists ping; then
+    local tgt out
+    for tgt in 1.1.1.1 8.8.8.8; do
+      if out="$(ping -c 4 -W 2 -q "$tgt" 2>/dev/null)" && printf '%s\n' "$out" | grep -qE 'rtt|round-trip'; then
+        # stats line is "rtt min/avg/max/mdev = a/b/c/d ms" (iputils, 4 values)
+        # or "round-trip min/avg/max = a/b/c ms" (busybox, 3 values, no mdev).
+        # Parse positionally AFTER '=' — with -F'/' the fixed fields $5/$6 are
+        # avg/max on iputils but avg lands in $4 on busybox, and mdev is $7.
+        BH_LAT_ICMP="$(printf '%s\n' "$out" | awk '/rtt|round-trip/{ if (match($0, /[0-9.]+\/[0-9.]+\/[0-9.]+/)) { split(substr($0, RSTART, RLENGTH), a, "/"); printf "%.1f", a[2] } exit }')"
+        BH_LAT_JITTER="$(printf '%s\n' "$out" | awk '/rtt|round-trip/{ if (match($0, /[0-9.]+\/[0-9.]+\/[0-9.]+\/[0-9.]+/)) { split(substr($0, RSTART, RLENGTH), a, "/"); printf "%.1f", a[4] } exit }')"
+        BH_LAT_TARGET="$tgt"
+        break
+      fi
+    done
+  fi
 
   # download
   local dbytes=104857600 dmethod="cloudflare"
@@ -938,6 +977,21 @@ verdict_text() {
 bh_lines=()
 rpt() { bh_lines+=("$1"); }
 
+# print lines with ANSI colors on a TTY (files always get the plain body):
+# section headers bold+cyan, [OK] green, [WARN] yellow, [BAD] red.
+print_line_color() {
+  local l="$1"
+  if [ -z "$C_CYN" ]; then printf '%s\n' "$l"; return; fi
+  case "$l" in
+    \[[0-9]\]\ *)  printf '%s%s%s\n' "$C_B$C_CYN" "$l" "$C_RST" ;;
+    "  [OK]"*)     printf '%s%s%s\n' "$C_GRN" "$l" "$C_RST" ;;
+    "  [WARN]"*)   printf '%s%s%s\n' "$C_YLW" "$l" "$C_RST" ;;
+    "  [BAD]"*)    printf '%s%s%s\n' "$C_RED" "$l" "$C_RST" ;;
+    "  [POST]"*)   printf '%s%s%s\n' "$C_B$C_MAG" "$l" "$C_RST" ;;
+    *)             printf '%s\n' "$l" ;;
+  esac
+}
+
 print_evidence() {
   if [ -n "$BH_EVIDENCE" ]; then
     while IFS= read -r ev; do
@@ -989,6 +1043,9 @@ build_report() {
   fi
   rpt "$memline"
   rpt "  Disk    : $BH_DISK_DEV ($BH_DISK_FS) on $BH_DISK_DIR — total $(fmt_mbint "$BH_DISK_TOTAL_MB"), avail $(fmt_mbint "$BH_DISK_AVAIL_MB")"
+  rpt "  NetEnv  : TCP cc ${BH_TCPCC:-n/a}${BH_TCPCC_AVAIL:+ (avail: $BH_TCPCC_AVAIL)} | entropy ${BH_ENTROPY:-n/a} | DNS: ${BH_DNS:-n/a}"
+  rpt "  Devices : TUN/TAP $( [ "${BH_TUN:-0}" = "1" ] && echo yes || echo no )$( [ "${BH_TUN:-0}" = "1" ] && printf ' (VPN-capable)' ) | FUSE $( [ "${BH_FUSE:-0}" = "1" ] && echo yes || echo no ) | PPP $( [ "${BH_PPP:-0}" = "1" ] && echo yes || echo no ) | tz: ${BH_TZ:-n/a}"
+  rpt "  Load    : ${BH_LOAD:-n/a} (1/5/15 min) | processes: ${BH_PROCS:-?}"
 
   rpt ""
   if [ "${BH_BENCH_SKIPPED:-0}" = "1" ]; then
@@ -1005,7 +1062,10 @@ build_report() {
     if [ "$BH_NO_NET" = "1" ]; then
       rpt "  Network : skipped (--no-net)"
     else
-      rpt "  Network : down $(fmt_mbps "$BH_DOWN_MBPS") | up $(fmt_mbps "$BH_UP_MBPS") | connect $(fmt_ms "$BH_LAT_MS")  [$BH_NET_METHOD]"
+      local netline
+      netline="Network : down $(fmt_mbps "$BH_DOWN_MBPS") | up $(fmt_mbps "$BH_UP_MBPS") | connect $(fmt_ms "$BH_LAT_MS")  [$BH_NET_METHOD]"
+      [ -n "$BH_LAT_ICMP" ] && netline="$netline | icmp ${BH_LAT_ICMP} ms${BH_LAT_JITTER:+ ± $BH_LAT_JITTER jitter} (${BH_LAT_TARGET})"
+      rpt "  $netline"
     fi
   fi
 
@@ -1019,10 +1079,23 @@ build_report() {
   fi
 
   rpt ""
-  if [ "${BH_BENCH_SKIPPED:-0}" = "1" ]; then
-    rpt "[5] BH-SCORE — n/a (no benchmark in $BH_MODE mode)"
+  if [ "${BH_SEC_SKIPPED:-0}" = "1" ]; then
+    rpt "[5] SSH & SECURITY AUDIT — skipped (--no-sec or detect mode)"
   else
-    rpt "[5] BH-SCORE"
+    rpt "[5] SSH & SECURITY AUDIT (scope: this machine only)"
+    if [ "${#BH_SEC_LINES[@]}" -gt 0 ] 2>/dev/null; then
+      local secl
+      for secl in "${BH_SEC_LINES[@]}"; do rpt "$secl"; done
+    else
+      rpt "  [INFO]  no audit data"
+    fi
+  fi
+
+  rpt ""
+  if [ "${BH_BENCH_SKIPPED:-0}" = "1" ]; then
+    rpt "[6] BH-SCORE — n/a (no benchmark in $BH_MODE mode)"
+  else
+    rpt "[6] BH-SCORE"
     rpt "  CPU 1-core ${BH_SCORE_CPU1C}/100 | CPU multi ${BH_SCORE_CPUMC}/100 | Memory ${BH_SCORE_MEM}/100"
     rpt "  Disk seq ${BH_SCORE_DSEQ}/100 | Disk 4k ${BH_SCORE_D4K}/100 | Net down ${BH_SCORE_NDOWN}/100 | Net up ${BH_SCORE_NUP}/100"
     rpt "  TOTAL: $BH_SCORE_TOTAL / $BH_SCORE_MAX"
@@ -1036,13 +1109,14 @@ print_report() {
     printf '%s\n' "${bh_lines[@]}" > "$BH_TXT_OUT"
     log "text report written to $BH_TXT_OUT"
   fi
-  # banner in color on TTY, then the plain body
+  # banner in color on TTY, then the body (badges/headers colorized on TTY)
   if [ -n "$C_CYN" ]; then
     printf '%s%s%s\n' "$C_B$C_CYN" "${bh_lines[0]}" "$C_RST"
   else
     printf '%s\n' "${bh_lines[0]}"
   fi
-  printf '%s\n' "${bh_lines[@]:1}"
+  local _pl
+  for _pl in "${bh_lines[@]:1}"; do print_line_color "$_pl"; done
 }
 
 # ---------------------------------------------------------------- JSON
@@ -1077,6 +1151,9 @@ EOF2
     "$(json_val "$BH_MEM_TOTAL_MB")" "$(json_val "$BH_MEM_AVAIL_MB")" "$(json_val "$BH_MEM_SWAP_MB")"
   printf '"limits":{"cgroup_version":%s,"cpu_quota_cores":%s,"memory_limit_mb":%s,"cpuset":%s},' \
     "$(json_val "$CG_VER")" "$(json_val "$BH_CPU_QUOTA_TXT")" "$(json_val "$BH_MEM_LIMIT_MB")" "$(json_val "$CPUSET")"
+  printf '"net_env":{"tcp_cc":%s,"tcp_cc_available":%s,"dns":%s,"entropy":%s,"tun":%s,"fuse":%s,"ppp":%s,"load":%s,"processes":%s},' \
+    "$(json_val "$BH_TCPCC")" "$(json_val "$BH_TCPCC_AVAIL")" "$(json_val "$BH_DNS")" "$(json_val "$BH_ENTROPY")" \
+    "$(json_val "$BH_TUN")" "$(json_val "$BH_FUSE")" "$(json_val "$BH_PPP")" "$(json_val "$BH_LOAD")" "$(json_val "$BH_PROCS")"
   printf '"disk":{"dir":%s,"device":%s,"fs":%s,"total_mb":%s,"available_mb":%s},' \
     "$(json_val "$BH_DISK_DIR")" "$(json_val "$BH_DISK_DEV")" "$(json_val "$BH_DISK_FS")" "$(json_val "$BH_DISK_TOTAL_MB")" "$(json_val "$BH_DISK_AVAIL_MB")"
   printf '"bench":{"skipped":%s,' "$skipped"
@@ -1087,11 +1164,27 @@ EOF2
     "$(json_val "$BH_DISK_MODE")" "$(json_val "$(num_or_0 "$BH_SEQW")")" "$(json_val "$(num_or_0 "$BH_SEQR")")" \
     "$(json_val "$(num_or_0 "$BH_4KW")")" "$(json_val "$(num_or_0 "$BH_4KR")")" \
     "$(json_val "$(num_or_0 "$BH_FIO_RIOPS")")" "$(json_val "$(num_or_0 "$BH_FIO_WIOPS")")"
-  printf '"network":{"skipped":%s,"method":%s,"download_mbps":%s,"upload_mbps":%s,"connect_ms":%s,' \
+  printf '"network":{"skipped":%s,"method":%s,"download_mbps":%s,"upload_mbps":%s,"connect_ms":%s,"icmp_latency_ms":%s,"icmp_jitter_ms":%s,' \
     "$netskipped" "$(json_val "$BH_NET_METHOD")" "$(json_val "$(num_or_0 "$BH_DOWN_MBPS")")" \
-    "$(json_val "$(num_or_0 "$BH_UP_MBPS")")" "$(json_val "$(num_or_0 "$BH_LAT_MS")")"
+    "$(json_val "$(num_or_0 "$BH_UP_MBPS")")" "$(json_val "$(num_or_0 "$BH_LAT_MS")")" \
+    "$(json_val "$(num_or_0 "$BH_LAT_ICMP")")" "$(json_val "$(num_or_0 "$BH_LAT_JITTER")")"
   printf '"ipv4":%s,"ipv6":%s,"geo":%s,"asn":%s}},' \
     "$(json_val "$BH_IPV4")" "$(json_val "$BH_IPV6")" "$(json_val "$BH_IP_GEO")" "$(json_val "$BH_IP_ASN")"
+  if [ "${BH_SEC_SKIPPED:-0}" = "1" ]; then
+    printf '"security":{"skipped":true},'
+  else
+    printf '"security":{"sshd_found":%s,"password_auth":%s,"pubkey_auth":%s,"root_login":%s,"ports":%s,' \
+      "$(json_val "$BH_SSH_FOUND")" "$(json_val "${BH_SSH_PWDAUTH:-unset}")" "$(json_val "${BH_SSH_PUBKEY:-unset}")" \
+      "$(json_val "${BH_SSH_ROOTLOGIN:-default}")" "$(json_val "$BH_SSH_PORTS")"
+    printf '"authorized_keys":%s,"key_types":%s,"weak_keys":%s,"failed_logins":%s,' \
+      "$(json_val "$BH_AK_TOTAL")" "$(json_val "$BH_AK_TYPES")" "$(json_val "$BH_AK_WEAK")" "$(json_val "$BH_SSH_FAILS")"
+    printf '"firewall":%s,"fail2ban":%s,"uid0_accounts":%s,"empty_passwords":%s,"sudo_nopasswd":%s,' \
+      "$(json_val "$BH_FW")" "$(json_val "$BH_F2B")" "$(json_val "${BH_UID0:-unknown}")" "$(json_val "$BH_EMPTY_PW")" "$(json_val "$BH_SUDO_NOPASS")"
+    printf '"aslr":%s,"auto_updates":%s,"listening_ports":%s,' \
+      "$(json_val "$BH_ASLR")" "$(json_val "$BH_AUTO_UPD")" "$(json_val "$BH_LISTEN")"
+    printf '"pass":%s,"warn":%s,"bad":%s,"posture":%s},' \
+      "$(json_val "$BH_SEC_PASS")" "$(json_val "$BH_SEC_WARN")" "$(json_val "$BH_SEC_BAD")" "$(json_val "$BH_SEC_POSTURE")"
+  fi
   printf '"score":{"cpu_1c":%s,"cpu_multi":%s,"memory":%s,"disk_seq":%s,"disk_4k":%s,"net_down":%s,"net_up":%s,"total":%s,"max":%s}}' \
     "$(json_val "$BH_SCORE_CPU1C")" "$(json_val "$BH_SCORE_CPUMC")" "$(json_val "$BH_SCORE_MEM")" \
     "$(json_val "$BH_SCORE_DSEQ")" "$(json_val "$BH_SCORE_D4K")" "$(json_val "$BH_SCORE_NDOWN")" \
@@ -1130,7 +1223,19 @@ build_markdown() {
       printf '| Network download | %s |\n' "$(fmt_mbps "$BH_DOWN_MBPS")"
       printf '| Network upload | %s |\n' "$(fmt_mbps "$BH_UP_MBPS")"
       printf '| TCP connect | %s |\n' "$(fmt_ms "$BH_LAT_MS")"
+      [ -n "$BH_LAT_ICMP" ] && printf '| ICMP latency / jitter | %s ms%s (%s) |\n' "$BH_LAT_ICMP" "${BH_LAT_JITTER:+ ± $BH_LAT_JITTER}" "$BH_LAT_TARGET"
     fi
+  fi
+  if [ "${BH_SEC_SKIPPED:-0}" != "1" ] && [ "${#BH_SEC_LINES[@]}" -gt 0 ] 2>/dev/null; then
+    printf '\n## SSH & Security\n\n| Status | Check |\n|---|---|\n'
+    local ml badge txt
+    for ml in "${BH_SEC_LINES[@]}"; do
+      txt="${ml##*]  }"
+      badge="${ml#*\[}"; badge="${badge%%\]*}"
+      printf '| %s | %s |\n' "$badge" "$(printf '%s' "$txt" | sed 's/|/\\|/g')"
+    done
+  fi
+  if [ "${BH_BENCH_SKIPPED:-0}" != "1" ]; then
     printf '\n## BH-SCORE\n\n**%s / %s**\n\n' "$BH_SCORE_TOTAL" "$BH_SCORE_MAX"
     printf 'cpu1c %s · cpumc %s · mem %s · disk-seq %s · disk-4k %s · net-down %s · net-up %s\n' \
       "$BH_SCORE_CPU1C" "$BH_SCORE_CPUMC" "$BH_SCORE_MEM" "$BH_SCORE_DSEQ" "$BH_SCORE_D4K" "$BH_SCORE_NDOWN" "$BH_SCORE_NUP"
@@ -1182,6 +1287,10 @@ discord_send() {
     fi
   fi
   [ -n "$BH_IP_GEO" ] && add_field "Location" "$BH_IP_GEO"
+  if [ "${BH_SEC_SKIPPED:-0}" != "1" ]; then
+    add_field "SSH auth" "password=${BH_SSH_PWDAUTH:-unset} · root=${BH_SSH_ROOTLOGIN:-default} · keys=$BH_AK_TOTAL"
+    add_field "Security posture" "$BH_SEC_POSTURE — $BH_SEC_PASS pass / $BH_SEC_WARN warn / $BH_SEC_BAD bad"
+  fi
   fields="$fields]"
 
   local payload="$BH_RUNDIR/dh_payload.json"
@@ -1205,6 +1314,345 @@ discord_send() {
   fi
 }
 
+# ============ lib/80-ssh.sh ============
+# =====================================================================
+# blackhole-vps-bench · 80-ssh.sh — SSH & local security audit (v2)
+# Audits ONLY the local machine: sshd effective config (password auth,
+# pubkey auth, root login), authorized_keys inventory, failed login
+# attempts, firewall, fail2ban, UID-0 accounts, empty passwords,
+# sudo NOPASSWD, ASLR, auto updates, listening ports.
+# No root required — checks degrade gracefully and say so.
+# =====================================================================
+# shellcheck shell=bash
+
+BH_SSH_FOUND=0; BH_SSH_T_OK=0; BH_SSH_T_OUT=""; BH_SSH_CFG_SRC=""
+BH_SSH_PWDAUTH=""; BH_SSH_PUBKEY=""; BH_SSH_ROOTLOGIN=""
+BH_SSH_PORTS=""; BH_SSH_MAXAUTH=""
+BH_AK_TOTAL=0; BH_AK_TYPES=""; BH_AK_WEAK=0
+BH_SSH_FAILS="n/a"; BH_SSH_FAILS_N=-1
+BH_FW="unknown"; BH_F2B=0
+BH_UID0=""; BH_EMPTY_PW="n/a"; BH_LOGIN_SHELLS=""
+BH_SUDO_NOPASS="n/a"
+BH_ASLR=""; BH_AUTO_UPD="n/a"
+BH_LISTEN=""
+BH_SEC_PASS=0; BH_SEC_WARN=0; BH_SEC_BAD=0
+BH_SEC_POSTURE="n/a"
+BH_SEC_LINES=()
+BH_SSH_CFG_LINES=()
+
+# sec_line STATUS TEXT — record one audit line (plain, badged) and count it.
+# STATUS: ok | warn | bad | info (info is not counted in the posture score)
+sec_line() {
+  local st="$1" txt="$2" tag
+  case "$st" in
+    ok)   tag="[OK]";   BH_SEC_PASS=$((BH_SEC_PASS + 1)) ;;
+    warn) tag="[WARN]"; BH_SEC_WARN=$((BH_SEC_WARN + 1)) ;;
+    bad)  tag="[BAD]";  BH_SEC_BAD=$((BH_SEC_BAD + 1)) ;;
+    *)    tag="[INFO]" ;;
+  esac
+  BH_SEC_LINES+=("  $tag  $txt")
+}
+
+sec_sshd_load() {
+  if command_exists sshd; then
+    BH_SSH_FOUND=1
+    BH_SSH_T_OUT="$(sshd -T 2>/dev/null || true)"
+    if [ -n "$BH_SSH_T_OUT" ]; then
+      BH_SSH_T_OK=1
+      BH_SSH_CFG_SRC="sshd -T (effective config)"
+    fi
+  fi
+  if [ "$BH_SSH_FOUND" = "0" ] && [ -f /etc/ssh/sshd_config ]; then
+    BH_SSH_FOUND=1
+  fi
+  if [ "$BH_SSH_T_OK" = "0" ]; then
+    # OpenSSH uses FIRST-MATCH semantics; Include is normally the first
+    # directive of sshd_config, so include-dir files win over the main file.
+    local f line
+    for f in /etc/ssh/sshd_config.d/*.conf /etc/ssh/sshd_config; do
+      [ -f "$f" ] || continue
+      while IFS= read -r line; do
+        case "$line" in ''|\#*) continue ;; esac
+        BH_SSH_CFG_LINES+=("$line")
+      done < "$f"
+    done
+    BH_SSH_CFG_SRC="config files, first-match (drop-in dir wins)"
+  fi
+}
+
+sec_sshd_opt() { # KEY DEFAULT — first match wins (mirrors sshd semantics)
+  local key="$1" def="$2" out=""
+  if [ "$BH_SSH_T_OK" = "1" ]; then
+    out="$(printf '%s\n' "$BH_SSH_T_OUT" | awk -v k="$key" 'tolower($1)==tolower(k){ $1=""; sub(/^[ \t]+/, ""); print; exit }')"
+  elif [ "${#BH_SSH_CFG_LINES[@]}" -gt 0 ] 2>/dev/null; then
+    # sshd -T already resolves everything; for raw config lines: strip inline
+    # comments ("PermitRootLogin yes # ansible"), skip Match blocks (their
+    # settings are not global), and lowercase the value — sec_audit compares
+    # lowercase but real files often say "PasswordAuthentication YES".
+    out="$(printf '%s\n' "${BH_SSH_CFG_LINES[@]}" | awk -v k="$key" '
+      { sub(/#.*/, "") }
+      tolower($1)=="match" { inmatch=1; next }
+      inmatch { next }
+      tolower($1)==tolower(k){ $1=""; sub(/^[ \t]+/, ""); print tolower($0); exit }')"
+  fi
+  if [ -n "$out" ]; then printf '%s' "$out"; else printf '%s' "$def"; fi
+}
+
+sec_sshd_all() { # KEY — every match joined by ',' (for multi-Port configs)
+  local key="$1" out=""
+  if [ "$BH_SSH_T_OK" = "1" ]; then
+    out="$(printf '%s\n' "$BH_SSH_T_OUT" | awk -v k="$key" 'tolower($1)==tolower(k){print $2}')"
+  elif [ "${#BH_SSH_CFG_LINES[@]}" -gt 0 ] 2>/dev/null; then
+    out="$(printf '%s\n' "${BH_SSH_CFG_LINES[@]}" | awk -v k="$key" '
+      { sub(/#.*/, "") }
+      tolower($1)=="match" { inmatch=1; next }
+      inmatch { next }
+      tolower($1)==tolower(k){print $2}')"
+  fi
+  printf '%s' "$out" | paste -sd ',' -
+}
+
+sec_auth_keys() {
+  local d kf line kt homes="/root"
+  for d in /home/*; do [ -d "$d" ] && homes="$homes $d"; done
+  for d in $homes; do
+    kf="$d/.ssh/authorized_keys"
+    [ -f "$kf" ] || continue
+    while IFS= read -r line; do
+      case "$line" in ''|\#*) continue ;; esac
+      BH_AK_TOTAL=$((BH_AK_TOTAL + 1))
+      kt="${line%%[[:space:]]*}"
+      case "$kt" in
+        ssh-ed25519|sk-ssh-ed25519@openssh.com) kt="ed25519" ;;
+        ssh-rsa)                                kt="RSA" ;;
+        ecdsa-sha2-*)                           kt="ECDSA" ;;
+        *)                                      kt="${kt%%@*}" ;;
+      esac
+      BH_AK_TYPES="$BH_AK_TYPES $kt"
+    done < "$kf"
+    if command_exists ssh-keygen; then
+      while IFS= read -r bits; do
+        [ -n "$bits" ] || continue
+        if [ "$bits" -lt 2048 ] 2>/dev/null; then BH_AK_WEAK=$((BH_AK_WEAK + 1)); fi
+      done < <(ssh-keygen -lf "$kf" 2>/dev/null | awk '{print $1}')
+    fi
+  done
+  # BH_AK_TYPES accumulates as one space-separated line; split into one type
+  # per line first or 'sort | uniq -c' counts the whole string as a single hit.
+  BH_AK_TYPES="$(printf '%s\n' "$BH_AK_TYPES" | tr ' ' '\n' | sed '/^$/d' | sort | uniq -c | awk '{printf "%sx%d ", $2, $1}')"
+  BH_AK_TYPES="${BH_AK_TYPES% }"
+}
+
+sec_failed_logins() {
+  local n jerr="$BH_RUNDIR/journal.err"
+  # journalctl exits 0 even when no journal files exist (stderr: "No journal
+  # files were found.", stdout: "-- No entries --") — that must NOT be
+  # reported as "0 failed logins", so bail to the auth.log fallback instead.
+  if command_exists journalctl && journalctl -n 1 >/dev/null 2>&1; then
+    n="$(journalctl -u ssh -u sshd --since '-24 hours' --no-pager 2>"$jerr" | grep -c 'Failed password' || true)"
+    if [ -n "$n" ] && ! grep -qi 'no journal files' "$jerr" 2>/dev/null; then
+      BH_SSH_FAILS_N="$n"
+      BH_SSH_FAILS="$n in last 24h (journalctl)"
+      return
+    fi
+  fi
+  if [ -r /var/log/auth.log ]; then
+    n="$(grep -hc 'Failed password' /var/log/auth.log 2>/dev/null)"
+    case "$n" in
+      ''|*[!0-9]*) # keep BH_SSH_FAILS_N numeric for the -ge comparisons below
+        BH_SSH_FAILS_N=-1
+        BH_SSH_FAILS="n/a (auth.log present but not parseable)"
+        return
+        ;;
+    esac
+    BH_SSH_FAILS_N="$n"
+    BH_SSH_FAILS="$n in current auth.log"
+    return
+  fi
+  BH_SSH_FAILS_N=-1
+  BH_SSH_FAILS="n/a (no readable auth logs — run as root for the exact count)"
+}
+
+sec_firewall() {
+  if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+    BH_FW="ufw active"
+  elif command_exists nft && nft list ruleset 2>/dev/null | grep -q "chain "; then
+    BH_FW="nftables rules present"
+  elif command_exists iptables && iptables -S 2>/dev/null | grep -qv "^-P"; then
+    BH_FW="iptables rules present"
+  elif command_exists firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
+    BH_FW="firewalld running"
+  elif command_exists ufw; then
+    BH_FW="ufw installed but INACTIVE"
+  else
+    BH_FW="no firewall detected"
+  fi
+}
+
+sec_misc() {
+  local uid0
+  uid0="$(awk -F: '$3==0{printf "%s ", $1}' /etc/passwd 2>/dev/null)"
+  BH_UID0="${uid0% }"
+  BH_LOGIN_SHELLS="$(awk -F: '$7 ~ /(bash|zsh|ksh|sh)$/{n++} END{print n+0}' /etc/passwd 2>/dev/null)"
+  if [ -r /etc/shadow ]; then
+    BH_EMPTY_PW="$(awk -F: '$2==""{n++} END{print n+0}' /etc/shadow 2>/dev/null)"
+  fi
+  local nopass=0 sudoers_readable=0
+  if [ -r /etc/sudoers ]; then
+    sudoers_readable=1
+    grep -qs 'NOPASSWD' /etc/sudoers && nopass=1
+  fi
+  if [ -d /etc/sudoers.d ]; then
+    grep -qs 'NOPASSWD' /etc/sudoers.d/* 2>/dev/null && nopass=1
+    if ls /etc/sudoers.d/* >/dev/null 2>&1; then sudoers_readable=1; fi
+  fi
+  if [ "$nopass" = "1" ]; then
+    BH_SUDO_NOPASS="yes (NOPASSWD entries found)"
+  elif [ "$sudoers_readable" = "1" ]; then
+    BH_SUDO_NOPASS="no"
+  fi
+  BH_ASLR="$(cat /proc/sys/kernel/randomize_va_space 2>/dev/null)"
+  if grep -qs 'Unattended-Upgrade' /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null; then
+    BH_AUTO_UPD="enabled (unattended-upgrades)"
+  elif [ -f /etc/dnf/automatic.conf ]; then
+    BH_AUTO_UPD="dnf-automatic configured"
+  elif command_exists dnf && [ -f /etc/dnf/dnf.conf ] && grep -qs 'automatic' /etc/dnf/dnf.conf; then
+    BH_AUTO_UPD="dnf-automatic configured"
+  else
+    BH_AUTO_UPD="not detected"
+  fi
+  if command_exists ss; then
+    BH_LISTEN="$(ss -tulnH 2>/dev/null | awk '$1=="tcp"||$1=="tcp6"{print $5}' | sed 's/.*://' | sort -n | uniq | paste -sd ',' - | head -c 200)"
+    [ -n "$BH_LISTEN" ] || BH_LISTEN="none" # ss exists but zero listeners — don't claim "ss unavailable"
+  fi
+}
+
+# run_sec_audit — gate used by main: honors --no-sec / BH_NO_SEC and sets
+# BH_SEC_SKIPPED so the report can say why the audit is missing.
+run_sec_audit() {
+  if [ "${BH_NO_SEC:-0}" = "1" ]; then
+    BH_SEC_SKIPPED=1
+    log "SEC audit skipped (--no-sec)"
+    return 0
+  fi
+  BH_SEC_SKIPPED=0
+  sec_audit
+}
+
+sec_audit() {
+  BH_SEC_PASS=0; BH_SEC_WARN=0; BH_SEC_BAD=0
+  BH_SEC_LINES=()
+  BH_SEC_POSTURE="n/a"
+
+  log "SEC audit: sshd config, authorized_keys, firewall, local accounts..."
+  sec_sshd_load
+
+  # ---- SSH server configuration ----
+  if [ "$BH_SSH_FOUND" = "1" ]; then
+    BH_SSH_PORTS="$(sec_sshd_all port)"
+    [ -n "$BH_SSH_PORTS" ] || BH_SSH_PORTS="22"
+    BH_SSH_PWDAUTH="$(sec_sshd_opt passwordauthentication "")"
+    BH_SSH_PUBKEY="$(sec_sshd_opt pubkeyauthentication "")"
+    BH_SSH_ROOTLOGIN="$(sec_sshd_opt permitrootlogin "")"
+    BH_SSH_MAXAUTH="$(sec_sshd_opt maxauthtries "")"
+
+    case "$BH_SSH_PWDAUTH" in
+      no)  sec_line ok   "PasswordAuthentication: no (key-only login)" ;;
+      yes) sec_line warn "PasswordAuthentication: yes — brute-force surface; set 'PasswordAuthentication no'" ;;
+      *)   sec_line warn "PasswordAuthentication: not set (OpenSSH default: yes)" ;;
+    esac
+    case "$BH_SSH_PUBKEY" in
+      no)  sec_line warn "PubkeyAuthentication: no" ;;
+      *)   sec_line ok   "PubkeyAuthentication: ${BH_SSH_PUBKEY:-yes (default)}" ;;
+    esac
+    case "$BH_SSH_ROOTLOGIN" in
+      yes) sec_line bad  "PermitRootLogin: yes — direct root brute-force possible" ;;
+      no)  sec_line ok   "PermitRootLogin: no" ;;
+      *)   sec_line info "PermitRootLogin: ${BH_SSH_ROOTLOGIN:-prohibit-password (default)} — 'no' is safer with a sudo user" ;;
+    esac
+    sec_line info "SSH port(s): $BH_SSH_PORTS${BH_SSH_MAXAUTH:+ | MaxAuthTries: $BH_SSH_MAXAUTH} | source: $BH_SSH_CFG_SRC"
+  else
+    BH_SSH_PORTS=""
+    sec_line info "sshd: not found on this machine (no SSH server installed)"
+  fi
+
+  # ---- authorized keys ----
+  sec_auth_keys
+  if [ "$BH_AK_TOTAL" -gt 0 ]; then
+    local weaktxt=""
+    [ "$BH_AK_WEAK" -gt 0 ] && weaktxt=" — $BH_AK_WEAK WEAK (<2048-bit)"
+    sec_line ok "authorized_keys: $BH_AK_TOTAL key(s): ${BH_AK_TYPES:-unknown types}$weaktxt"
+  else
+    sec_line info "authorized_keys: none found (root + /home/*)"
+  fi
+
+  # ---- failed logins ----
+  sec_failed_logins
+  if [ "$BH_SSH_FAILS_N" -ge 50 ] 2>/dev/null; then
+    sec_line warn "Failed SSH logins: $BH_SSH_FAILS — looks like active brute-force; consider fail2ban + key-only auth"
+  elif [ "$BH_SSH_FAILS_N" -ge 1 ] 2>/dev/null; then
+    sec_line info "Failed SSH logins: $BH_SSH_FAILS"
+  else
+    sec_line info "Failed SSH logins: $BH_SSH_FAILS"
+  fi
+
+  # ---- firewall / fail2ban ----
+  sec_firewall
+  case "$BH_FW" in
+    *INACTIVE*|"no firewall detected") sec_line warn "Firewall: $BH_FW — enable ufw/nftables and only open needed ports" ;;
+    *) sec_line ok "Firewall: $BH_FW" ;;
+  esac
+  if command_exists fail2ban-client; then
+    BH_F2B=1
+    sec_line ok "fail2ban: installed"
+  else
+    BH_F2B=0
+    sec_line info "fail2ban: not installed (recommended when password auth is enabled)"
+  fi
+
+  # ---- local accounts / kernel / maintenance ----
+  sec_misc
+  if [ -n "$BH_UID0" ] && [ "$BH_UID0" != "root" ]; then
+    sec_line bad "UID-0 accounts: $BH_UID0 — extra root-level accounts exist"
+  else
+    sec_line ok "UID-0 accounts: root only"
+  fi
+  case "$BH_EMPTY_PW" in
+    n/a) sec_line info "Empty passwords: n/a (/etc/shadow not readable)" ;;
+    0)   sec_line ok   "Empty passwords: none" ;;
+    *)   sec_line bad  "Empty passwords: $BH_EMPTY_PW account(s) — CRITICAL" ;;
+  esac
+  sec_line info "Login-shell accounts: $BH_LOGIN_SHELLS"
+  case "$BH_SUDO_NOPASS" in
+    yes*) sec_line warn "sudo NOPASSWD: yes — passwordless root for some users" ;;
+    no)   sec_line ok   "sudo NOPASSWD: no" ;;
+    *)    sec_line info "sudo NOPASSWD: n/a (sudoers not readable)" ;;
+  esac
+
+  # ---- kernel / maintenance ----
+  if [ "$BH_ASLR" = "2" ]; then
+    sec_line ok "ASLR: full (randomize_va_space=2)"
+  else
+    sec_line info "ASLR: ${BH_ASLR:-n/a}"
+  fi
+  if [ "$BH_AUTO_UPD" = "not detected" ]; then
+    sec_line info "Auto security updates: not detected"
+  else
+    sec_line ok "Auto security updates: $BH_AUTO_UPD"
+  fi
+  sec_line info "Listening TCP ports: ${BH_LISTEN:-n/a (ss unavailable)}"
+
+  # ---- posture ----
+  if [ "$BH_SEC_BAD" -gt 0 ]; then
+    BH_SEC_POSTURE="WEAK"
+  elif [ "$BH_SEC_WARN" -gt 2 ]; then
+    BH_SEC_POSTURE="FAIR"
+  else
+    BH_SEC_POSTURE="GOOD"
+  fi
+  BH_SEC_LINES+=("  [POST]  Posture: $BH_SEC_POSTURE ($BH_SEC_PASS pass / $BH_SEC_WARN warn / $BH_SEC_BAD bad) — scope: this machine only")
+}
+
 # ============ lib/99-main.sh ============
 # =====================================================================
 # blackhole-vps-bench · 99-main.sh — CLI parsing and run modes
@@ -1213,24 +1661,29 @@ discord_send() {
 
 usage() {
   cat <<USAGE
-$BH_TOOL v$BH_VERSION — VPS virtualization detector + hardware benchmark
-Detects KVM / QEMU / Docker / Podman / LXC / OpenVZ / Xen / Hyper-V / VMware /
-VirtualBox / bhyve / WSL / bare metal, then benchmarks the REAL (cgroup-limited)
-configuration: CPU, memory, disk, network. Reports to terminal, JSON, Markdown
-and optionally a Discord webhook.
+$BH_TOOL v$BH_VERSION — VPS virtualization detector + hardware benchmark + SSH/security audit
+Detects KVM / QEMU / Docker / Podman / Kubernetes / LXC / OpenVZ / Xen / Hyper-V /
+VMware / VirtualBox / bhyve / WSL / bare metal, benchmarks the REAL (cgroup-limited)
+configuration — CPU, memory, disk, network speed (down/up, ICMP latency + jitter) —
+and audits the local SSH & security posture (password vs key auth, root login,
+authorized_keys, failed logins, firewall, fail2ban, UID-0 accounts, listening ports).
+Everything prints right here in the terminal; JSON/Markdown files and a Discord
+webhook are optional extras.
 
 Usage: blackhole-vps-bench [MODE] [OPTIONS]
 
 Modes:
-  all        detect + info + full benchmark (default)
+  all        detect + info + full benchmark + security audit (default)
   detect     virtualization detection only (fast, works offline)
-  info       system info only, no benchmark
+  info       system info + security audit, no benchmark
   bench      benchmark only (detection still shown for context)
+  sec        security/SSH audit only (no benchmark, no network speed)
   help       show this help
 
 Options:
   --fast           quick profile (smaller test payloads)
   --no-net         skip network tests (no outbound traffic)
+  --no-sec         skip the SSH/security audit
   --webhook URL    send report to a Discord webhook (env: BH_WEBHOOK)
   --json PATH      write JSON report to PATH ('-' = stdout)
   --markdown PATH  write Markdown report to PATH ('-' = stdout)
@@ -1240,13 +1693,14 @@ Options:
   --version        print version
   -h, help         show help
 
-Environment: BH_WEBHOOK, BH_FAST=1, BH_NO_NET=1, BH_DISK_DIR, BH_NO_COLOR=1
+Environment: BH_WEBHOOK, BH_FAST=1, BH_NO_NET=1, BH_NO_SEC=1, BH_DISK_DIR, BH_NO_COLOR=1
 
 Exit codes: 0 ok | 1 benchmark produced no data | 2 usage error
 
 Examples:
   blackhole-vps-bench
   blackhole-vps-bench detect
+  blackhole-vps-bench sec                        # only the SSH/security audit
   blackhole-vps-bench all --fast --webhook https://discord.com/api/webhooks/xxx/yyy
   blackhole-vps-bench all --json report.json --markdown report.md
 USAGE
@@ -1257,11 +1711,12 @@ BH_MODE="all"
 parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      all|detect|info|bench) BH_MODE="$1" ;;
+      all|detect|info|bench|sec) BH_MODE="$1" ;;
       help|-h|--help)        BH_MODE="help" ;;
       --version|-V)          BH_MODE="version" ;;
       --fast)                BH_FAST=1 ;;
       --no-net)              BH_NO_NET=1 ;;
+      --no-sec)              BH_NO_SEC=1 ;;
       --no-color)            BH_NO_COLOR=1; C_RST=''; C_B=''; C_DIM=''; C_CYN=''; C_GRN=''; C_YLW=''; C_RED=''; C_MAG='' ;;
       --webhook)
         [ -n "${2:-}" ] || die "--webhook requires a URL"
@@ -1314,22 +1769,36 @@ main() {
   detect_virt
 
   if [ "$BH_MODE" = "detect" ]; then
-    # detection must work fully offline
+    # detection must work fully offline and instantly
     local saved_net="$BH_NO_NET"
     BH_NO_NET=1
     gather_info
     BH_NO_NET="$saved_net"
     BH_BENCH_SKIPPED=1
+    BH_SEC_SKIPPED=1
   else
     gather_info
     if [ "$BH_MODE" = "info" ]; then
       BH_BENCH_SKIPPED=1
+      run_sec_audit
+    elif [ "$BH_MODE" = "sec" ]; then
+      BH_BENCH_SKIPPED=1
+      BH_NO_NET=1
+      run_sec_audit
+    elif [ "$BH_MODE" = "bench" ]; then
+      BH_SEC_SKIPPED=1
+      bench_cpu
+      bench_mem
+      bench_disk
+      bench_net
+      compute_scores
     else
       bench_cpu
       bench_mem
       bench_disk
       bench_net
       compute_scores
+      run_sec_audit
     fi
   fi
 

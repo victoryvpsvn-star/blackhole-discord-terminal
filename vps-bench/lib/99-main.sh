@@ -5,24 +5,29 @@
 
 usage() {
   cat <<USAGE
-$BH_TOOL v$BH_VERSION — VPS virtualization detector + hardware benchmark
-Detects KVM / QEMU / Docker / Podman / LXC / OpenVZ / Xen / Hyper-V / VMware /
-VirtualBox / bhyve / WSL / bare metal, then benchmarks the REAL (cgroup-limited)
-configuration: CPU, memory, disk, network. Reports to terminal, JSON, Markdown
-and optionally a Discord webhook.
+$BH_TOOL v$BH_VERSION — VPS virtualization detector + hardware benchmark + SSH/security audit
+Detects KVM / QEMU / Docker / Podman / Kubernetes / LXC / OpenVZ / Xen / Hyper-V /
+VMware / VirtualBox / bhyve / WSL / bare metal, benchmarks the REAL (cgroup-limited)
+configuration — CPU, memory, disk, network speed (down/up, ICMP latency + jitter) —
+and audits the local SSH & security posture (password vs key auth, root login,
+authorized_keys, failed logins, firewall, fail2ban, UID-0 accounts, listening ports).
+Everything prints right here in the terminal; JSON/Markdown files and a Discord
+webhook are optional extras.
 
 Usage: blackhole-vps-bench [MODE] [OPTIONS]
 
 Modes:
-  all        detect + info + full benchmark (default)
+  all        detect + info + full benchmark + security audit (default)
   detect     virtualization detection only (fast, works offline)
-  info       system info only, no benchmark
+  info       system info + security audit, no benchmark
   bench      benchmark only (detection still shown for context)
+  sec        security/SSH audit only (no benchmark, no network speed)
   help       show this help
 
 Options:
   --fast           quick profile (smaller test payloads)
   --no-net         skip network tests (no outbound traffic)
+  --no-sec         skip the SSH/security audit
   --webhook URL    send report to a Discord webhook (env: BH_WEBHOOK)
   --json PATH      write JSON report to PATH ('-' = stdout)
   --markdown PATH  write Markdown report to PATH ('-' = stdout)
@@ -32,13 +37,14 @@ Options:
   --version        print version
   -h, help         show help
 
-Environment: BH_WEBHOOK, BH_FAST=1, BH_NO_NET=1, BH_DISK_DIR, BH_NO_COLOR=1
+Environment: BH_WEBHOOK, BH_FAST=1, BH_NO_NET=1, BH_NO_SEC=1, BH_DISK_DIR, BH_NO_COLOR=1
 
 Exit codes: 0 ok | 1 benchmark produced no data | 2 usage error
 
 Examples:
   blackhole-vps-bench
   blackhole-vps-bench detect
+  blackhole-vps-bench sec                        # only the SSH/security audit
   blackhole-vps-bench all --fast --webhook https://discord.com/api/webhooks/xxx/yyy
   blackhole-vps-bench all --json report.json --markdown report.md
 USAGE
@@ -49,11 +55,12 @@ BH_MODE="all"
 parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      all|detect|info|bench) BH_MODE="$1" ;;
+      all|detect|info|bench|sec) BH_MODE="$1" ;;
       help|-h|--help)        BH_MODE="help" ;;
       --version|-V)          BH_MODE="version" ;;
       --fast)                BH_FAST=1 ;;
       --no-net)              BH_NO_NET=1 ;;
+      --no-sec)              BH_NO_SEC=1 ;;
       --no-color)            BH_NO_COLOR=1; C_RST=''; C_B=''; C_DIM=''; C_CYN=''; C_GRN=''; C_YLW=''; C_RED=''; C_MAG='' ;;
       --webhook)
         [ -n "${2:-}" ] || die "--webhook requires a URL"
@@ -106,22 +113,36 @@ main() {
   detect_virt
 
   if [ "$BH_MODE" = "detect" ]; then
-    # detection must work fully offline
+    # detection must work fully offline and instantly
     local saved_net="$BH_NO_NET"
     BH_NO_NET=1
     gather_info
     BH_NO_NET="$saved_net"
     BH_BENCH_SKIPPED=1
+    BH_SEC_SKIPPED=1
   else
     gather_info
     if [ "$BH_MODE" = "info" ]; then
       BH_BENCH_SKIPPED=1
+      run_sec_audit
+    elif [ "$BH_MODE" = "sec" ]; then
+      BH_BENCH_SKIPPED=1
+      BH_NO_NET=1
+      run_sec_audit
+    elif [ "$BH_MODE" = "bench" ]; then
+      BH_SEC_SKIPPED=1
+      bench_cpu
+      bench_mem
+      bench_disk
+      bench_net
+      compute_scores
     else
       bench_cpu
       bench_mem
       bench_disk
       bench_net
       compute_scores
+      run_sec_audit
     fi
   fi
 
