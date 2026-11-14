@@ -1,7 +1,7 @@
 # =====================================================================
 # blackhole-vps-bench · 40-mem.sh — memory bandwidth benchmark
 # Preferred: tiny C memcpy-style loop compiled at runtime (cc/gcc/clang).
-# Fallback: dd write-to-null proxy (clearly labeled).
+# Fallback: dd write-to-null proxy with adaptive payload sizing.
 # =====================================================================
 # shellcheck shell=bash
 
@@ -69,14 +69,18 @@ bench_mem() {
   fi
 
   if [ -z "$BH_MEM_GBS" ] || [ "$BH_MEM_GBS" = "0" ] || [ "$BH_MEM_GBS" = "0.00" ]; then
-    log "MEM bench: C compiler unavailable, falling back to dd proxy..."
-    local blocks=2048
-    [ "$BH_FAST" = "1" ] && blocks=1024
-    local t0 t1
-    t0=$(now_ms)
-    dd if=/dev/zero of=/dev/null bs=1M count="$blocks" 2>/dev/null
-    t1=$(now_ms)
-    BH_MEM_GBS="$(awk -v b="$blocks" -v ms=$((t1 - t0)) 'BEGIN{ if (ms>50) printf "%.2f", b/1048576/(ms/1000)*1024; else print 0 }')"
+    log "MEM bench: no C compiler — dd proxy with adaptive payload..."
+    local blocks=1024 t0 t1 ms
+    [ "$BH_FAST" != "1" ] && blocks=2048
+    while :; do
+      t0=$(now_ms)
+      dd if=/dev/zero of=/dev/null bs=1M count="$blocks" 2>/dev/null
+      t1=$(now_ms)
+      ms=$((t1 - t0))
+      { [ "$ms" -ge 300 ] || [ "$blocks" -ge 8192 ]; } && break
+      blocks=$((blocks * 2))
+    done
+    BH_MEM_GBS="$(awk -v b="$blocks" -v ms="$ms" 'BEGIN{ if (ms>=50) printf "%.2f", b*1048576/1e9/(ms/1000); else print 0 }')"
     BH_MEM_METHOD="dd /dev/zero->null proxy"
   fi
 }

@@ -38,7 +38,7 @@ jobs:
         run: vps-bench/build.sh
       - name: shellcheck
         run: >
-          shellcheck -x -e SC2034,SC2016,SC2317
+          shellcheck -x -e SC2034,SC2016,SC2317,SC2329
           vps-bench/dist/blackhole-vps-bench
           vps-bench/install.sh
           vps-bench/tests/run-tests.sh
@@ -92,14 +92,18 @@ jobs:
         run: vps-bench/build.sh
       - name: Run inside ${{ matrix.image }}
         run: |
-          docker run --rm -v "$PWD:/work" -w /work "${{ matrix.image }}" bash -c '
+          docker run --rm -v "$PWD:/work" -w /work "${{ matrix.image }}" /bin/sh -c '
             set -e
             if grep -qi alpine /etc/os-release; then
               apk add --no-cache bash curl coreutils openssl >/dev/null
             elif grep -qi debian /etc/os-release; then
               apt-get update -qq && apt-get install -y -qq bash curl openssl >/dev/null
+            elif grep -qi rocky /etc/os-release; then
+              # rocky minimal ships curl-minimal + coreutils-single (both enough for the tool);
+              # installing full curl/coreutils would conflict with them
+              dnf -y install openssl >/dev/null
             else
-              (dnf -y install bash curl openssl coreutils || yum -y install bash curl openssl coreutils) >/dev/null
+              dnf -y install bash curl openssl coreutils >/dev/null
             fi
             bash vps-bench/bin/blackhole-vps-bench detect
             if [ "${{ matrix.full }}" = "true" ]; then

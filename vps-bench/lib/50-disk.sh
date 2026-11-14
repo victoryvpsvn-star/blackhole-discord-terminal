@@ -45,33 +45,48 @@ bench_disk() {
     BH_RFLAGS="iflag=direct"; BH_DISK_MODE="${BH_DISK_MODE} +direct-read"
   fi
 
-  local t0 t1
-  log "DISK bench on $dir (mode: $BH_DISK_MODE): seq write ${seqmb} MB..."
+  local t0 t1 ms
+  log "DISK bench on $dir (mode: $BH_DISK_MODE): seq write (adaptive from ${seqmb} MB)..."
 
-  t0=$(now_ms)
-  # shellcheck disable=SC2086  # flags are intentionally word-split
-  dd if=/dev/zero of="$file" bs=1M count="$seqmb" $BH_WFLAGS 2>/dev/null
-  sync 2>/dev/null
-  t1=$(now_ms)
-  BH_SEQW="$(awk -v n="$seqmb" -v ms=$((t1 - t0)) 'BEGIN{ if (ms>50) printf "%.1f", n*1048576/(ms/1000)/1048576; else print 0 }')"
+  # adaptive payload: double until the measurement window is >= 300 ms
+  while :; do
+    t0=$(now_ms)
+    # shellcheck disable=SC2086  # flags are intentionally word-split
+    dd if=/dev/zero of="$file" bs=1M count="$seqmb" $BH_WFLAGS 2>/dev/null
+    sync 2>/dev/null
+    t1=$(now_ms)
+    ms=$((t1 - t0))
+    { [ "$ms" -ge 300 ] || [ "$seqmb" -ge 1024 ] || [ "$seqmb" -ge $((BH_DISK_AVAIL_MB / 2)) ]; } && break
+    seqmb=$((seqmb * 2))
+  done
+  BH_SEQW="$(awk -v n="$seqmb" -v ms="$ms" 'BEGIN{ if (ms>=50) printf "%.1f", n*1048576/(ms/1000)/1048576; else print 0 }')"
 
-  t0=$(now_ms)
-  dd if="$file" of=/dev/null bs=1M $BH_RFLAGS 2>/dev/null
-  t1=$(now_ms)
-  BH_SEQR="$(awk -v n="$seqmb" -v ms=$((t1 - t0)) 'BEGIN{ if (ms>50) printf "%.1f", n*1048576/(ms/1000)/1048576; else print 0 }')"
-
-  log "DISK bench: 4K blocks (${seq4k} x 4K)..."
   t0=$(now_ms)
   # shellcheck disable=SC2086
-  dd if=/dev/zero of="$file" bs=4k count="$seq4k" $BH_WFLAGS 2>/dev/null
-  sync 2>/dev/null
+  dd if="$file" of=/dev/null bs=1M $BH_RFLAGS 2>/dev/null
   t1=$(now_ms)
-  BH_4KW="$(awk -v n="$seq4k" -v ms=$((t1 - t0)) 'BEGIN{ if (ms>50) printf "%.1f", n*4096/(ms/1000)/1048576; else print 0 }')"
+  ms=$((t1 - t0))
+  BH_SEQR="$(awk -v n="$seqmb" -v ms="$ms" 'BEGIN{ if (ms>=50) printf "%.1f", n*1048576/(ms/1000)/1048576; else print 0 }')"
+
+  log "DISK bench: 4K blocks (adaptive from ${seq4k})..."
+  while :; do
+    t0=$(now_ms)
+    # shellcheck disable=SC2086
+    dd if=/dev/zero of="$file" bs=4k count="$seq4k" $BH_WFLAGS 2>/dev/null
+    sync 2>/dev/null
+    t1=$(now_ms)
+    ms=$((t1 - t0))
+    { [ "$ms" -ge 300 ] || [ "$seq4k" -ge 131072 ]; } && break
+    seq4k=$((seq4k * 4))
+  done
+  BH_4KW="$(awk -v n="$seq4k" -v ms="$ms" 'BEGIN{ if (ms>=50) printf "%.1f", n*4096/(ms/1000)/1048576; else print 0 }')"
 
   t0=$(now_ms)
+  # shellcheck disable=SC2086
   dd if="$file" of=/dev/null bs=4k $BH_RFLAGS 2>/dev/null
   t1=$(now_ms)
-  BH_4KR="$(awk -v n="$seq4k" -v ms=$((t1 - t0)) 'BEGIN{ if (ms>50) printf "%.1f", n*4096/(ms/1000)/1048576; else print 0 }')"
+  ms=$((t1 - t0))
+  BH_4KR="$(awk -v n="$seq4k" -v ms="$ms" 'BEGIN{ if (ms>=50) printf "%.1f", n*4096/(ms/1000)/1048576; else print 0 }')"
 
   rm -f "$file" 2>/dev/null
 
