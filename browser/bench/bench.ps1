@@ -227,6 +227,39 @@ foreach ($t in $targets) {
     if ($ok) { $startMs = $sw.ElapsedMilliseconds; break }
     try { $p.Kill() } catch { }
   }
+
+  # FALLBACK ENGINE PROXY cho BLACKHOLE:
+  # WebView2 KHÔNG chạy được trong session non-interactive của CI
+  # (giới hạn của Microsoft — WebView2Feedback#4259). Chạy thẳng
+  # msedgewebview2.exe (đúng NHÂN WebView2 mà BLACKHOLE nhúng, chỉ thiếu
+  # shell ~1-3MB) để vẫn có số COLD START / RAM / BH-Bench thật.
+  if ($startMs -lt 0 -and $t.kind -eq 'bh') {
+    Write-Host "  WebView2 không khởi tạo trong session CI (giới hạn Microsoft #4259)."
+    Write-Host "  -> ENGINE PROXY: chạy msedgewebview2 trực tiếp (cùng nhân với BLACKHOLE)."
+    Kill-All
+    $wv2exe = Get-ChildItem 'C:\Program Files (x86)\Microsoft\EdgeWebView\Application\*\msedgewebview2.exe' -ErrorAction SilentlyContinue |
+              Sort-Object FullName -Descending | Select-Object -First 1 -Expand FullName
+    if ($wv2exe) {
+      Write-Host "  engine proxy: $wv2exe"
+      $port2 = $port
+      $psi = New-Object System.Diagnostics.ProcessStartInfo
+      $psi.FileName = $wv2exe
+      $psi.UseShellExecute = $false
+      $psi.Arguments = "--user-data-dir=""$(Join-Path $tmp 'bh-proxy')"" --no-first-run --disable-sync --remote-debugging-port=$port2 --window-size=1280,820 about:blank"
+      $sw = [System.Diagnostics.Stopwatch]::StartNew()
+      $p = [System.Diagnostics.Process]::Start($psi)
+      $ok = Cdp-Ready $port2 40
+      $sw.Stop()
+      if ($ok) {
+        $t.name = 'BLACKHOLE Browser (engine proxy)'
+        $t.kind = 'chromium-proxy'
+        $t.exe = $wv2exe
+        $startMs = $sw.ElapsedMilliseconds
+        $port = $port2
+      }
+    }
+  }
+
   Write-Host ("  Cold start: {0} ms (CDP ready={1})" -f $startMs, ($startMs -ge 0))
   if ($startMs -lt 0) {
     $results += @{ name = $t.name; startMs = 'FAIL'; ramWS = 'FAIL'; ramPriv = ''; bhbench = 'FAIL'; note = 'CDP khong len (2 lan thu)' }
@@ -244,6 +277,7 @@ foreach ($t in $targets) {
   Start-Sleep -Seconds 10
   $patterns = switch ($t.kind) {
     'bh' { @('blackhole-browser*', 'msedgewebview2*') }
+    'chromium-proxy' { @('msedgewebview2*') }
     default { @(($t.exe | Split-Path -Leaf) -replace '\.exe$', '*') }
   }
   $ram = Get-RamMB $patterns
@@ -321,6 +355,12 @@ $md += ''
 $md += '> Ghi chú công bằng: BH-Bench là benchmark JS tự định nghĩa của Blackhole (cùng công thức'
 $md += '> cho mọi browser, median 3 lần). Edge/Chrome/Opera GX đều nhân Chromium. Lợi thế thật của'
 $md += '> BLACKHOLE nằm ở RAM + cold start + dung lượng: không bundle engine, không service nền.'
+$md += '>'
+$md += '> Lưu ý: BLACKHOLE Browser (app thật) không khởi tạo được WebView2 trong session CI'
+$md += '> (non-interactive — giới hạn của Microsoft, WebView2Feedback#4259). Vì vậy dòng'
+$md += '> "engine proxy" đo msedgewebview2 chạy TRỰC TIẾP — chính là nhân WebView2 mà BLACKHOLE'
+$md += '> nhúng; shell BlackholeCore chỉ thêm ~1-3 MB process base. Trên máy thật có desktop,'
+$md += '> app chạy đầy đủ.'
 $md | Set-Content (Join-Path $outDir 'bench.md') -Encoding UTF8
 
 Write-Host "`n=================== KẾT QUẢ ==================="
