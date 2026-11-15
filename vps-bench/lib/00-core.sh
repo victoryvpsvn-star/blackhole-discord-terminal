@@ -3,7 +3,7 @@
 # =====================================================================
 # shellcheck shell=bash
 
-BH_VERSION="5.0.0"
+BH_VERSION="5.1.0"
 BH_TOOL="blackhole-vps-bench"
 BH_REPO="victoryvpsvn-star/blackhole-discord-terminal"
 

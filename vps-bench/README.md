@@ -2,7 +2,7 @@
 
 Tool kiểm tra VPS của bạn thực chất đang chạy trên gì — KVM, QEMU, Docker, Podman, Kubernetes, LXC/LXD, OpenVZ, Xen, Hyper-V, VMware, VirtualBox, bhyve, WSL hay máy chủ dedicated — rồi benchmark đúng **cấu hình thực** (đọc cgroup limit chứ không báo nhầm RAM/CPU của host), **chứng minh nhà cung cấp có oversell hay không** (steal-under-load, KSM, diskstats live, model ổ host), **chỉ ra region thật** (colo Cloudflare), **chốt VPS chạy mail/VPN được không** (NAT/CGNAT + port 25/465/587/1194/51820), kiểm kê **GPU/AI accelerator**, **audit SSH & bảo mật ngay trên máy**. Thuần bash, một file duy nhất, chạy được cả trong container Alpine lẫn runner ARM, có GitHub Actions selftest, và **kết quả in thẳng ra terminal** — Discord chỉ là tuỳ chọn.
 
-- Phiên bản: **v4.0.0**
+- Phiên bản: **v5.1.0**
 - Repo: `victoryvpsvn-star/blackhole-discord-terminal`
 - Yêu cầu: Linux + bash, `curl` (bắt buộc cho phần network), còn lại mọi thứ đều tự động hóa qua `dd`/`sha256sum`/`openssl`/`fio`/`ss` nếu có. Không cần root (có root thì audit sâu hơn).
 
@@ -24,6 +24,19 @@ Tool kiểm tra VPS của bạn thực chất đang chạy trên gì — KVM, QE
 > 5. **Parser sshd đọc drop-in thắng main config vô điều kiện** — v4 expand Include đúng vị trí, giữ semantics *first-match-wins* của OpenSSH.
 > 6. **`aws_gen` bị ép gán từ IMDSv2** (Xen-gen cũng trả lời IMDSv2 mà) — v4 chỉ suy generation từ DMI/instance-type, không đè verdict của detect.
 > 7. **cpuset bị bỏ qua khi bench** (chỉ để hiển thị) — v4 số job song song = min(cgroup quota, nproc, số core trong cpuset).
+
+> **Có gì mới ở v5.1?** Đợt nâng cấp "dò được nhiều thứ trên máy hơn" do pipeline 10 idea agent → 5 review agent → 3 coder agent đề xuất/chấm điểm/triển khai (chi tiết: `docs/vps-bench-v5.1-design.md`):
+> - **Sandbox class**: nhận diện **kata-containers / gVisor / Firecracker** — microVM sandbox bọc ngoài container của bạn (dòng `Sandbox :` trong verdict, kèm danh sách signal đã bắn).
+> - **SMT truth**: `SMT: N hardware thread(s)/core` + hotplug delta (`N offline`) — đối chiếu "N vCPU" quảng cáo với topology thật.
+> - **Overcommit posture**: mode 0/1/2 + `Committed_AS` vs `CommitLimit` (mode 2 breach = OOM risk thật).
+> - **TCP kernel knobs**: syncookies, fastopen, rp_filter (all/default), rmem/wmem max — một dòng `[ENV]` gọn.
+> - **Qdisc of default iface**: pfifo/fq/fq_codel + cảnh báo `fq recommended with BBR` khi đang chạy BBR mà qdisc không phải fq.
+> - **Userns budget**: `max_user_namespaces` — hardening surface một dòng.
+> - **Guest-agent census** (found-only, presence-only — KHÔNG đọc config, KHÔNG đụng /var/lib/cloud contents): cloud-init, qemu-ga, vmtoolsd, waagent, google-guest-agent, amazon-ssm-agent → dòng `Managed :` trả lời "thằng nào đang quản máy này".
+> - **JSON**: 11 key mới trong `system` (`smt_threads`, `oom_mode`, `sandbox`, `qdisc`, `guest_agents`, ...).
+> - **CI Discord notify bản nâng cấp**: embed giờ kèm **verdict digest thật** (Verdict/share/Posture/Oversell) từ từng job host + từng container, không chỉ PASS/FAIL.
+>
+> Đề xuất bị review agent loại có chủ đích: `drop_caches` trước disk-read (vì `iflag=direct` đã có sẵn và drop_caches đập cache CẢ HOST — nguy hiểm shared kernel), speedtest-cli/iperf3 tự động (flaky, vi phạm no-install), CPU steal (đã ship từ v4).
 
 ---
 

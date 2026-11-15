@@ -1082,6 +1082,10 @@ build_report() {
   fi
   # v4 deep-scan verdicts (10-detect; each renders only when determined)
   [ -n "${BH_VIRT_NESTED:-}" ]    && rpt "  Nested  : $BH_VIRT_NESTED"
+  # v5.1 sandbox runtime class (27-probes): kata/gVisor/Firecracker microVM
+  # wrapping the container or VM — the definitive "it even sees that" row.
+  # (label "Sandbox :" to avoid clashing with module 26's "Runtime :" row)
+  [ -n "${BH_SANDBOX_TXT:-}" ]    && rpt "  Sandbox : $BH_SANDBOX_TXT"
   [ -n "${BH_CONF_COMPUTING:-}" ] && rpt "  ConfCmp : $BH_CONF_COMPUTING (confidential computing)"
   [ -n "${BH_IRQ_VMM:-}" ]        && rpt "  VMM irq : $BH_IRQ_VMM"
   [ -n "${BH_VIRTIO_DEVS:-}" ]    && rpt "  Virtio  : $BH_VIRTIO_DEVS"
@@ -1132,6 +1136,13 @@ build_report() {
   esac
   rpt "$cpuline"
   rpt "            ${BH_CPU_LOGICAL:-?} logical / ${BH_CPU_PHYS:-?} physical cores"
+  # v5.1 SMT truth + hotplug delta (27-probes) — feeds the oversell intuition
+  if [ -n "${BH_SMT_THREADS:-}" ]; then
+    local _smtline="            SMT: ${BH_SMT_THREADS} hardware thread(s)/core"
+    [ "${BH_SMT_THREADS:-1}" = "2" ] && _smtline="$_smtline (hyperthreading)"
+    rpt "$_smtline"
+  fi
+  [ -n "${BH_CPU_HOTPLUG:-}" ] && rpt "            hotplug: $BH_CPU_HOTPLUG"
   local effline="            effective: ${BH_EFF_CORES:-?} core(s)"
   if [ -n "$BH_CPU_QUOTA_TXT" ]; then effline="$effline, cgroup quota $BH_CPU_QUOTA_TXT cores"; fi
   if [ -n "$CPUSET" ]; then effline="$effline, cpuset [$CPUSET]"; fi
@@ -1324,6 +1335,14 @@ build_report() {
     fi
     [ -n "${BH_OOM_ADJ:-}${BH_OOM_SCORE:-}" ] && rpt "  OOM     : adj ${BH_OOM_ADJ:-?} · score ${BH_OOM_SCORE:-?}"
     [ -n "${BH_CG_CONTROLLERS:-}" ] && rpt "  Cgroup  : controllers: $BH_CG_CONTROLLERS"
+    # ---- v5.1 deep probes (module 27) — compact, guarded, silent when absent
+    [ -n "${BH_OOM_MODE:-}" ] && rpt "  OverCmt : mode ${BH_OOM_MODE}${BH_OOM_RATIO:+ ratio ${BH_OOM_RATIO}}${BH_OOM_COMMIT_PCT:+ · committed ${BH_OOM_COMMIT_PCT}% of CommitLimit}"
+    if [ -n "${BH_TCP_SYNCOOKIES:-}${BH_TCP_FASTOPEN:-}${BH_RP_FILTER:-}" ]; then
+      rpt "  TCP     : syncookies ${BH_TCP_SYNCOOKIES:-?} · fastopen ${BH_TCP_FASTOPEN:-?} · rp_filter ${BH_RP_FILTER:-?}${BH_TCP_RMEM_MAX_KB:+ · rmem max ${BH_TCP_RMEM_MAX_KB}K}${BH_TCP_WMEM_MAX_KB:+ · wmem max ${BH_TCP_WMEM_MAX_KB}K}"
+    fi
+    [ -n "${BH_QDISC:-}" ] && rpt "  Qdisc   : ${BH_QDISC} on ${BH_QDISC_IFACE:-?}${BH_QDISC_NOTE:+ — $BH_QDISC_NOTE}"
+    [ -n "${BH_USERNS_MAX:-}" ] && rpt "  Userns  : max_user_namespaces ${BH_USERNS_MAX}"
+    [ -n "${BH_GUEST_AGENTS:-}" ] && rpt "  Managed : $BH_GUEST_AGENTS"
   fi
   # ---- v5 container / runtime / pressure lines (module 25 + runtime extras) ----
   bhv5c14_render_env_extras
@@ -1511,6 +1530,16 @@ EOF2
     "$(json_val "${BH_STEAL_PCT:-}")" "$(json_val "${BH_NET_MTU:-}")"
   printf '"vuln_worst":%s,"vuln_scope":%s,' \
     "$(json_val "${BH_VULN_WORST:-}")" "$(json_val "${BH_VULN_SCOPE:-}")"
+  # v5.1 deep probes (module 27) — inside "system"
+  printf '"smt_threads":%s,"cpu_hotplug":%s,"oom_mode":%s,"oom_commit_pct":%s,' \
+    "$(json_val "${BH_SMT_THREADS:-}")" "$(json_val "${BH_CPU_HOTPLUG:-}")" \
+    "$(json_val "${BH_OOM_MODE:-}")" "$(json_val "${BH_OOM_COMMIT_PCT:-}")"
+  printf '"tcp_syncookies":%s,"tcp_fastopen":%s,"rp_filter":%s,"qdisc":%s,' \
+    "$(json_val "${BH_TCP_SYNCOOKIES:-}")" "$(json_val "${BH_TCP_FASTOPEN:-}")" \
+    "$(json_val "${BH_RP_FILTER:-}")" "$(json_val "${BH_QDISC:-}")"
+  printf '"sandbox":%s,"userns_max":%s,"guest_agents":%s,' \
+    "$(json_val "${BH_SANDBOX:-none}")" "$(json_val "${BH_USERNS_MAX:-}")" \
+    "$(json_val "${BH_GUEST_AGENTS:-}")"
   printf '"cpu":{"model":%s,"logical_cores":%s,"physical_cores":%s,"effective_cores":%s,"features":%s,"cpu_freq_mhz":%s,' \
     "$(json_val "$BH_CPU_MODEL")" "$(json_val "$BH_CPU_LOGICAL")" "$(json_val "$BH_CPU_PHYS")" "$(json_val "$BH_EFF_CORES")" "$(json_val "$BH_CPU_FLAGS_HI")" "$(json_val "${BH_CPU_FREQ_MHZ:-}")"
   printf '"ai_features":%s,"crypto_features":%s,"microcode":%s,"stepping":%s,' \

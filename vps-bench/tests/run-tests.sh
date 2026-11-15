@@ -270,6 +270,22 @@ if [ -n "$jline" ] && command -v jq >/dev/null 2>&1; then
   else
     skip "json: score.grade (feature not present)"
   fi
+  # v5.1 probes soft keys — assert ONLY when the producer is actually wired
+  # into lib/, otherwise the whole suite would be red mid-merge:
+  #   .system.smt_threads / .system.oom_mode / .system.sandbox
+  #     <- BH_SMT_THREADS / BH_OOM_MODE / BH_SANDBOX (27-probes.sh) + build_json
+  # Guard is pinned to lib/27-probes.sh: 70-report.sh already consumes
+  # BH_SMT_THREADS for the text report, so a lib/*.sh grep would always match.
+  if grep -qs 'BH_SMT_THREADS' lib/27-probes.sh && grep -qs '"smt_threads"' lib/70-report.sh; then
+    printf '%s' "$jline" | jq -e '.system | has("smt_threads")' >/dev/null 2>&1 \
+      && pass "json: system.smt_threads present" || flunk "json: system.smt_threads present"
+    printf '%s' "$jline" | jq -e '.system | has("oom_mode")' >/dev/null 2>&1 \
+      && pass "json: system.oom_mode present" || flunk "json: system.oom_mode present"
+    printf '%s' "$jline" | jq -e '.system | has("sandbox")' >/dev/null 2>&1 \
+      && pass "json: system.sandbox present" || flunk "json: system.sandbox present"
+  else
+    skip "json: system smt_threads/oom_mode/sandbox (feature not present)"
+  fi
 elif [ -n "$jline" ] && command -v python3 >/dev/null 2>&1; then
   printf '%s' "$jline" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert isinstance(d["virtualization"]["evidence"], list); assert isinstance(d["security"], dict); assert "grade" in d["score"]' \
     && pass "json schema v4 (python3 fallback)" || flunk "json schema v4 (python3 fallback)"
@@ -442,6 +458,101 @@ echo "== 18. new module smoke: gather_env / gather_storage_map (soft) =="
   fi
   exit "$U"
 ) && pass "new module smoke (25-env / 55-storage-map)" || flunk "new module smoke (25-env / 55-storage-map)"
+
+echo "== 19. unit: gather_probes globals contract =="
+(
+  # shellcheck disable=SC1091
+  . ./lib/00-core.sh
+  U=0
+  # er DESC REGEX VAL — like um but VAL='' is always allowed (contract
+  # default): um itself can never pass an empty actual (grep sees zero lines).
+  er() { if [ -z "$3" ] || printf '%s' "$3" | grep -qE "$2"; then echo "PASS: $1"; else echo "FAIL: $1 (want: '' or /$2/ got: '$3')"; return 1; fi; }
+  # the probes module is merged in parallel: a missing/broken file must be a
+  # CLEAR failed test (not a crash, not a silent skip) — flunk fires below.
+  if [ ! -f ./lib/27-probes.sh ]; then
+    echo "FAIL: lib/27-probes.sh missing (probes module not merged yet)"
+    exit 1
+  fi
+  # shellcheck disable=SC1091
+  . ./lib/27-probes.sh 2>/dev/null || { echo "FAIL: lib/27-probes.sh failed to source"; exit 1; }
+  declare -f gather_probes >/dev/null 2>&1 \
+    || { echo "FAIL: gather_probes not defined in lib/27-probes.sh"; exit 1; }
+  # stdout -> file (NOT $( ): the globals-only contract must be checked in
+  # THIS shell — a command substitution would run gather_probes in a child
+  # and hide every BH_* global it sets; same idiom as == 18.
+  gather_probes > "$BH_RUNDIR/gather_probes.out" 2>/dev/null; prc=$?
+  pout="$(cat "$BH_RUNDIR/gather_probes.out" 2>/dev/null)"
+  u "gather_probes exit 0" "0" "$prc" || U=1
+  u "gather_probes stdout empty (globals-only contract)" "" "$pout" || U=1
+  um "BH_SANDBOX one of none|kata|gvisor|firecracker" '^(none|kata|gvisor|firecracker)$' "${BH_SANDBOX:-}" || U=1
+  er "BH_SMT_THREADS '' or ^[0-9]+$"          '^[0-9]+$' "${BH_SMT_THREADS:-}"    || U=1
+  er "BH_OOM_MODE '' or ^[012]$"              '^[012]$'  "${BH_OOM_MODE:-}"      || U=1
+  er "BH_TCP_SYNCOOKIES '' or ^[01]$"         '^[01]$'   "${BH_TCP_SYNCOOKIES:-}" || U=1
+  er "BH_TCP_FASTOPEN '' or ^[0-3]$"          '^[0-3]$'  "${BH_TCP_FASTOPEN:-}"  || U=1
+  er "BH_USERNS_MAX '' or ^[0-9]+$"           '^[0-9]+$' "${BH_USERNS_MAX:-}"    || U=1
+  er "BH_GUEST_AGENTS names only (no ':' or '/')" '^[^:/]*$' "${BH_GUEST_AGENTS:-}" || U=1
+  u "BH_SANDBOX_TXT empty iff BH_SANDBOX=none" "yes" \
+    "$({ [ -z "${BH_SANDBOX_TXT:-}" ] && [ "${BH_SANDBOX:-}" = "none" ]; } || { [ -n "${BH_SANDBOX_TXT:-}" ] && [ "${BH_SANDBOX:-}" != "none" ]; } && echo yes || echo no)" || U=1
+  exit "$U"
+) && pass "probes: globals contract" || flunk "probes: globals contract"
+
+echo "== 20. unit: gather_probes bad-input tolerance (idempotency + missing optional tools) =="
+(
+  # shellcheck disable=SC1091
+  . ./lib/00-core.sh
+  U=0
+  er() { if [ -z "$3" ] || printf '%s' "$3" | grep -qE "$2"; then echo "PASS: $1"; else echo "FAIL: $1 (want: '' or /$2/ got: '$3')"; return 1; fi; }
+  if [ ! -f ./lib/27-probes.sh ]; then
+    echo "FAIL: lib/27-probes.sh missing (probes module not merged yet)"
+    exit 1
+  fi
+  # shellcheck disable=SC1091
+  . ./lib/27-probes.sh 2>/dev/null || { echo "FAIL: lib/27-probes.sh failed to source"; exit 1; }
+  declare -f gather_probes >/dev/null 2>&1 \
+    || { echo "FAIL: gather_probes not defined in lib/27-probes.sh"; exit 1; }
+  # snapshot of every contract global; ${v-} tolerates unset under set -u
+  gp_snap() {
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+      "${BH_SMT_THREADS-}"      "${BH_CPU_HOTPLUG-}"     "${BH_OOM_MODE-}" \
+      "${BH_OOM_RATIO-}"       "${BH_OOM_COMMIT_PCT-}"  "${BH_TCP_SYNCOOKIES-}" \
+      "${BH_TCP_FASTOPEN-}"    "${BH_TCP_RMEM_MAX_KB-}" "${BH_TCP_WMEM_MAX_KB-}" \
+      "${BH_RP_FILTER-}"       "${BH_QDISC-}"           "${BH_QDISC_IFACE-}" \
+      "${BH_QDISC_NOTE-}"      "${BH_SANDBOX-}"         "${BH_SANDBOX_TXT-}" \
+      "${BH_USERNS_MAX-}"      "${BH_GUEST_AGENTS-}"
+  }
+  # idempotency: two consecutive runs, byte-identical globals, both silent
+  gather_probes > "$BH_RUNDIR/gather_probes.1.out" 2>/dev/null; rc1=$?
+  pout1="$(cat "$BH_RUNDIR/gather_probes.1.out" 2>/dev/null)"
+  snap1="$(gp_snap)"
+  gather_probes > "$BH_RUNDIR/gather_probes.2.out" 2>/dev/null; rc2=$?
+  pout2="$(cat "$BH_RUNDIR/gather_probes.2.out" 2>/dev/null)"
+  snap2="$(gp_snap)"
+  u "gather_probes run 1 exit 0" "0" "$rc1" || U=1
+  u "gather_probes run 2 exit 0" "0" "$rc2" || U=1
+  u "gather_probes run 1 stdout empty" "" "$pout1" || U=1
+  u "gather_probes run 2 stdout empty" "" "$pout2" || U=1
+  u "gather_probes idempotent (contract globals identical after 2nd run)" "$snap1" "$snap2" || U=1
+  # bad input: optional tools absent (no /usr/sbin, no shim dirs) must not
+  # crash, abort a set -e caller, or corrupt the globals
+  oldpath="$PATH"
+  PATH=/usr/bin:/bin
+  gather_probes > "$BH_RUNDIR/gather_probes.3.out" 2>/dev/null; rc3=$?
+  PATH="$oldpath"
+  pout3="$(cat "$BH_RUNDIR/gather_probes.3.out" 2>/dev/null)"
+  u "gather_probes rc=0 with PATH=/usr/bin:/bin (tc/sysctl/... absent)" "0" "$rc3" || U=1
+  u "gather_probes stdout empty (restricted PATH)" "" "$pout3" || U=1
+  # globals remain well-formed even when the probes could not run
+  um "BH_SANDBOX well-formed (restricted PATH)" '^(none|kata|gvisor|firecracker)$' "${BH_SANDBOX:-}" || U=1
+  er "BH_SMT_THREADS well-formed (restricted PATH)"  '^[0-9]+$' "${BH_SMT_THREADS:-}"    || U=1
+  er "BH_OOM_MODE well-formed (restricted PATH)"     '^[012]$'  "${BH_OOM_MODE:-}"      || U=1
+  er "BH_TCP_SYNCOOKIES well-formed (restricted PATH)" '^[01]$' "${BH_TCP_SYNCOOKIES:-}" || U=1
+  er "BH_TCP_FASTOPEN well-formed (restricted PATH)" '^[0-3]$'  "${BH_TCP_FASTOPEN:-}"  || U=1
+  er "BH_USERNS_MAX well-formed (restricted PATH)"   '^[0-9]+$' "${BH_USERNS_MAX:-}"    || U=1
+  er "BH_GUEST_AGENTS well-formed (restricted PATH)" '^[^:/]*$' "${BH_GUEST_AGENTS:-}"  || U=1
+  u "BH_SANDBOX_TXT empty iff BH_SANDBOX=none (restricted PATH)" "yes" \
+    "$({ [ -z "${BH_SANDBOX_TXT:-}" ] && [ "${BH_SANDBOX:-}" = "none" ]; } || { [ -n "${BH_SANDBOX_TXT:-}" ] && [ "${BH_SANDBOX:-}" != "none" ]; } && echo yes || echo no)" || U=1
+  exit "$U"
+) && pass "probes: bad-input tolerance" || flunk "probes: bad-input tolerance"
 
 echo
 if [ "$fail" -eq 0 ]; then

@@ -172,6 +172,9 @@ bhv5c15_v5_gathers() {
   if bh_mod_enabled spec && declare -F gather_speccheck >/dev/null 2>&1; then bh_timed spec gather_speccheck; fi
   if bh_mod_enabled hw && declare -F gather_hwdeep >/dev/null 2>&1; then bh_timed hw gather_hwdeep; fi
   if bh_mod_enabled container && declare -F gather_container >/dev/null 2>&1; then bh_timed container gather_container; fi
+  # v5.1 deep probes (SMT / overcommit / TCP knobs / qdisc / sandbox class /
+  # userns / guest-agent census) — pure reads, offline, double-guarded.
+  if bh_mod_enabled probes && declare -F gather_probes >/dev/null 2>&1; then bh_timed probes gather_probes; fi
   if bh_mod_enabled mounts && declare -F gather_mount_audit >/dev/null 2>&1; then bh_timed mounts gather_mount_audit; fi
   if [ "${1:-}" = "--health" ]; then
     if bh_mod_enabled health && declare -F gather_storage_health >/dev/null 2>&1; then bh_timed health gather_storage_health; fi

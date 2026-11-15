@@ -76,6 +76,10 @@ jobs:
           vps-bench/bin/blackhole-vps-bench all --fast \
             --json /tmp/report.json --markdown /tmp/report.md --output /tmp/report.txt \
             --prom /tmp/report.prom
+      - name: Extract verdict digest
+        run: |
+          mkdir -p verdicts
+          grep -E '^  Verdict :|^  share:|^  Posture:|Oversell' /tmp/report.txt > "verdicts/host-${{ matrix.os }}.txt" || true
       - name: Show verdict
         run: |
           grep -A10 "VIRTUALIZATION VERDICT" /tmp/report.txt || true
@@ -90,6 +94,12 @@ jobs:
             /tmp/report.txt
             /tmp/report.prom
           if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verdict-${{ matrix.os }}
+          path: verdicts/
+          if-no-files-found: ignore
 
   containers:
     name: container ${{ matrix.image }}
@@ -110,9 +120,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build bundle
         run: vps-bench/build.sh
+      - name: Prepare verdict output and sanitized artifact key
+        run: |
+          mkdir -p verdicts
+          echo "ctkey=$(printf '%s' '${{ matrix.image }}' | tr ':/' '__')" >> "$GITHUB_ENV"
       - name: Run inside ${{ matrix.image }}
         run: |
-          docker run --rm ${{ matrix.quota }} -v "$PWD:/work" -w /work "${{ matrix.image }}" /bin/sh -c '
+          docker run --rm ${{ matrix.quota }} -v "$PWD:/work" -v "$PWD/verdicts:/out" -w /work "${{ matrix.image }}" /bin/sh -c '
             set -e
             if grep -qi alpine /etc/os-release; then
               apk add --no-cache bash curl coreutils openssl >/dev/null
@@ -141,11 +155,20 @@ jobs:
               grep "Posture:" /tmp/report.txt
               echo "--- share card ---"
               grep "share:" /tmp/report.txt
+              grep -E "Verdict :|share:|Posture:|Oversell" /tmp/report.txt > /out/ct.txt 2>/dev/null || true
             fi
             if [ -n "${{ matrix.quota }}" ]; then
               grep -q "cgroup quota" /tmp/report.txt || { echo "ERROR: cgroup quota not detected/reported"; exit 1; }
             fi
           '
+      - name: Collect container verdict digest
+        run: mv verdicts/ct.txt "verdicts/ct-$ctkey.txt" 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verdict-ct-${{ env.ctkey }}
+          path: verdicts/
+          if-no-files-found: ignore
 
   notify:
     name: discord notify
@@ -153,6 +176,13 @@ jobs:
     runs-on: ubuntu-latest
     if: always()
     steps:
+      - name: Collect verdict digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: 'verdict-*'
+          merge-multiple: true
+          path: verdicts
+        continue-on-error: true
       - name: Send CI result to Discord
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
@@ -171,6 +201,17 @@ jobs:
           if $ok; then color=3066993; title="vps-bench selftest: PASS"; else color=15158332; title="vps-bench selftest: FAIL"; fi
           run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           desc=$(printf 'lint: %s\nsmoke: %s\ncontainers: %s\n\n[open run](%s)' "$LINT" "$SMOKE" "$CONT" "$run_url")
+          # append per-host / per-container verdict digest sections, when available
+          digest=""
+          if compgen -G "verdicts/*" >/dev/null 2>&1; then
+            for f in verdicts/*; do
+              [ -f "$f" ] || continue
+              digest+="$(printf '\n[%s]\n' "$(basename "$f")")"
+              digest+="$(awk '{l[++n]=$0} END{while (n>0 && l[n] ~ /^[[:space:]]*$/) n--; for (i=1;i<=n;i++) print l[i]}' "$f")"
+              digest+=$'\n'
+            done
+          fi
+          desc=$(printf '%s' "$desc$digest" | head -c 3500)
           jq -n --arg t "$title" --arg d "$desc" --argjson c "$color" --arg u "$run_url" \
             '{username:"Blackhole VPS Bench", embeds:[{title:$t, url:$u, description:$d, color:$c, timestamp:(now|todateiso8601)}]}' \
             > /tmp/notify.json
